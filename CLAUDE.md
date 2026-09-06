@@ -26,8 +26,8 @@ These rules are canon. They override convenience, time pressure, and apparent co
 
 ## Key paths
 
-- Handoff file: `C:\Users\djwmo\.claude\projects\f5fcdd41-f82b-411f-aee8-30708fbd2bcb\handoff.md`
-- Helper script: `C:\Users\djwmo\dev\judge/scripts/handoff.js`
+- Handoff file: resolved by the handoff engine from the uuid in `.memory-engine`, under the user's Claude config directory (not in this repo)
+- Helper script: `handoff.js` from the claude-memory engine (`HANDOFF_ENGINE` env var, plugin root, or recorded `.engine-path`); not vendored in this repo
 
 ---
 
