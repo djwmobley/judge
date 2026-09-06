@@ -118,23 +118,42 @@ function readLedgerCount(key, kind, resolvedPath) {
 }
 
 /**
- * Opportunistically remove any orchestrator-tool-guard.*.ledger file whose
- * mtime is older than maxAgeMs (default 7 days) — same prefix-guarded
- * deletion as the prior JSON-tally design, now matched against the ledger
- * extension. Wrapped try/catch at every level — any failure here is
- * otherwise ignored, never blocks the current call.
+ * Opportunistically remove any `${prefix}*${suffix}` file in STATE_DIR
+ * whose mtime is older than maxAgeMs (default 7 days) — same
+ * prefix/suffix-guarded deletion as the prior JSON-tally design.
+ * Generalized (judge PR 2) so a second, differently-shaped ledger
+ * (`agent-tier-ledger.<session>.jsonl`) can reuse this sweep without
+ * touching Hook 2's own ledger files: `prefix`/`suffix` default to this
+ * module's own `LEDGER_PREFIX`/`LEDGER_SUFFIX` constants, so every
+ * pre-existing call site (`cleanupOldStateFiles()`, no arguments) keeps
+ * its exact original behavior unchanged.
+ *
+ * `minAgeMs` (default 0 — no skip, matching the original behavior) skips
+ * any file whose mtime is within `minAgeMs` of now, even if it is also
+ * older than `maxAgeMs` — used by the tier-ledger's own sweep (owner
+ * decision A6) to avoid unlinking a file a concurrent process may still be
+ * mid-append to; a residual race narrower than this window is a documented,
+ * accepted limitation, not something this guard closes.
+ *
+ * Wrapped try/catch at every level — any failure here is otherwise
+ * ignored, never blocks the current call.
  */
-function cleanupOldStateFiles(maxAgeMs) {
+function cleanupOldStateFiles(maxAgeMs, prefix, suffix, minAgeMs) {
   const maxAge = typeof maxAgeMs === "number" ? maxAgeMs : SEVEN_DAYS_MS;
+  const pfx = typeof prefix === "string" ? prefix : LEDGER_PREFIX;
+  const sfx = typeof suffix === "string" ? suffix : LEDGER_SUFFIX;
+  const minAge = typeof minAgeMs === "number" ? minAgeMs : 0;
   try {
     if (!fs.existsSync(STATE_DIR)) return;
     const now = Date.now();
     for (const f of fs.readdirSync(STATE_DIR)) {
-      if (!f.startsWith(LEDGER_PREFIX) || !f.endsWith(LEDGER_SUFFIX)) continue;
+      if (!f.startsWith(pfx) || !f.endsWith(sfx)) continue;
       const full = path.join(STATE_DIR, f);
       try {
         const st = fs.statSync(full);
-        if (now - st.mtimeMs > maxAge) fs.unlinkSync(full);
+        const age = now - st.mtimeMs;
+        if (age <= minAge) continue; // too fresh — a concurrent append may still be in flight.
+        if (age > maxAge) fs.unlinkSync(full);
       } catch (_) {
         // Per-file failure: ignore, keep scanning the rest.
       }
