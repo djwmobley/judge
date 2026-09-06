@@ -54,7 +54,7 @@ test("isOurs: recognizes a plain node command ending in hooks/<guard>.js", () =>
 });
 
 test("isOurs: recognizes a quoted path with spaces", () => {
-  const id = isOurs('node "C:/Users/a b/.claude/hooks/shell-write-guard.js"');
+  const id = isOurs('node "C:/Fake/home with spaces/.claude/hooks/shell-write-guard.js"');
   assert.deepEqual(id, { id: "shell-write-guard" });
 });
 

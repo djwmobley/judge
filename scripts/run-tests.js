@@ -1,10 +1,17 @@
 #!/usr/bin/env node
-// Collects every *.test.js under hooks/ and test/ and runs them with the
+// Collects test files under hooks/ and test/ and runs them with the
 // built-in node test runner. Also runs any standalone self-contained test
 // runner (a script that isn't written against node:test but exits non-zero
 // on failure) listed in STANDALONE_RUNNERS below. Exits 0 with a message
 // when nothing is found yet (e.g. on a fresh main before the first guard PR
 // lands), so CI does not fail on an empty tree.
+//
+// Discovery differs by directory on purpose: hooks/ mixes guard source
+// with its tests, so only *.test.js there is picked up (a plain <name>.js
+// is guard source, not a test). test/ is exclusively test code, so every
+// *.js file there is picked up — this is what catches a file named
+// test-public-scan.js, which does NOT match the *.test.js suffix but is a
+// real node:test file that must run under `npm test`.
 
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
@@ -17,18 +24,18 @@ const path = require('node:path');
 // accident.
 const STANDALONE_RUNNERS = ['hooks/test-bash-classifier-bait-guard.js'];
 
-function findTestFiles(dir) {
+function findFiles(dir, predicate) {
   if (!fs.existsSync(dir)) return [];
   return fs
     .readdirSync(dir)
-    .filter((f) => f.endsWith('.test.js'))
+    .filter(predicate)
     .map((f) => path.join(dir, f));
 }
 
 const root = path.join(__dirname, '..');
 const files = [
-  ...findTestFiles(path.join(root, 'hooks')),
-  ...findTestFiles(path.join(root, 'test')),
+  ...findFiles(path.join(root, 'hooks'), (f) => f.endsWith('.test.js')),
+  ...findFiles(path.join(root, 'test'), (f) => f.endsWith('.js')),
 ];
 const standaloneFiles = STANDALONE_RUNNERS.map((f) => path.join(root, f)).filter((f) => fs.existsSync(f));
 
