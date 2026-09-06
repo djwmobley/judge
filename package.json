@@ -1,0 +1,14 @@
+{
+  "name": "judge",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Harness law for multi-agent Claude Code sessions: dispatch guards, independence rules, and the judge docket.",
+  "license": "MIT",
+  "main": "index.js",
+  "scripts": {
+    "test": "node scripts/run-tests.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
