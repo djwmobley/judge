@@ -1,5 +1,10 @@
 {
   "roots": [],
   "gated_extensions": [],
-  "exempt_types": []
+  "exempt_types": [],
+  "model_tiers": {
+    "<your-planning-tier-model-name>": "planning",
+    "<your-drafting-tier-model-name>": "drafting",
+    "<your-mechanical-tier-model-name>": "mechanical"
+  }
 }

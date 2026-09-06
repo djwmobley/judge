@@ -74,6 +74,32 @@ const GUARDS = [
     event: 'PreToolUse',
     matcher: 'Agent|SendMessage',
   },
+  {
+    id: 'agent-model-routing-guard',
+    file: 'agent-model-routing-guard.js',
+    event: 'PreToolUse',
+    matcher: 'Agent|SendMessage',
+  },
+  // Second and third registrations of the SAME guard logic, at different
+  // hook events, for the per-agent tier ledger (owner decision D3). Each
+  // gets its own on-disk filename (thin shims requiring the shared
+  // agent-model-routing-guard.js module) rather than a second/third GUARDS
+  // entry pointed at the identical file — isOurs() below identifies an
+  // installed entry purely by which guard *file* its command runs, so two
+  // registrations sharing one filename could never be told apart on
+  // re-install (see the shim files' own header comments).
+  {
+    id: 'agent-model-routing-guard-ledger',
+    file: 'agent-model-routing-guard-posttooluse.js',
+    event: 'PostToolUse',
+    matcher: 'Agent',
+  },
+  {
+    id: 'agent-model-routing-guard-subagent-start',
+    file: 'agent-model-routing-guard-subagentstart.js',
+    event: 'SubagentStart',
+    matcher: null,
+  },
 ];
 
 // Files copied into the destination hooks directory alongside the guards
@@ -85,6 +111,7 @@ const SUPPORT_FILES = [
   'model-routing-guards.exempt.js',
   'model-routing-guards.rules.js',
   'model-routing-guards.paths.js',
+  'agent-tier-ledger.js',
 ];
 const SUPPORT_DIRS = ['lib'];
 
