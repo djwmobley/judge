@@ -8,7 +8,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # windows-latest: the guards in hooks/** are Windows/Git-Bash-specific
+    # by design (MSYS path rewriting, PowerShell-vs-bash detection, Windows
+    # drive-letter normalization) -- this is where they actually run.
+    runs-on: windows-latest
     strategy:
       matrix:
         node-version: [lts/*]
