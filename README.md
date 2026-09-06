@@ -53,12 +53,19 @@ where a guard needs to check session state; it does not implement it.
   after; every write-capable agent report carries a stated blind-spot
   section.
 - `test/` — repository-level tests, including a scan that fails the build
-  if anything under `hooks/` or `docs/` carries an owner-identifying path,
-  handle, or private project name.
+  if any tracked file in the repo carries an owner-identifying path,
+  handle, private project name, or a specific model-family name.
 
 ## Status
 
 This repository is being built up in a small number of pull requests.
-This first PR carries the dispatch guards themselves, parameterized to be
-machine- and project-agnostic. Later PRs add a fully model-agnostic
-routing guard and the judge docket protocol.
+This first PR carries the orchestrator-tool-guard hook (the "orchestrator
+tier doesn't draft" enforcement) together with the rest of the dispatch
+guards, all parameterized to be machine- and project-agnostic, plus the
+`model-routing-guards.rules.js` / `.paths.js` support modules
+`orchestrator-tool-guard.js` requires at runtime — those two support
+modules carry no owner paths (roots come from `os.tmpdir()` /
+`os.homedir()` / `hooks/lib/local-policy.js`) and no model names (tier
+language only). Only `agent-model-routing-guard.js` — the Agent-dispatch
+tier-routing guard itself — waits for PR 2, where it becomes policy-driven
+instead of hardcoded. PR 3 adds the judge docket protocol.
