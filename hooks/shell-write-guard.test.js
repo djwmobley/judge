@@ -2506,3 +2506,68 @@ t("MIXED-70 (MC2-09): psql backtick continuation with TRAILING WHITESPACE, then 
   const r = ps("psql -h localhost -d db `  \n  -f tmp.sql");
   assert.equal(r.allow, true, JSON.stringify(r));
 });
+
+// ---------------------------------------------------------------------------
+// RV-01 (reviewer finding on PR #9): a quoted, flag-shaped, UNRECOGNIZED
+// token was falling through to classifyMixedBareToken (allowed as a
+// connection/positional slot) instead of FRICTIONing as UNKNOWN — the
+// unknown-flag check was wrongly gated on `!tok.quoted`. Fixed in
+// dispatchKnownMixed; these tests lock in quoted-bit-insensitive UNKNOWN
+// classification across all three CLIs, Bash and PowerShell, plus prove a
+// quoted RECOGNIZED flag still matches correctly (was already correct via
+// matchMixedFlag, which never gated on quoted — confirmed, not just fixed).
+// ---------------------------------------------------------------------------
+
+t('MIXED-71 (RV-01, psql, Bash): psql "--unknown-flag" -f x.sql -> block, quoted unrecognized flag is FRICTION', () => {
+  const r = bash('psql "--unknown-flag" -f x.sql');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "unknown-flag");
+});
+
+t('MIXED-72 (RV-01, psql, Bash): psql -f x.sql "-badflag" -> block, quoted unrecognized flag after a resolved FILE role is FRICTION', () => {
+  const r = bash('psql -f x.sql "-badflag"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "unknown-flag");
+});
+
+t('MIXED-73 (RV-01, mysql, Bash): mysql db "--unknown-flag" -> block, quoted unrecognized flag is FRICTION', () => {
+  const r = bash('mysql db "--unknown-flag"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "unknown-flag");
+});
+
+t('MIXED-74 (RV-01, sqlite3, Bash): sqlite3 db.sqlite "--unknown-flag" -> block, quoted unrecognized flag is FRICTION (not the positional-2+ path)', () => {
+  const r = bash('sqlite3 db.sqlite "--unknown-flag"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "unknown-flag");
+});
+
+t('MIXED-75 (RV-01, psql, PowerShell-native): psql "--unknown-flag" -f x.sql -> block, quoted unrecognized flag is FRICTION', () => {
+  const r = ps('psql "--unknown-flag" -f x.sql');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t('MIXED-76 (RV-01, mysql, PowerShell-native): mysql db "--unknown-flag" -> block, quoted unrecognized flag is FRICTION', () => {
+  const r = ps('mysql db "--unknown-flag"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t('MIXED-77 (RV-01, sqlite3, PowerShell-native): sqlite3 db.sqlite "--unknown-flag" -> block, quoted unrecognized flag is FRICTION', () => {
+  const r = ps('sqlite3 db.sqlite "--unknown-flag"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t('MIXED-78 (RV-01, quoted "--" consistency): psql "--" -c \'SELECT 1\' -> block, quoted -- is inert (same as unquoted), -c still recognized', () => {
+  const r = bash('psql "--" -c \'SELECT 1\'');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t('MIXED-79 (RV-01 regression proof, quoted recognized flag): psql "-f" x.sql -> allow, a quoted RECOGNIZED flag still matches (unaffected by the fix)', () => {
+  const r = bash('psql "-f" x.sql');
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t('MIXED-80 (RV-01 regression proof, quoted recognized flag, PowerShell): psql "-c" "select 1" -> block on -c itself (quoted recognized INLINE flag still matches)', () => {
+  const r = ps('psql "-c" "select 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});

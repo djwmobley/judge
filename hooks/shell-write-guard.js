@@ -1490,7 +1490,11 @@ function dispatchKnownMixed(stage, verbIdx, cwd, gatedExts, precededByPipe) {
       }
     }
 
-    if (!tok.quoted && tok.value === "--") { i++; continue; } // MC-11: inert, not end-of-options
+    // MC-11/RV-01: inert, not end-of-options — quoted-bit-insensitive (a
+    // quoted "--" is still the literal argv string "--" to the CLI, same
+    // as unquoted; MC-06's "match flag names regardless of quoted" applies
+    // here too, not just to recognized flags).
+    if (tok.value === "--") { i++; continue; }
 
     const flagMatch = matchMixedFlag(table, stage, i);
     if (flagMatch) {
@@ -1528,10 +1532,22 @@ function dispatchKnownMixed(stage, verbIdx, cwd, gatedExts, precededByPipe) {
       continue;
     }
 
-    if (!tok.quoted && tok.value.startsWith("-") && tok.value !== "-") {
-      // MC-14: per-token fallthrough — an unrecognized flag is FRICTION
-      // by itself; it never re-opens an already-resolved token's role,
-      // and it never reaches catchAllUnknownVerb.
+    if (tok.value.startsWith("-") && tok.value !== "-") {
+      // MC-14/RV-01 (reviewer finding on PR #9): per-token fallthrough —
+      // an unrecognized flag is FRICTION by itself; it never re-opens an
+      // already-resolved token's role, and it never reaches
+      // catchAllUnknownVerb. Quoted-bit-insensitive per MC-06's own
+      // rationale: a quoted `"--unknown-flag"` is the literal argv string
+      // "--unknown-flag" to psql/sqlite3/mysql — shell quoting never
+      // changes what the CLI's own getopt sees, only word-splitting and
+      // expansion. Gating this check on `!tok.quoted` (as an earlier
+      // version of this file did) let a quoted flag-shaped unrecognized
+      // token fall through to classifyMixedBareToken and be silently
+      // allowed as a connection/positional slot — a real escape, not
+      // covered by matchMixedFlag's own already-quoted-insensitive
+      // lookup, since that function only recognizes TABLE entries; an
+      // UNRECOGNIZED flag-shaped token has nowhere else to be classified
+      // once quoting is (correctly) not disqualifying.
       consider(mixedFriction(verb, "unknown-flag", tok.value));
       i++;
       continue;

@@ -789,3 +789,9 @@ plus the blind-spot-section requirement.
 | MC2-07 | VERIFIED, no defect | re-fetched the same doc URL: `-z`/`-0` are real short options, `-F`/`-f` are genuinely distinct options — round 1's table was already correct; citation-accuracy concern closed, not carried forward (§7.1) |
 | MC2-08 | FIXED | mysql positional 2+ now explicitly FRICTION (§7.3), mirroring §7.2's sqlite3 precedent — closes the "which of two readings" ambiguity MC2-08 identified |
 | MC2-09 | FIXED | "line-final" backtick precisely defined as "last non-whitespace character before `\n`," matching real PowerShell continuation semantics, not a strict last-character check (§6.3); new trailing-whitespace test MIXED-70 |
+
+## 14. Reviewer findings (PR #9)
+
+| Finding | Disposition | One-line rationale |
+|---|---|---|
+| RV-01 | FIXED | independent reviewer on PR #9 found the implemented `dispatchKnownMixed`'s UNKNOWN -> FRICTION check was gated on `!tok.quoted`, so a quoted flag-shaped unrecognized token (`psql "--unknown-flag" -f x.sql`, `psql -f x.sql "-badflag"`) fell through to `classifyMixedBareToken` and was silently allowed as a connection/positional slot — contradicting §2's UNKNOWN row (total classification) and the MC-06 quoted-bit-insensitivity principle already applied to RECOGNIZED flags via `matchMixedFlag`. Fixed by removing the `!tok.quoted` gate on both the unknown-flag check and the `--` inert-skip check (audited for the same asymmetry per the reviewer's request; OUTPUT/BENIGN roles were already quoted-bit-insensitive via `matchMixedFlag`, which never gated on `quoted`). New tests MIXED-71..80 cover quoted unrecognized flags across all three CLIs on both the Bash and PowerShell-native paths, quoted `--`, and a quoted RECOGNIZED flag continuing to match correctly.
