@@ -70,28 +70,70 @@ const { createLogger } = require("./model-routing-guards.log.js");
 const { loadLocalPolicy, foldModelTierToken } = require("./lib/local-policy.js");
 const ledger = require("./agent-tier-ledger.js");
 
-// docs/specs/routing-scorecard.md §2.1 — the decisions module is loaded
-// defensively: install drift, a syntax error, or any other throw during
-// require() must never crash this guard before its own top-level catch can
-// run. On failure, fall back to no-op stand-ins with the same call shape
-// used throughout this file, so every appendDecision/appendCrashRecord/
-// hashTarget call site below needs no extra guarding for THIS failure mode
-// (a missing or corrupted module) — only the top-level catch's own
-// appendCrashRecord call additionally wraps itself, for the separate
-// failure mode of a loaded-but-still-throwing appendCrashRecord (see that
-// call site below). A decisions-module failure can never change this
-// guard's exit code or stdout/stderr on any path, crash path included.
+// docs/specs/routing-scorecard.md §2.1 / R9 — the decisions module is
+// loaded defensively, and EVERY call into it — not just require() itself —
+// is routed through the three safe wrappers below (logDecision/safeHash/
+// safeCrash). Each wrapper (i) checks typeof === "function" before
+// calling, (ii) wraps the call in try/catch, (iii) returns a harmless
+// default (undefined for logDecision/safeCrash, null for safeHash) on ANY
+// failure — require() throwing, a loaded module whose export is present
+// but not a function (install drift replacing a function with an
+// object/undefined — the case a bare require()-guard alone does not
+// cover), or a function that throws when called. No call site in this file
+// calls decisions.appendDecision/appendCrashRecord/hashTarget directly;
+// every one goes through logDecision/safeCrash/safeHash. This guard's
+// decision logic never reads a wrapper's return value in a way that
+// changes its outcome (logDecision/safeCrash are called only for their
+// side effect; safeHash's `null` default is a value the record schema
+// already treats as "no target", never a branch condition) — so a
+// decisions-module failure, in any of the shapes above, can never change
+// this guard's exit code or stdout/stderr on any path, crash path
+// included.
 let decisions;
 try {
   decisions = require("./model-routing-guards.decisions.js");
 } catch (_) {
-  decisions = {
-    appendDecision: function () {},
-    appendCrashRecord: function () {},
-    hashTarget: function () {
-      return null;
-    },
-  };
+  decisions = {};
+}
+
+// Each wrapper captures the module's function reference into a local
+// before calling it (never a direct decisions.appendDecision-style
+// call in this file's own source outside this block) — both so a
+// non-function export is caught by the typeof check below and so a later
+// global find/replace of the (un-wrapped) call pattern elsewhere in this
+// file can never accidentally rewrite these three definitions themselves.
+function logDecision(record) {
+  try {
+    const fn = decisions.appendDecision;
+    if (typeof fn === "function") {
+      fn(record);
+    }
+  } catch (_) {
+    // See header comment above.
+  }
+}
+
+function safeHash(target) {
+  try {
+    const fn = decisions.hashTarget;
+    if (typeof fn === "function") {
+      return fn(target);
+    }
+  } catch (_) {
+    // fall through to the harmless default below.
+  }
+  return null;
+}
+
+function safeCrash(rawStdinBufferArg, guard, guardVersion) {
+  try {
+    const fn = decisions.appendCrashRecord;
+    if (typeof fn === "function") {
+      fn(rawStdinBufferArg, guard, guardVersion);
+    }
+  } catch (_) {
+    // See header comment above.
+  }
 }
 
 const appendDebug = createLogger("agent-model-routing-guard");
@@ -254,7 +296,7 @@ function failOpen(reason, extra) {
   // §2.5: caller is "unknown" at every fail_open triggered before agent_id
   // has been parsed at all — true for all three fail_open reasons this
   // guard can produce.
-  decisions.appendDecision(
+  logDecision(
     decisionRecord({ event: "fail_open", session_id: null, agent_id: null, caller: "unknown", tool_name: null, reason })
   );
   process.exit(0);
@@ -272,7 +314,7 @@ function buildBlockMessage(findings, toolName) {
 function block(findings, toolName, extra, ctx) {
   const findingIds = findings.map((f) => f.id);
   appendDebug(Object.assign({ ts: new Date().toISOString(), event: "block", tool_name: toolName, finding_ids: findingIds }, extra || {}));
-  decisions.appendDecision(
+  logDecision(
     decisionRecord(Object.assign({ event: "block", tool_name: toolName, finding_ids: findingIds }, ctx || {}))
   );
   process.stderr.write(buildBlockMessage(findings, toolName));
@@ -281,7 +323,7 @@ function block(findings, toolName, extra, ctx) {
 
 function allow(toolName, extra, ctx) {
   appendDebug(Object.assign({ ts: new Date().toISOString(), event: "allow", tool_name: toolName }, extra || {}));
-  decisions.appendDecision(decisionRecord(Object.assign({ event: "allow", tool_name: toolName }, ctx || {})));
+  logDecision(decisionRecord(Object.assign({ event: "allow", tool_name: toolName }, ctx || {})));
   process.exit(0);
 }
 
@@ -575,7 +617,7 @@ function main() {
         subagent_type: result.subagentType,
         model: result.model,
         tier: result.tier,
-        target_hash: decisions.hashTarget(typeof result.subagentType === "string" ? result.subagentType : null),
+        target_hash: safeHash(typeof result.subagentType === "string" ? result.subagentType : null),
       };
       if (result.ok) {
         try {
@@ -634,7 +676,7 @@ function main() {
       finding_ids: ["internal_exception"],
       message: String((internalErr && internalErr.message) || internalErr),
     });
-    decisions.appendDecision(
+    logDecision(
       decisionRecord({
         event: "block",
         tool_name: toolName,
@@ -665,19 +707,13 @@ if (require.main === module) {
       process.stderr.write("agent-model-routing-guard: BLOCKED — internal error during classification — treat as block.\n");
     } catch (_) {}
     // §2.1 R1 — best-effort session recovery from the raw stdin captured
-    // before main() ran. The real appendCrashRecord already swallows its
-    // own errors, but this call site wraps it again anyway: a corrupted/
-    // replaced decisions module (install drift) might not honor that
-    // contract, and this is the last line of defense before process.exit —
-    // nothing downstream can catch a throw here. Either way the guard's
-    // own exit code (2, unchanged from before this spec) is decided
-    // independently below, never by whether this call throws.
-    try {
-      decisions.appendCrashRecord(rawStdinBuffer, "agent-model-routing-guard", GUARD_VERSION);
-    } catch (_) {
-      // See comment above — a decisions-module failure here must never
-      // change this guard's exit code or output.
-    }
+    // before main() ran. safeCrash() (see the wrapper block near the top
+    // of this file) already never throws — a missing module, a
+    // non-function export, or a throwing appendCrashRecord are all
+    // absorbed there — so no further try/catch is needed at this, the
+    // guard's last line of defense before its own exit code below, which
+    // is decided independently of whether this call did anything at all.
+    safeCrash(rawStdinBuffer, "agent-model-routing-guard", GUARD_VERSION);
     process.exit(2);
   }
 }

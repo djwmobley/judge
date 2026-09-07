@@ -223,6 +223,38 @@ reimplementing their primitives:
   - This fix does not touch `hook-state-write-guard.js`,
     `stop-stale-worktrees-guard.js`, or their specs/tests — out of scope
     for this ruling, owned by a separate author.
+  - **Amendment (independent approver, second review of R9):** the two
+    bullets above — defensive `require()` plus a lone `try/catch` around
+    the top-level catch's `appendCrashRecord` call — left every OTHER
+    `appendDecision`/`hashTarget` call site in each guard calling the
+    module directly and unguarded (`hooks/orchestrator-tool-guard.js:55,
+    73,87,139,198,210,225` and the equivalent lines in the other two
+    guards, per the approver's finding). That is fine when `require()`
+    itself throws (the fallback stand-in absorbs every call site
+    uniformly), but NOT when `require()` **succeeds** and returns a module
+    whose exports are present but not callable — e.g. `appendDecision`/
+    `appendCrashRecord`/`hashTarget` as plain objects, or `undefined`.
+    Calling a non-function throws a `TypeError` that the require()-level
+    `try/catch` cannot see (it already returned) and that these unguarded
+    call sites do not catch — empirically flipping
+    `orchestrator-tool-guard`/`agent-model-routing-guard`'s allow and
+    malformed-JSON cases from exit 0 to exit 2, and
+    `agent-adversary-floor`'s block case from exit 2 to exit 0 (a real
+    escape). Fixed by replacing every direct `decisions.*` call in all
+    three guards with one of three local wrappers defined once, immediately
+    after the defensive `require()`: `logDecision(record)`, `safeHash(target)`,
+    `safeCrash(rawStdinBuffer, guard, guardVersion)`. Each wrapper (i)
+    captures the export into a local (`const fn = decisions.appendDecision`,
+    etc.) and checks `typeof fn === "function"` before calling it, (ii)
+    wraps the call in its own `try/catch`, (iii) returns a harmless default
+    (`undefined` for `logDecision`/`safeCrash`, `null` for `safeHash`) on
+    any failure — covering a throwing `require()`, a loaded-but-non-callable
+    export, AND a callable export that itself throws, uniformly, at every
+    call site, not only the crash path. No guard's decision logic ever
+    branches on a wrapper's return value. With this amendment, "a
+    decisions-module failure can never change a guard's exit code or
+    output" (§2.1 above, R9 in §6.1) holds for all of these shapes, not
+    only "`require()` throws" — see §7.1a's expanded matrix.
   - See `hooks/model-routing-guards.crash-path.test.js` (§7.1a) for the
     regression tests, and R9 in §6.1.
 
@@ -979,18 +1011,64 @@ no placement decision needed here).
 ### 7.1a `hooks/model-routing-guards.crash-path.test.js` (R9)
 
 Added in the crash-path hardening fix (§2.1's "Defensive load and
-defense-in-depth" bullet, R9). Discovered by the same `hooks/*.test.js`
-glob as §7.1. Drives each of the three guards as a child process
-(`execFileSync`) with malformed (invalid-JSON) stdin, while shadowing
-`model-routing-guards.decisions.js` in-process via a `-r`-preloaded
-`Module._load` interception keyed on that module's resolved absolute path
-(a relative `require("./...")`, so `NODE_PATH` cannot shadow it). Two
-fixture modes per guard:
+defense-in-depth" bullet, R9), then extended per the independent
+approver's second review (§2.1's "Amendment" sub-bullet). Discovered by
+the same `hooks/*.test.js` glob as §7.1. Drives each of the three guards
+as a child process (`spawnSync`) with a deterministic envelope, while
+shadowing `model-routing-guards.decisions.js` in-process via a
+`-r`-preloaded `Module._load` interception keyed on that module's resolved
+absolute path (a relative `require("./...")`, so `NODE_PATH` cannot shadow
+it).
 
-| Test | Checks |
-|---|---|
-| `decisions module throws on require()` | Shadowed `require()` throws (simulated install drift/missing module). Every guard's defensive load falls back to no-op stand-ins, so the malformed-JSON envelope resolves via that guard's **ordinary fail-open path** — exit code/stdout/stderr identical to what an unmodified `require()` would have produced — without the top-level catch ever being needed. Proves the failure is neutralized before `main()` runs at all. |
-| `decisions module loads but appendDecision/appendCrashRecord both throw` | `require()` succeeds; the shadowed module's `appendDecision` and `appendCrashRecord` both throw on every call. Because `appendDecision` is called, unguarded, from each guard's fail-open handler (itself invoked outside that guard's own inner `try` blocks), the malformed-JSON envelope causes that call to throw, which propagates out of `main()` into the guard's top-level catch — genuinely exercising it. Asserts exit code/stdout/stderr exactly match that guard's c629cf1 (pre-PR-#14) top-level-catch contract, read directly via `git show c629cf1:hooks/<file>`: `orchestrator-tool-guard.js`/`agent-model-routing-guard.js` exit 2 with their existing "BLOCKED — internal error during classification — treat as block." stderr message; `agent-adversary-floor.js` exits 0 with no stderr (its documented fail-open behavior). Also asserts stderr carries no raw Node stack trace. Verified to fail (exit 1, Node's default uncaught-exception code) against the pre-fix code — this is a genuine regression test, not a vacuous one. |
+**Structural check (one test per guard):** `assertNoUnwrappedCalls` scans
+each guard's source for the literal patterns `decisions.appendDecision(`,
+`decisions.hashTarget(`, `decisions.appendCrashRecord(` and asserts none
+appear outside the three wrapper functions' own bodies (which capture the
+export into a local before calling it, so even those definitions never
+contain the literal call-shaped pattern) — a static regression guard
+against a future call site bypassing `logDecision`/`safeHash`/`safeCrash`.
+
+**Behavioral matrix:** for every combination of
+
+- **guard** — `orchestrator-tool-guard`, `agent-model-routing-guard`,
+  `agent-adversary-floor`;
+- **envelope** — `allow` (a deterministic allow-path payload per guard:
+  orchestrator-tool-guard's exempt-subagent branch, agent-model-routing-
+  guard's Agent dispatch with a resolvable mechanical-tier model plus a
+  temp `~/.claude/hooks/local-policy.json` HOME per hooks/agent-model-
+  routing-guard.test.js's own `mkTierHome` convention, agent-adversary-
+  floor's `Explore` exempt type), `block` (orchestrator-tool-guard's
+  unexpected-`tool_name` branch, agent-model-routing-guard's model-less
+  Agent dispatch, agent-adversary-floor's no-completeness-clause prompt),
+  and `malformed` (invalid-JSON stdin, the same fail-open envelope for all
+  three);
+- **decisions-module shape** — `throw_on_load` (`require()` itself
+  throws — the original R9 fix's failure mode), `non_function_objects`
+  (`require()` succeeds; `appendDecision`/`appendCrashRecord`/`hashTarget`
+  are each `{}` — the approver's reported shape), `undefined_exports`
+  (same, but each export is `undefined`), and `throwing_functions` (each
+  export IS a function but throws when called — exercises the wrappers'
+  `try/catch` layer specifically, distinct from the `typeof`-guard layer
+  the other three shapes exercise);
+
+the guard is run twice with the identical envelope — once against the
+real, healthy `model-routing-guards.decisions.js`, once against the
+shadowed/broken module — and the test asserts the **broken run's exit code
+and stdout equal the healthy run's**, computed fresh in the same test
+rather than a hardcoded expected value, so the assertion cannot drift from
+whatever the healthy path actually does. 3 guards x 3 envelopes x 4 shapes
+= 36 behavioral tests, plus 3 structural tests = 39 total.
+
+Verified to fail (18/39, spanning every `non_function_objects`/
+`undefined_exports` case for `orchestrator-tool-guard` and
+`agent-model-routing-guard`'s `allow`/`malformed` envelopes and
+`agent-adversary-floor`'s `block` envelope) against the first R9 fix
+(defensive `require()` + a single wrapped top-level-catch call, before the
+approver's second-review amendment) — reproducing the approver's exact
+finding (allow/malformed flipping to exit 2, block flipping to exit 0) —
+and to pass 39/39 against both the pre-PR-#14 (`c629cf1`, decisions module
+absent entirely) and the fully-amended code. This is a genuine regression
+test, not a vacuous one.
 
 Does not touch `hook-state-write-guard.js`, `stop-stale-worktrees-guard.js`,
 or their specs/tests — out of scope for R9, owned by a separate author.
