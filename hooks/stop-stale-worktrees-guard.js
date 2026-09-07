@@ -39,9 +39,10 @@
 //     (merged into base, on any OTHER remote -- the operator has no
 //     standing to delete it) allows with a systemMessage instead. Never
 //     fetches; an atomically-failing `for-each-ref refs/remotes` (one bad
-//     object blacks out the whole call) falls back to `show-ref` plus
-//     per-ref `rev-parse --verify` so one corrupt ref can't hide every
-//     sibling ref's classification.
+//     object blacks out the whole call) falls back to a reduced-format
+//     `for-each-ref` (refname+objectname only, no `%(tree)`, so no object
+//     dereference) plus per-ref `rev-parse --verify` so one corrupt ref
+//     can't hide every sibling ref's classification.
 //
 // Bypass: set JUDGE_STOP_GUARD=off in the hook process's OWN inherited
 // environment (not something an agent can set from inside its own shell
@@ -1115,7 +1116,7 @@ function evaluateStop(targetDir, deps) {
   if (!remoteEnumRes.ok) {
     return remoteEnumRes.deadlineExpired
       ? { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "remote-list" }]) }
-      : { action: "block", reason: buildUnknownReason("remote-list-failed", remoteEnumRes.message || "git for-each-ref refs/remotes and its show-ref fallback both failed") };
+      : { action: "block", reason: buildUnknownReason("remote-list-failed", remoteEnumRes.message || "git for-each-ref refs/remotes and its reduced-format for-each-ref fallback both failed") };
   }
   classified.push({ kind: "step", id: "remote-list", class: `${remoteEnumRes.refs.length} ref(s)${remoteEnumRes.usedFallback ? " (via fallback)" : ""}` });
 
