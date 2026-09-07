@@ -85,6 +85,36 @@ conservative default rather than throwing.
   `shell-write-guard.config.json`) or lands in a location a hook-gated
   editor tool would have linted. Shell writes skip the PostToolUse linter
   an Edit/Write call would have triggered — this guard is the backstop.
+- **KNOWN_MIXED tier (`psql`/`sqlite3`/`mysql`):** these CLIs are neither
+  pure reads nor pure writes — a documented, per-flag input/output split
+  resolves each token to exactly one role instead of falling back to the
+  generic unknown-verb scan. A file-role flag (`psql -f`/`--file`,
+  `sqlite3 -init`) is never extension-gated (it's a read), but its
+  argument is checked against a stdin-source denylist — `-`, `/dev/stdin`,
+  `/dev/fd/*`, process substitution, a heredoc, or a here-string all
+  FRICTION, naming the tempfile-canon alternative; a literal stdin
+  redirect from a real file (`psql ... < file.sql`) allows. An inline-SQL
+  flag (`psql -c`/`--command`, `sqlite3 -cmd`, `mysql -e`/`--execute`/
+  `--init-command`) is FRICTION unconditionally and content-blind — this
+  is what actually reproduced the incident shape this tier was built
+  for. An output flag (`psql -o`/`-L`, `mysql --result-file`/
+  `--tee`) resolves like `curl -o`. Every other token is BENIGN with a
+  declared arity (including mysql's/psql's glued-only optional-argument
+  flags, e.g. `-p`/`-C`) or a CONNECTION/positional slot up to the CLI's
+  own limit — beyond that limit, or for any flag not in the CLI's table,
+  the token is UNKNOWN and FRICTIONs by itself; it never falls through to
+  the generic unknown-verb scan, so an unrelated unrecognized flag can
+  never re-open an already-resolved file argument's extension check.
+  Recognizes a wrapper hop (`docker exec`/`run`, `podman exec`/`run`,
+  `ssh <host>`, `kubectl exec`, `sudo`, `env`, `wsl`, `cmd /c`\|`/k`,
+  `nohup`, `time`, `xargs`) before dispatching — on both the Bash and the
+  native-PowerShell path — and blocks outright if a recognized wrapper
+  exhausts its own arguments with no inner command located. sqlite3's own
+  flag surface beyond `-cmd`/`-init` is UNKNOWN by policy (its CLI
+  reference could not be fetched from this environment) rather than
+  guessed at with an unverified arity. See
+  `docs/specs/shell-write-guard-mixed-cli-tier.md` for the full
+  per-CLI tables and the two adversary rounds behind this design.
 - **Override:** prefix the command with `SHELL_WRITE_OK=1 ` (logged) for a
   deliberate, reviewed exception.
 

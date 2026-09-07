@@ -2144,3 +2144,365 @@ t("H-08: log rotation — write debug log past 2MB, then run hook, assert .1 rot
 // (D4: log rotation is now provided by model-routing-guards.log.js's shared
 // appendRotating/createLogger, exercised end-to-end by H-08 above. That
 // module's own rotation unit tests live in its own test file, not here.)
+
+// ---------------------------------------------------------------------------
+// KNOWN_MIXED tier: psql/sqlite3/mysql-style CLIs.
+// Spec: docs/specs/shell-write-guard-mixed-cli-tier.md, section 9 test
+// matrix (MIXED-01..70), adversary rounds 1 (MC-01..17) and 2 (MC2-01..09).
+// ---------------------------------------------------------------------------
+
+const { classifyCommand: mixedClassify } = require(HOOK_PATH);
+function bashSql(cmd, cwd) { return mixedClassify(cmd, cwd || "C:\\work", "Bash", [".sql"]); }
+
+t("MIXED-01 (v1 #1): psql -f x.sql -> allow", () => {
+  assert.equal(bash("psql -f x.sql").allow, true);
+});
+
+t("MIXED-02 (v1 #2): psql -f x.sql, .sql gated -> allow", () => {
+  assert.equal(bashSql("psql -f x.sql").allow, true);
+});
+
+t("MIXED-03 (v1 #3, incident shape): psql -h localhost -p 5432 -U postgres -d db -f tmp.sql, .sql gated -> allow", () => {
+  const r = bashSql("psql -h localhost -p 5432 -U postgres -d db -f tmp.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-04 (v1 #4): psql -c \"select 1\" -> block, message names -f", () => {
+  const r = bash('psql -c "select 1"');
+  assert.equal(r.allow, false);
+  assert.match(r.reason, /-f/);
+});
+
+t("MIXED-05 (v1 #5): psql -o out.ps1 -> block", () => {
+  assert.equal(bash("psql -o out.ps1").allow, false);
+});
+
+t("MIXED-06 (v1 #6): psql -o out.txt -> allow", () => {
+  assert.equal(bash("psql -o out.txt").allow, true);
+});
+
+t("MIXED-07 (v1 #7 + MC-03): psql --output=out.ps1 -> block", () => {
+  assert.equal(bash("psql --output=out.ps1").allow, false);
+});
+
+t("MIXED-08 (v1 #12, MC-14 corrected): psql --unknown-flag out.ps1 -> block, UNKNOWN-token FRICTION naming --unknown-flag", () => {
+  const r = bash("psql --unknown-flag out.ps1");
+  assert.equal(r.allow, false);
+  assert.equal(r.reason, "unknown-flag");
+  assert.equal(r.target, "--unknown-flag");
+});
+
+t("MIXED-09 (v1 #13): psql -f x.sql -o out.ps1 -> block, target out.ps1", () => {
+  const r = bash("psql -f x.sql -o out.ps1");
+  assert.equal(r.allow, false);
+  assert.match(r.target, /out\.ps1/);
+});
+
+t("MIXED-10 (MC-13): psql -A -t -F, -f export.sql -> allow, benign flags enumerated (glued -F, too)", () => {
+  const r = bash("psql -A -t -F, -f export.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-11 (MC-14 regression proof): psql -f tmp.sql --tuples-only, .sql gated -> allow, -f role survives co-occurring flag", () => {
+  const r = bashSql("psql -f tmp.sql --tuples-only");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-12 (MC-01): psql -f /dev/stdin <<< \"SELECT 1\" -> block, names tempfile canon", () => {
+  const r = bash('psql -f /dev/stdin <<< "SELECT 1"');
+  assert.equal(r.allow, false);
+  assert.match(r.reason, /stdin-sentinel-use-tempfile/);
+});
+
+t("MIXED-13 (MC-01): psql -f - -> block", () => {
+  assert.equal(bash("psql -f -").allow, false);
+});
+
+t("MIXED-14 (MC-01): psql -f /dev/fd/5 -> block", () => {
+  assert.equal(bash("psql -f /dev/fd/5").allow, false);
+});
+
+t("MIXED-15 (MC-01): psql -f <(echo \"DROP TABLE x;\") -> block", () => {
+  const r = bash('psql -f <(echo "DROP TABLE x;")');
+  assert.equal(r.allow, false);
+});
+
+t("MIXED-16 (decision 1): psql -h localhost -d db < script.sql -> allow, literal stdin redirect", () => {
+  const r = bash("psql -h localhost -d db < script.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-17 (decision 1): psql -h localhost -d db <<EOF heredoc -> block", () => {
+  const r = bash("psql -h localhost -d db <<EOF\nSELECT 1;\nEOF");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-18 (decision 1): psql -h localhost -d db <<< \"SELECT 1\" -> block, here-string", () => {
+  const r = bash('psql -h localhost -d db <<< "SELECT 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-19 (decision 1): cat script.sql | psql db -> block, pipe-fed stdin, no FILE/INLINE role", () => {
+  const r = bash("cat script.sql | psql db");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-20 (MC-03): psql -h localhost -d db --command=\"SELECT 1\" (Bash) -> block, =-split normalized", () => {
+  const r = bash('psql -h localhost -d db --command="SELECT 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-21 (MC-04): psql -h localhost -d db --command=\"SELECT 1\" (PowerShell) -> block, clause reassembly before lookup", () => {
+  const r = ps('psql -h localhost -d db --command="SELECT 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-22 (MC-05): psql -h localhost -d db -cSELECT (glued) -> block, glued-flag prefix match", () => {
+  const r = bash("psql -h localhost -d db -cSELECT");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-23 (MC-06): psql \"-c\" \"SELECT 1\" -> block, quoted-bit-insensitive match", () => {
+  const r = bash('psql "-c" "SELECT 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-24 (MC-11): psql -- -c 'SELECT 1' -> block, -- not honored as end-of-options", () => {
+  const r = bash("psql -- -c 'SELECT 1'");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-25 (MC-15): psql -v ON_ERROR_STOP=1 -v cmd=$(rm -rf /) -f x.sql -> block, -v value ambiguous", () => {
+  const r = bash('psql -v ON_ERROR_STOP=1 -v "cmd=$(rm -rf /)" -f x.sql');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-26 (MC-15): psql -L out.ps1 -f x.sql -> block, -L is OUTPUT-role", () => {
+  const r = bash("psql -L out.ps1 -f x.sql");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-27 (MC-17): psql postgres://user:p%24ss@host/db -f x.sql -> allow, URL-encoded $", () => {
+  const r = bash("psql postgres://user:p%24ss@host/db -f x.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-28 (MC-17 companion): psql postgres://user:p$ss@host/db -f x.sql -> block, raw $ in positional", () => {
+  const r = bash("psql postgres://user:p$ss@host/db -f x.sql");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-29 (MC-02, Bash): docker exec -it dbcontainer psql -c \"DROP TABLE x;\" -> block, wrapper-unwrapped", () => {
+  const r = bash('docker exec -it dbcontainer psql -c "DROP TABLE x;"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-30 (MC-02, Bash): ssh dbhost psql -c \"DROP TABLE x;\" -> block, wrapper-unwrapped", () => {
+  const r = bash('ssh dbhost psql -c "DROP TABLE x;"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-31 (MC-02, Bash): kubectl exec pod -- psql -c \"DROP TABLE x;\" -> block, wrapper-unwrapped", () => {
+  const r = bash('kubectl exec pod -- psql -c "DROP TABLE x;"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-32 (MC-02 extension): podman run --rm img psql -c \"...\" -> block, wrapper-unwrapped", () => {
+  const r = bash('podman run --rm img psql -c "DROP TABLE x;"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-33 (regression): sudo -u postgres psql -c \"...\" -> block, existing sudo unwrap + new INLINE role", () => {
+  const r = bash('sudo -u postgres psql -c "DROP TABLE x;"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-34 (wrapper-exhausted side effect): ssh dbhost (no inner command) -> block", () => {
+  const r = bash("ssh dbhost");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "wrapper-exhausted-no-inner-verb");
+});
+
+t("MIXED-35 (wrapper-exhausted side effect): sudo -i -> block", () => {
+  const r = bash("sudo -i");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "wrapper-exhausted-no-inner-verb");
+});
+
+t("MIXED-36 (MC-10): psql -f tmp.sql across a PowerShell backtick line continuation -> allow", () => {
+  const r = ps("psql -h localhost -d db `\n  -f tmp.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-37 (MC-08): mysql -e \"select 1\" -uroot -> block, -e now INLINE", () => {
+  const r = bash('mysql -e "select 1" -uroot');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-38 (MC-08 + MC-03): mysql --execute=\"select 1\" -> block, =-split + INLINE", () => {
+  const r = bash('mysql --execute="select 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-39 (MC-12): mysql -c -e \"select 1\" -d somedb -> block on -e only; -c (comments) benign", () => {
+  const r = bash('mysql -c -e "select 1" -d somedb');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason.startsWith("inline-sql-content-blind"), true, JSON.stringify(r));
+});
+
+t("MIXED-40 (MC-12 companion): mysql -C -e \"select 1\" -> block on -e; -C (compress) benign", () => {
+  const r = bash('mysql -C -e "select 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-41 (v1 #10): mysql -e \"select 1\" --result-file=out.ps1 -> block", () => {
+  const r = bash('mysql -e "select 1" --result-file=out.ps1');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-42 (MC-08, INVERTED from v1 #11): mysql -e \"select 1\" db -> block", () => {
+  const r = bash('mysql -e "select 1" db');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-43 (MC-08): mysql db -e \"select 1\" -> block, order-independent", () => {
+  const r = bash('mysql db -e "select 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-44 (mysql -p special-case): mysql -pSECRET db -> allow, glued optional-arg password", () => {
+  const r = bash("mysql -pSECRET db");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-45 (mysql -p special-case): mysql -p db -> allow, bare -p does NOT consume db", () => {
+  const r = bash("mysql -p db");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-46 (MC-07): sqlite3 db.sqlite \"SELECT id FROM users\" -> block, second positional is FRICTION", () => {
+  const r = bash('sqlite3 db.sqlite "SELECT id FROM users"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-47 (MC-07, INVERTED from v1 #8): sqlite3 db.sqlite \".read x.sql\" -> block", () => {
+  const r = bash('sqlite3 db.sqlite ".read x.sql"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-48 (decision 4): sqlite3 -cmd \".read x.sql\" db.sqlite -> block, -cmd content-blind", () => {
+  const r = bash('sqlite3 -cmd ".read x.sql" db.sqlite');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-49 (decision 4): sqlite3 -init startup.sql db.sqlite -> allow", () => {
+  const r = bash("sqlite3 -init startup.sql db.sqlite");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-50 (§3 invariant symmetry): sqlite3 -init startup.ps1 db.sqlite -> allow, FILE-role extension-exempt even for .ps1", () => {
+  const r = bash("sqlite3 -init startup.ps1 db.sqlite");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-51 (MC-01 cross-CLI): sqlite3 -init /dev/stdin db.sqlite -> block, stdin-sentinel applies cross-CLI", () => {
+  const r = bash("sqlite3 -init /dev/stdin db.sqlite");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-52 (§7.2 policy): sqlite3 -unsafe-testing db.sqlite -> block, UNKNOWN -> FRICTION (unconfirmed flag)", () => {
+  const r = bash("sqlite3 -unsafe-testing db.sqlite");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "unknown-flag");
+});
+
+t("MIXED-53 (recursion note): bash -c 'psql -c \"select 1\"' -> block via existing shell-inline recursion", () => {
+  const r = bash("bash -c 'psql -c \"select 1\"'");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-54 (§6.3 recursion): pwsh -Command 'psql -c \"select 1\"' -> block via PS-inline recursion", () => {
+  const r = bash('pwsh -Command \'psql -c "select 1"\'');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-55 (§6.3 PowerShell splat): psql @creds -f x.sql -> block, @-prefixed token already ambiguous", () => {
+  const r = ps("psql @creds -f x.sql");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-56 (§6.3 here-string): psql -c @\"\\nSELECT 1\\n\"@ -> block, here-string FRICTION", () => {
+  const r = ps('psql -c @"SELECT 1"@');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-57 (§4): xargs psql -c \"select 1\" -> block, xargs unwrapped", () => {
+  const r = bash('xargs psql -c "select 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-58 (§4): nohup psql -f x.sql -> allow, nohup unwrapped", () => {
+  const r = bash("nohup psql -f x.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-59 (MC2-03, PS-native): docker exec -it dbcontainer psql -c \"DROP TABLE x;\" (native PowerShell) -> block", () => {
+  const r = ps('docker exec -it dbcontainer psql -c "DROP TABLE x;"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-60 (MC2-03, PS-native): ssh dbhost psql -c \"DROP TABLE x;\" (native PowerShell) -> block", () => {
+  const r = ps('ssh dbhost psql -c "DROP TABLE x;"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-61 (MC2-03, PS-native): kubectl exec pod -- psql -c \"DROP TABLE x;\" (native PowerShell) -> block", () => {
+  const r = ps('kubectl exec pod -- psql -c "DROP TABLE x;"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-62 (MC2-03, PS-native): podman run --rm img psql -c \"...\" (native PowerShell) -> block", () => {
+  const r = ps('podman run --rm img psql -c "DROP TABLE x;"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-63 (MC2-01, corrected): mysql db<script.sql -> allow, glued redirect split and resolved via the SAME literal-file rule as the spaced form (decision 1)", () => {
+  const r = bash("mysql db<script.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-64 (MC2-01, corrected): psql -h localhost -d db<script.sql -> allow, glued redirect on a flag-bearing command, literal file", () => {
+  const r = bash("psql -h localhost -d db<script.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-65 (MC2-01): psql -h localhost -d db<(cat evil.sql) -> block, glued process substitution", () => {
+  const r = bash("psql -h localhost -d db<(cat evil.sql)");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-66 (MC2-02): mysql -h attackerhost -u root -e \"select 1\" -> block on -e; -h/-u correctly consume their own args", () => {
+  const r = bash('mysql -h attackerhost -u root -e "select 1"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason.startsWith("inline-sql-content-blind"), true, JSON.stringify(r));
+});
+
+t("MIXED-67 (MC2-02 regression proof): mysql -h localhost -u root db < script.sql (no -e) -> allow", () => {
+  const r = bash("mysql -h localhost -u root db < script.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-68 (MC2-04): mysql -Cpassword123 db -> allow, -C OPTIONAL-glued-only does not misconsume db", () => {
+  const r = bash("mysql -Cpassword123 db");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("MIXED-69 (MC2-08): mysql db extra positional -> block, positional 2+ FRICTION", () => {
+  const r = bash("mysql db extra positional");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("MIXED-70 (MC2-09): psql backtick continuation with TRAILING WHITESPACE, then -f tmp.sql -> allow", () => {
+  const r = ps("psql -h localhost -d db `  \n  -f tmp.sql");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
