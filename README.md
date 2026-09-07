@@ -44,9 +44,15 @@ where a guard needs to check session state; it does not implement it.
 - `scripts/install-guards.js` — merges the guards into a Claude Code
   user-scope `settings.json`, following the same matcher-wrapped schema,
   ownership marker, backup-and-atomic-write, `--dry-run`, `--hooks-scope`,
-  and `--uninstall` pattern used elsewhere for hook installation. This
-  script is never run against a live machine as part of this repository's
-  own tests — it is exercised only against a temporary settings fixture.
+  and `--uninstall` pattern used elsewhere for hook installation. Before
+  overwriting any already-installed hook file (in the destination hooks
+  directory) whose content differs from the incoming copy, it backs up the
+  old copy into a fresh `<hooksDir>/.backup-<ISO timestamp>/` directory
+  (mirroring each file's relative path); a byte-identical existing file is
+  left alone, and `--dry-run` reports how many files would be backed up
+  without writing anything. This script is never run against a live
+  machine as part of this repository's own tests — it is exercised only
+  against a temporary settings fixture.
 - `docs/independence.md` — the first written law: authoring and
   approving/merging are always two separate dispatches; a spec-adversary
   pass runs before a matcher, parser, validator, or gate is authored, not

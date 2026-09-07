@@ -78,7 +78,7 @@ conservative default rather than throwing.
   decision that is fed back to the model as a correction.
 
 ### shell-write-guard.js
-- **Event:** `PreToolUse` (Bash)
+- **Event:** `PreToolUse` (Bash / PowerShell)
 - **Blocks:** a shell command that writes to a file through a redirect,
   `cp`/`mv`/`sed -i`/heredoc, etc., when the write target has a gated
   extension (default `.ps1`/`.psm1`/`.psd1`, overridable in
@@ -111,8 +111,11 @@ conservative default rather than throwing.
   dialog loop.
 
 ### orchestrator-tool-guard.js
-- **Event:** `PreToolUse` (Read / Bash / Write / Edit / Agent's SendMessage
-  path, when routed through PreToolUse)
+- **Event:** `PreToolUse` (Read / Bash / PowerShell / Write / Edit — its
+  `main()` switches on exactly these five `tool_name` values; anything
+  else reaching it, including `Agent`/`SendMessage`, hits the
+  `unexpected_tool_name` block branch, so the matcher must never widen
+  past this list).
 - **Blocks:** the orchestrator tier drafting or touching files directly
   instead of delegating: a Read past a small line cap and a small
   per-session tally, an un-prefixed direct shell command, a Write outside

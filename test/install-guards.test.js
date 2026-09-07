@@ -28,6 +28,10 @@ const {
   diffLines,
   reconcileFormatting,
   makeBackupPath,
+  collectManagedRelPaths,
+  filesDiffer,
+  planBackups,
+  backupDiffering,
 } = require("../scripts/install-guards.js");
 
 const INSTALL_SCRIPT = path.join(__dirname, "..", "scripts", "install-guards.js");
@@ -192,7 +196,8 @@ test("mergeGuardHooks: moves a guard entry found under the wrong matcher", () =>
   };
   const report = mergeGuardHooks(settings, { hooksDir: FAKE_HOOKS_DIR });
   assert.ok(report.moved.some((m) => m.id === "shell-write-guard"));
-  const bashGroup = settings.hooks.PreToolUse.find((e) => e.matcher === "Bash");
+  const expectedMatcher = GUARDS.find((g) => g.id === "shell-write-guard").matcher;
+  const bashGroup = settings.hooks.PreToolUse.find((e) => e.matcher === expectedMatcher);
   assert.ok(bashGroup.hooks.some((h) => isOurs(h.command) && isOurs(h.command).id === "shell-write-guard"));
   const readGroup = settings.hooks.PreToolUse.find((e) => e.matcher === "Read");
   assert.equal(readGroup, undefined, "the now-empty Read group must be pruned");
@@ -330,6 +335,207 @@ test("CLI --force --hooks-scope project then --uninstall: fully sandboxed round 
         `${g.file} must be removed by uninstall`
       );
     }
+  } finally {
+    rmTree(fakeHome);
+    rmTree(fakeProject);
+  }
+});
+
+// ── GUARDS matcher scope: PowerShell (dry-run bug this file's PR fixes) ─────
+
+test("GUARDS: shell-write-guard's matcher includes PowerShell", () => {
+  const g = GUARDS.find((x) => x.id === "shell-write-guard");
+  assert.ok(g, "shell-write-guard must be registered");
+  assert.ok(
+    g.matcher.split("|").includes("PowerShell"),
+    `shell-write-guard.js handles tool_name "PowerShell" (see its own header, "Matcher scope: Bash | PowerShell") ` +
+      `but its GUARDS matcher is ${JSON.stringify(g.matcher)}`
+  );
+});
+
+test("GUARDS: orchestrator-tool-guard's matcher includes PowerShell (and only the five tools its code switches on)", () => {
+  const g = GUARDS.find((x) => x.id === "orchestrator-tool-guard");
+  assert.ok(g, "orchestrator-tool-guard must be registered");
+  const tools = g.matcher.split("|");
+  assert.ok(
+    tools.includes("PowerShell"),
+    `orchestrator-tool-guard.js has an explicit case "PowerShell" but its GUARDS matcher is ${JSON.stringify(g.matcher)}`
+  );
+  // The guard's own switch statement only has cases for these five tool
+  // names; anything else reaching it hits the "unexpected_tool_name" block
+  // branch, per its own header ("matcher should be Read|Bash|PowerShell|
+  // Write|Edit only"). A wider matcher would mean legitimate Agent/
+  // SendMessage calls get unconditionally blocked.
+  assert.deepEqual(tools.sort(), ["Bash", "Edit", "PowerShell", "Read", "Write"].sort());
+});
+
+test("mergeGuardHooks: consolidates a pre-existing standalone Bash entry and a pre-existing standalone PowerShell entry for the same guard into one entry under the guard's combined matcher, without dropping an unrelated hook sharing the PowerShell block", () => {
+  const settings = {
+    hooks: {
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: `node ${FAKE_HOOKS_DIR}/shell-write-guard.js` }] },
+        {
+          matcher: "PowerShell",
+          hooks: [
+            { type: "command", command: `node ${FAKE_HOOKS_DIR}/shell-write-guard.js` },
+            { type: "command", command: "node /somewhere/else/unrelated-ps-hook.js" },
+          ],
+        },
+      ],
+    },
+  };
+  const expectedMatcher = GUARDS.find((g) => g.id === "shell-write-guard").matcher; // "Bash|PowerShell"
+  mergeGuardHooks(settings, { hooksDir: FAKE_HOOKS_DIR });
+
+  // Exactly one shell-write-guard entry remains anywhere, and it lives under
+  // the combined matcher — the operator's real PowerShell-only matcher
+  // block is never simply deleted along with our entry.
+  let hits = 0;
+  let combinedGroupSeen = false;
+  for (const entry of settings.hooks.PreToolUse) {
+    const entryMatcher = typeof entry.matcher === "string" ? entry.matcher : null;
+    for (const inner of entry.hooks || []) {
+      const id = isOurs(inner.command);
+      if (id && id.id === "shell-write-guard") {
+        hits++;
+        assert.equal(entryMatcher, expectedMatcher, "shell-write-guard must live under its combined matcher");
+        combinedGroupSeen = true;
+      }
+    }
+  }
+  assert.equal(hits, 1, "shell-write-guard must appear exactly once after consolidation");
+  assert.ok(combinedGroupSeen);
+
+  // No bare "Bash" or bare "PowerShell" matcher group is left holding a
+  // shell-write-guard entry.
+  for (const entry of settings.hooks.PreToolUse) {
+    if (entry.matcher === "Bash" || entry.matcher === "PowerShell") {
+      for (const inner of entry.hooks || []) {
+        const id = isOurs(inner.command);
+        assert.notEqual(id && id.id, "shell-write-guard");
+      }
+    }
+  }
+
+  // The unrelated hook that shared the standalone PowerShell block survives
+  // (the block is pruned only when it becomes fully empty, never wholesale).
+  const survivorGroup = settings.hooks.PreToolUse.find(
+    (e) => e.matcher === "PowerShell" && (e.hooks || []).some((h) => h.command === "node /somewhere/else/unrelated-ps-hook.js")
+  );
+  assert.ok(survivorGroup, "unrelated hook sharing the old standalone PowerShell block must survive");
+});
+
+// ── Backup of overwritten hook files (safety gap fixed by this PR) ─────────
+
+test("collectManagedRelPaths / filesDiffer / planBackups: identify only differing, installer-managed files", () => {
+  const tmpSrc = mkTmpDir("install-guards-backup-src-");
+  const tmpDest = mkTmpDir("install-guards-backup-dest-");
+  try {
+    fs.writeFileSync(path.join(tmpSrc, "guard-a.js"), "new content A");
+    fs.writeFileSync(path.join(tmpDest, "guard-a.js"), "old content A"); // differs
+    fs.writeFileSync(path.join(tmpSrc, "guard-b.js"), "same content B");
+    fs.writeFileSync(path.join(tmpDest, "guard-b.js"), "same content B"); // identical
+    // guard-c.js exists only in src (fresh install) — must not be "differing".
+    fs.writeFileSync(path.join(tmpSrc, "guard-c.js"), "brand new C");
+    // A file the installer does not manage at all must never be considered.
+    fs.writeFileSync(path.join(tmpDest, "not-ours.js"), "leave me alone");
+
+    assert.equal(filesDiffer(path.join(tmpSrc, "guard-a.js"), path.join(tmpDest, "guard-a.js")), true);
+    assert.equal(filesDiffer(path.join(tmpSrc, "guard-b.js"), path.join(tmpDest, "guard-b.js")), false);
+    assert.equal(filesDiffer(path.join(tmpSrc, "guard-c.js"), path.join(tmpDest, "guard-c.js")), false);
+
+    // planBackups drives off the real GUARDS/SUPPORT_FILES/SUPPORT_DIRS list,
+    // so exercise it against the real repo hooks/ directory instead of the
+    // synthetic guard-a/b/c files above (those only exercise filesDiffer).
+    const realSrcHooksDir = path.join(__dirname, "..", "hooks");
+    const tmpRealDest = mkTmpDir("install-guards-backup-realdest-");
+    try {
+      fs.mkdirSync(tmpRealDest, { recursive: true });
+      const swgSrc = fs.readFileSync(path.join(realSrcHooksDir, "shell-write-guard.js"), "utf8");
+      fs.writeFileSync(path.join(tmpRealDest, "shell-write-guard.js"), swgSrc + "\n// locally modified\n");
+      const npgSrc = fs.readFileSync(path.join(realSrcHooksDir, "no-punt-guard.js"));
+      fs.writeFileSync(path.join(tmpRealDest, "no-punt-guard.js"), npgSrc); // byte-identical
+      fs.writeFileSync(path.join(tmpRealDest, "not-managed-by-installer.js"), "untouchable");
+
+      const toBackup = planBackups(realSrcHooksDir, tmpRealDest);
+      assert.ok(toBackup.includes("shell-write-guard.js"));
+      assert.ok(!toBackup.includes("no-punt-guard.js"));
+      assert.ok(!toBackup.includes("not-managed-by-installer.js"));
+    } finally {
+      rmTree(tmpRealDest);
+    }
+  } finally {
+    rmTree(tmpSrc);
+    rmTree(tmpDest);
+  }
+});
+
+test("backupDiffering: copies only the listed relative paths, preserving subdirectory structure", () => {
+  const tmpDest = mkTmpDir("install-guards-backupdiffering-");
+  try {
+    fs.mkdirSync(path.join(tmpDest, "lib"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDest, "guard-a.js"), "old A");
+    fs.writeFileSync(path.join(tmpDest, "lib", "shared.js"), "old shared");
+    fs.writeFileSync(path.join(tmpDest, "guard-b.js"), "untouched B");
+
+    const backupDir = backupDiffering(tmpDest, ["guard-a.js", path.join("lib", "shared.js")], "2026-01-01T00-00-00.000Z");
+    assert.equal(backupDir, path.join(tmpDest, ".backup-2026-01-01T00-00-00.000Z"));
+    assert.equal(fs.readFileSync(path.join(backupDir, "guard-a.js"), "utf8"), "old A");
+    assert.equal(fs.readFileSync(path.join(backupDir, "lib", "shared.js"), "utf8"), "old shared");
+    assert.equal(fs.existsSync(path.join(backupDir, "guard-b.js")), false, "un-listed file must not be backed up");
+  } finally {
+    rmTree(tmpDest);
+  }
+});
+
+test("CLI --dry-run: reports how many differing files would be backed up, without writing anything", () => {
+  const fakeHome = mkTmpDir("install-guards-home-");
+  const fakeProject = mkTmpDir("install-guards-project-");
+  try {
+    const hooksDir = path.join(fakeHome, ".claude", "hooks");
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const before = "old shell-write-guard content, pre-existing on disk";
+    fs.writeFileSync(path.join(hooksDir, "shell-write-guard.js"), before);
+
+    const out = runCli(["--dry-run", "--hooks-scope", "project"], { home: fakeHome, cwd: fakeProject });
+    assert.match(out, /would back up 1 differing file\(s\)/);
+
+    // Nothing was actually written: the pre-existing file is untouched and
+    // no backup directory was created.
+    assert.equal(fs.readFileSync(path.join(hooksDir, "shell-write-guard.js"), "utf8"), before);
+    const backupDirs = fs.readdirSync(hooksDir).filter((f) => f.startsWith(".backup-"));
+    assert.equal(backupDirs.length, 0);
+  } finally {
+    rmTree(fakeHome);
+    rmTree(fakeProject);
+  }
+});
+
+test("CLI --force real run: backs up a differing hook file and leaves a byte-identical one alone", () => {
+  const fakeHome = mkTmpDir("install-guards-home-");
+  const fakeProject = mkTmpDir("install-guards-project-");
+  try {
+    const hooksDir = path.join(fakeHome, ".claude", "hooks");
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const oldContent = "old shell-write-guard content, pre-existing on disk";
+    fs.writeFileSync(path.join(hooksDir, "shell-write-guard.js"), oldContent);
+    // no-punt-guard.js pre-exists byte-identical to what the installer will
+    // copy in, so it must be left alone (not backed up).
+    const realNoPunt = fs.readFileSync(path.join(__dirname, "..", "hooks", "no-punt-guard.js"));
+    fs.writeFileSync(path.join(hooksDir, "no-punt-guard.js"), realNoPunt);
+
+    const out = runCli(["--force", "--hooks-scope", "project"], { home: fakeHome, cwd: fakeProject });
+    assert.match(out, /Backed up 1 differing file\(s\) to/);
+
+    const backupDirs = fs.readdirSync(hooksDir).filter((f) => f.startsWith(".backup-"));
+    assert.equal(backupDirs.length, 1, "exactly one backup directory must be created");
+    const backupDir = path.join(hooksDir, backupDirs[0]);
+    assert.equal(fs.readFileSync(path.join(backupDir, "shell-write-guard.js"), "utf8"), oldContent);
+    assert.equal(fs.existsSync(path.join(backupDir, "no-punt-guard.js")), false, "identical file must not be backed up");
+
+    // The live file was actually overwritten with the new content.
+    const realSwg = fs.readFileSync(path.join(__dirname, "..", "hooks", "shell-write-guard.js"), "utf8");
+    assert.equal(fs.readFileSync(path.join(hooksDir, "shell-write-guard.js"), "utf8"), realSwg);
   } finally {
     rmTree(fakeHome);
     rmTree(fakeProject);
