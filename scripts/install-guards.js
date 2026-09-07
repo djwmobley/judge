@@ -30,9 +30,10 @@
  *
  * Testability: mergeGuardHooks(), isOurs(), normalizeCommand(),
  * validateHooksSection(), scanEntries(), detectIndent(), detectOursPresent(),
- * serializeSettings(), diffLines(), reconcileFormatting(), unifiedDiff(), and
- * makeBackupPath() are exported for unit testing against in-memory objects
- * and temp-directory fixtures ONLY — requiring this module never touches
+ * serializeSettings(), diffLines(), reconcileFormatting(), unifiedDiff(),
+ * makeBackupPath(), collectManagedRelPaths(), filesDiffer(), planBackups(),
+ * and backupDiffering() are exported for unit testing against in-memory
+ * objects and temp-directory fixtures ONLY — requiring this module never touches
  * argv/cwd/process.exit/the real home directory; resolveConfig() and main()
  * only run when this file is executed directly. The test suite for this
  * file (hooks/../test/install-guards.test.js) must never point at a real
@@ -51,7 +52,7 @@ const os   = require('node:os');
 // has no tool to match against).
 const GUARDS = [
   { id: 'no-punt-guard', file: 'no-punt-guard.js', event: 'Stop', matcher: null },
-  { id: 'shell-write-guard', file: 'shell-write-guard.js', event: 'PreToolUse', matcher: 'Bash' },
+  { id: 'shell-write-guard', file: 'shell-write-guard.js', event: 'PreToolUse', matcher: 'Bash|PowerShell' },
   { id: 'bash-powershell-guard', file: 'bash-powershell-guard.js', event: 'PreToolUse', matcher: 'Bash' },
   { id: 'worktree-isolation-guard', file: 'worktree-isolation-guard.js', event: 'PreToolUse', matcher: 'Bash' },
   { id: 'bash-classifier-bait-guard', file: 'bash-classifier-bait-guard.js', event: 'PreToolUse', matcher: 'Bash' },
@@ -60,7 +61,7 @@ const GUARDS = [
     id: 'orchestrator-tool-guard',
     file: 'orchestrator-tool-guard.js',
     event: 'PreToolUse',
-    matcher: 'Read|Bash|Write|Edit|Agent|SendMessage',
+    matcher: 'Read|Bash|PowerShell|Write|Edit',
   },
   {
     id: 'agent-permission-preflight',
@@ -140,7 +141,11 @@ Usage: node scripts/install-guards.js [--dry-run] [--force] [--non-interactive]
 Copies this repo's hooks/*.js guards (plus hooks/lib/) to ~/.claude/hooks/
 and merges their PreToolUse/Stop entries into a Claude Code settings file.
 Existing hooks are preserved — this script only adds/re-points/removes its
-own guard entries (see hooks/README.md), never anyone else's.
+own guard entries (see hooks/README.md), never anyone else's. Before
+overwriting an already-installed hook file whose content differs from the
+incoming copy, the old copy is backed up to
+~/.claude/hooks/.backup-<ISO timestamp>/ first (byte-identical files are
+left alone).
 
 Flags:
   --dry-run          Show what would happen without writing anything; prints
@@ -627,6 +632,83 @@ function makeBackupPath(targetSettingsPath, ts) {
   return backupPath;
 }
 
+// ─── BACKUP OF OVERWRITTEN HOOK FILES ────────────────────────────────────────
+
+/**
+ * Every relative path (relative to hooksDir) this installer will write on a
+ * normal (non-uninstall) run: each GUARDS file, each SUPPORT_FILES entry
+ * that exists in srcHooksDir, and every file found directly inside each
+ * SUPPORT_DIRS subdirectory. This is also the exact set eligible for
+ * backup — the installer never backs up, or otherwise touches, any file
+ * outside it.
+ */
+function collectManagedRelPaths(srcHooksDir) {
+  const relPaths = [];
+  for (const g of GUARDS) relPaths.push(g.file);
+  for (const f of SUPPORT_FILES) {
+    if (fs.existsSync(path.join(srcHooksDir, f))) relPaths.push(f);
+  }
+  for (const d of SUPPORT_DIRS) {
+    const srcDir = path.join(srcHooksDir, d);
+    if (!fs.existsSync(srcDir)) continue;
+    for (const f of fs.readdirSync(srcDir)) {
+      relPaths.push(path.join(d, f));
+    }
+  }
+  return relPaths;
+}
+
+/**
+ * True only when destPath exists AND its bytes differ from srcPath's. A
+ * missing dest (fresh install of that file) or byte-identical dest are both
+ * "no backup needed" — this function never mutates either path.
+ */
+function filesDiffer(srcPath, destPath) {
+  if (!fs.existsSync(destPath)) return false;
+  if (!fs.existsSync(srcPath)) return false;
+  const a = fs.readFileSync(srcPath);
+  const b = fs.readFileSync(destPath);
+  return !a.equals(b);
+}
+
+/**
+ * Read-only plan: which of the installer-managed relative paths (see
+ * collectManagedRelPaths) already exist in destHooksDir with DIFFERENT
+ * content than the incoming src copy. Never writes anything — safe to call
+ * from --dry-run. Returns the list of differing relative paths (identical
+ * or not-yet-present files are excluded).
+ */
+function planBackups(srcHooksDir, destHooksDir) {
+  const relPaths = collectManagedRelPaths(srcHooksDir);
+  const toBackup = [];
+  for (const rel of relPaths) {
+    if (filesDiffer(path.join(srcHooksDir, rel), path.join(destHooksDir, rel))) {
+      toBackup.push(rel);
+    }
+  }
+  return toBackup;
+}
+
+/**
+ * Copy each of `relPaths` (as they currently stand in destHooksDir, i.e.
+ * BEFORE this run's overwrite) into a fresh `.backup-<ISO timestamp>/`
+ * subdirectory of destHooksDir, mirroring each file's relative path.
+ * Callers must only ever pass relPaths produced by planBackups(), so this
+ * never touches a file the installer doesn't manage. Returns the backup
+ * directory's absolute path. Only called when relPaths is non-empty.
+ */
+function backupDiffering(destHooksDir, relPaths, ts) {
+  const stamp = ts || new Date().toISOString().replace(/:/g, '-');
+  const backupDir = path.join(destHooksDir, `.backup-${stamp}`);
+  for (const rel of relPaths) {
+    const destSrc = path.join(destHooksDir, rel);
+    const destBackup = path.join(backupDir, rel);
+    fs.mkdirSync(path.dirname(destBackup), { recursive: true });
+    fs.copyFileSync(destSrc, destBackup);
+  }
+  return backupDir;
+}
+
 function printReport(report) {
   console.log(`    added:      ${report.added.length}`);
   console.log(`    repointed:  ${report.repointed.length}`);
@@ -685,6 +767,12 @@ async function main(cfg) {
     console.log(`  Hooks (would ${settingsExists ? 'merge into' : 'create'} ${targetSettingsPath}):`);
     printReport(report);
     console.log('');
+    if (!uninstall) {
+      const toBackup = planBackups(srcHooksDir, destHooksDir);
+      console.log(`  Files (would copy to ${destHooksDir}):`);
+      console.log(`    would back up ${toBackup.length} differing file(s)`);
+      console.log('');
+    }
     const diff = unifiedDiff(beforeText, afterText, path.basename(targetSettingsPath));
     console.log(diff ? `  Diff:\n${diff.split('\n').map((l) => (l ? `  ${l}` : l)).join('\n')}` : '  Diff: (no changes)');
     console.log('\nDry-run complete. Re-run without --dry-run to apply.\n');
@@ -698,6 +786,11 @@ async function main(cfg) {
     }
   } else {
     fs.mkdirSync(destHooksDir, { recursive: true });
+    const toBackup = planBackups(srcHooksDir, destHooksDir);
+    if (toBackup.length > 0) {
+      const backupFilesDir = backupDiffering(destHooksDir, toBackup);
+      console.log(`  Backed up ${toBackup.length} differing file(s) to ${backupFilesDir}`);
+    }
     for (const g of GUARDS) {
       fs.copyFileSync(path.join(srcHooksDir, g.file), path.join(destHooksDir, g.file));
     }
@@ -765,4 +858,8 @@ module.exports = {
   diffLines,
   reconcileFormatting,
   makeBackupPath,
+  collectManagedRelPaths,
+  filesDiffer,
+  planBackups,
+  backupDiffering,
 };
