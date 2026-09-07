@@ -29,9 +29,15 @@
 //     30-second timeout -- 10s of margin over the internal 20s deadline for
 //     this process's own stdout write to complete before any harness-level
 //     kill (see hooks/README.md's blind-spots note on this).
-//   - No state file, no strike counter, no session-keyed ledger. Every
-//     Stop invocation independently re-runs full classification from
-//     scratch -- see JUDGE_STOP_GUARD below for the one and only bypass.
+//   - Every Stop invocation independently re-runs full classification
+//     (worktrees/branches/remote refs) from scratch -- see JUDGE_STOP_GUARD
+//     below for the env-var bypass. A SEPARATE bounded-reblock layer
+//     (applyBoundedReblock, near the bottom of this file; spec
+//     docs/specs/stop-guard-bounded-reblock.md) sits on top of that
+//     unchanged classification pass and DOES keep small, per-item,
+//     per-session_id state -- this reverses this guard's original
+//     "no state, no yield" design (see stop-stale-worktrees-guard.md's
+//     section 4 for the reversal note and the incident that prompted it).
 //   - Remote-tracking refs (refs/remotes/*, spec section 13, adversaried a
 //     third round -- section 14) are a third classification target
 //     alongside worktrees and local branches: `stale-remote` (merged into
@@ -56,8 +62,10 @@
 // convention (see that file's own header, lines 15-19), not independently
 // re-derived from platform docs:
 //   - Print JSON {"decision":"block","reason":"<text>"} to STDOUT to block.
-//   - Allow -> no output at all, OR (bypass / in-progress-operation only)
-//     {"systemMessage":"<text>"} with no "decision" field.
+//   - Allow -> no output at all, OR (bypass, in-progress-operation,
+//     active-worktree, foreign-remote note, or a bounded-reblock yield --
+//     spec docs/specs/stop-guard-bounded-reblock.md) {"systemMessage":
+//     "<text>"} with no "decision" field.
 //   - Exit code is always 0 -- the decision field controls blocking, not
 //     the exit code. This hook never exits 2.
 //
@@ -68,6 +76,12 @@
 const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
+const {
+  STATE_DIR,
+  SEVEN_DAYS_MS,
+  sanitizeForFilename,
+  cleanupOldStateFiles,
+} = require("./model-routing-guards.state.js");
 
 const RULES_VERSION = "stop-stale-worktrees-guard:1";
 
@@ -960,6 +974,16 @@ function classifyWorktrees(records, branchResultsByName, execGit, targetDir, bud
 
 // ─── Reason text assembly ──────────────────────────────────────────────────
 
+// A fix sequence containing an externally-visible remote mutation is
+// flagged in the reason line itself (spec `stop-guard-bounded-reblock.md`
+// §2 item 6) -- same regex `stripRedundantPushDeleteLine` already uses to
+// find this exact line shape.
+const PUSH_DELETE_LINE_RE = /^git push \S+ --delete /;
+
+function isOperatorOnlyFinding(f) {
+  return !!(f.fixLines && f.fixLines.some((l) => PUSH_DELETE_LINE_RE.test(l)));
+}
+
 function formatFinding(f) {
   let line;
   if (f.kind === "worktree") line = `[worktree:${f.role}] ${f.path} — ${f.class}`;
@@ -972,6 +996,9 @@ function formatFinding(f) {
     line += ` — fix: ${f.fixLines.join(" ; ")}`;
   } else {
     line += " — no fix offered, inspect manually";
+  }
+  if (isOperatorOnlyFinding(f)) {
+    line += " (externally visible, run it or ask the operator)";
   }
   return line;
 }
@@ -1008,6 +1035,51 @@ function buildDeadlineReason(classified, notReached) {
   );
 }
 
+// ─── Bounded-reblock item extraction (spec `stop-guard-bounded-reblock.md`
+// §3) ────────────────────────────────────────────────────────────────────
+//
+// Every block-producing return site below pairs its existing, UNCHANGED
+// `reason` string with a small per-item breakdown used only by
+// `applyBoundedReblock` (defined further down, after `evaluateStop`) to key
+// per-item strike counts on. This is purely additive: `buildBlockedReason`/
+// `buildUnknownReason`/`buildDeadlineReason` above are untouched, and every
+// existing caller that only reads `.action`/`.reason` sees identical
+// behavior to before this spec.
+
+function itemsForFindings(findings) {
+  // `f.kind` is the STRUCTURAL type (worktree/branch/remote); `f.class` is
+  // the classification outcome (stale/unknown). Item identity kind (spec
+  // `stop-guard-bounded-reblock.md` §3) is "unknown" for an unclassifiable
+  // finding regardless of its structural kind -- kept specific by identity
+  // (still keyed on the same path/name/refname), never collapsed to a bare
+  // shared "unknown" bucket.
+  return findings.map((f) => ({
+    kind: f.class === "unknown" ? "unknown" : f.kind,
+    rawIdentity: f.path || f.name || f.refname || "",
+    line: formatFinding(f),
+  }));
+}
+
+function itemsForUnknown(label, detail) {
+  return [{ kind: "unknown", rawIdentity: label, line: buildUnknownReason(label, detail) }];
+}
+
+function itemsForDeadline(classified, notReached) {
+  return [{ kind: "deadline", rawIdentity: "deadline", line: buildDeadlineReason(classified, notReached) }];
+}
+
+function blockFindings(findings) {
+  return { action: "block", reason: buildBlockedReason(findings), items: itemsForFindings(findings) };
+}
+
+function blockUnknown(label, detail) {
+  return { action: "block", reason: buildUnknownReason(label, detail), items: itemsForUnknown(label, detail) };
+}
+
+function blockDeadline(classified, notReached) {
+  return { action: "block", reason: buildDeadlineReason(classified, notReached), items: itemsForDeadline(classified, notReached) };
+}
+
 // ─── Top-level evaluation (spec §2-§4, single entry point) ────────────────
 
 /**
@@ -1034,24 +1106,24 @@ function evaluateStop(targetDir, deps) {
 
   const scope = classifyScope(targetDir, execGit, budget);
   if (scope.status === "out-of-scope") return { action: "allow" };
-  if (scope.status === "unknown") return { action: "block", reason: buildUnknownReason("scope-gate", scope.reason) };
+  if (scope.status === "unknown") return blockUnknown("scope-gate", scope.reason);
 
   const classified = [];
   const notReached = [];
 
   const baseResult = resolveBaseBranch(targetDir, execGit, budget);
-  if (baseResult.deadlineExpired) return { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "base-branch-resolution" }]) };
-  if (!baseResult.ok) return { action: "block", reason: buildUnknownReason("base-branch-undeterminable", baseResult.reasonText) };
+  if (baseResult.deadlineExpired) return blockDeadline(classified, [{ kind: "step", id: "base-branch-resolution" }]);
+  if (!baseResult.ok) return blockUnknown("base-branch-undeterminable", baseResult.reasonText);
   const base = baseResult.base;
   classified.push({ kind: "step", id: "base-branch-resolution", class: base.name });
 
-  if (budget.remaining() <= 0) return { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "worktree-list" }, { kind: "step", id: "branch-list" }]) };
+  if (budget.remaining() <= 0) return blockDeadline(classified, [{ kind: "step", id: "worktree-list" }, { kind: "step", id: "branch-list" }]);
 
   const wtListRes = gitCall(execGit, ["worktree", "list", "--porcelain"], targetDir, budget);
   if (!wtListRes.ok) {
     return callFailed(wtListRes)
-      ? { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "worktree-list" }]) }
-      : { action: "block", reason: buildUnknownReason("worktree-list-failed", wtListRes.message || "git worktree list --porcelain failed") };
+      ? blockDeadline(classified, [{ kind: "step", id: "worktree-list" }])
+      : blockUnknown("worktree-list-failed", wtListRes.message || "git worktree list --porcelain failed");
   }
   const records = parseWorktreePorcelain(wtListRes.stdout);
   classified.push({ kind: "step", id: "worktree-list", class: `${records.length} record(s)` });
@@ -1059,8 +1131,8 @@ function evaluateStop(targetDir, deps) {
   const ferRes = gitCall(execGit, ["for-each-ref", "--format=" + FER_FORMAT, "refs/heads"], targetDir, budget);
   if (!ferRes.ok) {
     return callFailed(ferRes)
-      ? { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "branch-list" }]) }
-      : { action: "block", reason: buildUnknownReason("branch-list-failed", ferRes.message || "git for-each-ref failed") };
+      ? blockDeadline(classified, [{ kind: "step", id: "branch-list" }])
+      : blockUnknown("branch-list-failed", ferRes.message || "git for-each-ref failed");
   }
   const branches = parseForEachRef(ferRes.stdout);
   classified.push({ kind: "step", id: "branch-list", class: `${branches.length} branch(es)` });
@@ -1068,8 +1140,8 @@ function evaluateStop(targetDir, deps) {
   const treeSetRes = gitCall(execGit, ["log", "--max-count=500", "--format=%T", base.tip], targetDir, budget);
   if (!treeSetRes.ok) {
     return callFailed(treeSetRes)
-      ? { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "base-tree-set" }]) }
-      : { action: "block", reason: buildUnknownReason("base-tree-set-failed", treeSetRes.message || "git log --format=%T on the base branch failed") };
+      ? blockDeadline(classified, [{ kind: "step", id: "base-tree-set" }])
+      : blockUnknown("base-tree-set-failed", treeSetRes.message || "git log --format=%T on the base branch failed");
   }
   base.treeSet = new Set(treeSetRes.stdout.split(/\r?\n/).filter(Boolean));
   classified.push({ kind: "step", id: "base-tree-set", class: `${base.treeSet.size} tree(s)` });
@@ -1103,7 +1175,7 @@ function evaluateStop(targetDir, deps) {
     classified.push({ kind: "branch", id: br.name, class: result.class });
   }
   if (notReached.length > 0) {
-    return { action: "block", reason: buildDeadlineReason(classified, notReached) };
+    return blockDeadline(classified, notReached);
   }
 
   // ── Remote-tracking refs (spec §3 "Remote-tracking branches", §13) ──
@@ -1115,8 +1187,8 @@ function evaluateStop(targetDir, deps) {
   const remoteEnumRes = listRemoteRefs(execGit, targetDir, budget);
   if (!remoteEnumRes.ok) {
     return remoteEnumRes.deadlineExpired
-      ? { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "remote-list" }]) }
-      : { action: "block", reason: buildUnknownReason("remote-list-failed", remoteEnumRes.message || "git for-each-ref refs/remotes and its reduced-format for-each-ref fallback both failed") };
+      ? blockDeadline(classified, [{ kind: "step", id: "remote-list" }])
+      : blockUnknown("remote-list-failed", remoteEnumRes.message || "git for-each-ref refs/remotes and its reduced-format for-each-ref fallback both failed");
   }
   classified.push({ kind: "step", id: "remote-list", class: `${remoteEnumRes.refs.length} ref(s)${remoteEnumRes.usedFallback ? " (via fallback)" : ""}` });
 
@@ -1133,8 +1205,8 @@ function evaluateStop(targetDir, deps) {
     const remotesListRes = gitCall(execGit, ["remote"], targetDir, budget);
     if (!remotesListRes.ok) {
       return callFailed(remotesListRes)
-        ? { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "remote-names" }]) }
-        : { action: "block", reason: buildUnknownReason("remote-names-failed", remotesListRes.message || "git remote failed") };
+        ? blockDeadline(classified, [{ kind: "step", id: "remote-names" }])
+        : blockUnknown("remote-names-failed", remotesListRes.message || "git remote failed");
     }
     const remoteNames = remotesListRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
     classified.push({ kind: "step", id: "remote-names", class: `${remoteNames.length} remote(s)` });
@@ -1155,7 +1227,7 @@ function evaluateStop(targetDir, deps) {
       classified.push({ kind: "remote", id: shortName, class: "unknown" });
     }
     if (remoteNotReached.length > 0) {
-      return { action: "block", reason: buildDeadlineReason(classified, remoteNotReached) };
+      return blockDeadline(classified, remoteNotReached);
     }
   }
 
@@ -1172,7 +1244,7 @@ function evaluateStop(targetDir, deps) {
   }
 
   if (budget.remaining() <= 0) {
-    return { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "worktree-classification" }]) };
+    return blockDeadline(classified, [{ kind: "step", id: "worktree-classification" }]);
   }
 
   const wtOutcome = classifyWorktrees(records, branchResultsByName, execGit, targetDir, budget, fsx, remoteByTrackingBranchName, baseRemoteName);
@@ -1264,7 +1336,272 @@ function evaluateStop(targetDir, deps) {
     return { action: "allow" };
   }
 
-  return { action: "block", reason: buildBlockedReason(allFindings) };
+  return blockFindings(allFindings);
+}
+
+// ─── Bounded re-block (spec docs/specs/stop-guard-bounded-reblock.md) ─────
+//
+// Layered entirely on top of the classification pass above -- every
+// exported function up to this point keeps its exact pre-existing
+// signature and behavior (spec §2 item 9). `applyBoundedReblock` is the
+// single entry point `main()` calls with the raw result of `evaluateStop`;
+// an "allow" or "allow-message" result passes straight through untouched
+// -- only a "block" result (which always carries a non-empty `items` list,
+// per the wrappers above) engages any of this.
+
+const REBLOCK_STRIKE_CAP = 3;
+const REBLOCK_STATE_PREFIX = "stop-stale-worktrees-guard.";
+const REBLOCK_STATE_SUFFIX = ".json";
+const REBLOCK_YIELD_LOG_PATH = path.join(STATE_DIR, "stop-stale-worktrees-guard.yields.log");
+
+function reblockStatePath(stateDir, sessionKey) {
+  return path.join(stateDir, `${REBLOCK_STATE_PREFIX}${sessionKey}${REBLOCK_STATE_SUFFIX}`);
+}
+
+/**
+ * Item key = `${kind}:${normalizedIdentity}` (spec §3). Reuses this file's
+ * own `normalizePathForCompare` uniformly for every identity string --
+ * paths, branch/ref names, and the fixed diagnostic labels/literal
+ * "deadline" alike -- rather than a separate normalization rule per kind.
+ */
+function computeItemKey(kind, rawIdentity) {
+  return `${kind}:${normalizePathForCompare(rawIdentity) || ""}`;
+}
+
+/** Non-string or blank-after-trim -- the one Unicode-stripping nuance this
+ * file doesn't otherwise need; a plain trim covers every real Stop-hook
+ * stdin shape this guard has ever seen. */
+function isBlankSessionId(sessionIdRaw) {
+  return typeof sessionIdRaw !== "string" || sessionIdRaw.trim() === "";
+}
+
+/**
+ * Read + parse this session's state file. Any failure (missing file,
+ * unreadable, bad JSON, non-object body, non-object `items`) is treated
+ * identically to "absent" -- spec §3 step 2, a deliberately safe-direction
+ * fallback (can only ever reset progress toward a yield, never accelerate
+ * one).
+ */
+function readReblockState(fsx, statePath) {
+  try {
+    const raw = fsx.readFileSync(statePath, "utf8");
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj === "object" && obj.items && typeof obj.items === "object" && !Array.isArray(obj.items)) {
+      return obj;
+    }
+    return { items: {} };
+  } catch (_) {
+    return { items: {} };
+  }
+}
+
+/**
+ * Atomic write: temp file in the same directory, then `renameSync` onto
+ * the final path (spec §2 item 3). Returns `{ ok: true }` or
+ * `{ ok: false, error }` -- never throws.
+ */
+function writeReblockStateAtomic(fsx, stateDir, statePath, obj) {
+  try {
+    fsx.mkdirSync(stateDir, { recursive: true });
+    const tmpPath = `${statePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+    fsx.writeFileSync(tmpPath, JSON.stringify(obj));
+    fsx.renameSync(tmpPath, statePath);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+}
+
+/** One O_APPEND writeSync, matching `agent-tier-ledger.js`'s own
+ * atomicity convention for its append-only files. Best-effort: a failure
+ * here never reverts an already-decided allow (spec §5) -- the state file
+ * write (which DOES gate the decision) already succeeded by the time this
+ * runs. */
+function appendYieldLogLine(fsx, yieldLogPath, obj) {
+  try {
+    fsx.mkdirSync(path.dirname(yieldLogPath), { recursive: true });
+    const fd = fsx.openSync(yieldLogPath, "a");
+    try {
+      fsx.writeSync(fd, JSON.stringify(obj) + "\n");
+    } finally {
+      fsx.closeSync(fd);
+    }
+  } catch (_) {
+    // Best-effort only -- see this function's own header comment.
+  }
+}
+
+function defaultReblockFs() {
+  return {
+    readFileSync: (p, enc) => fs.readFileSync(p, enc),
+    writeFileSync: (p, data) => fs.writeFileSync(p, data),
+    renameSync: (a, b) => fs.renameSync(a, b),
+    mkdirSync: (p, opts) => fs.mkdirSync(p, opts),
+    existsSync: (p) => fs.existsSync(p),
+    readdirSync: (p) => fs.readdirSync(p),
+    statSync: (p) => fs.statSync(p),
+    unlinkSync: (p) => fs.unlinkSync(p),
+    openSync: (p, flags) => fs.openSync(p, flags),
+    writeSync: (fd, data) => fs.writeSync(fd, data),
+    closeSync: (fd) => fs.closeSync(fd),
+  };
+}
+
+/**
+ * Single entry point for the bounded-reblock layer (spec §3's decision
+ * procedure, verbatim). `baseResult` is exactly what `evaluateStop`
+ * returned. `stdinInfo` = `{ session_id, stop_hook_active }` as read from
+ * the Stop hook's own stdin JSON. `deps` (all optional, for test
+ * injection): `{ stateDir, yieldLogPath, now, fs }`.
+ */
+function applyBoundedReblock(baseResult, stdinInfo, deps) {
+  if (!baseResult || baseResult.action !== "block") return baseResult;
+
+  deps = deps || {};
+  const stateDir = deps.stateDir || STATE_DIR;
+  // Derived from `stateDir` (not the separately-defaulted module constant)
+  // whenever `yieldLogPath` itself isn't explicitly overridden -- so
+  // overriding `stateDir` alone (as this file's own test suite does, and
+  // as JUDGE_STOP_GUARD_STATE_DIR does in `main()`) always keeps the log
+  // in the same place as the state files, without also having to repeat
+  // the override for `yieldLogPath` separately.
+  const yieldLogPath = deps.yieldLogPath || path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+  const now = deps.now || Date.now;
+  const fsx = deps.fs || defaultReblockFs();
+
+  // Fail-soft sweep, every run this layer actually engages (spec §2 item 3).
+  // `cleanupOldStateFiles` always sweeps its own module-level `STATE_DIR`
+  // (shared with `agent-tier-ledger.js`'s own sweep); real production runs
+  // always use that directory, so this call handles them. When a test
+  // injects a different `stateDir` (isolation from the real, shared state
+  // directory), sweep that directory too using the identical prefix/
+  // suffix/age rule inline below -- kept deliberately simple rather than
+  // generalizing `cleanupOldStateFiles` itself to take a directory.
+  try {
+    cleanupOldStateFiles(SEVEN_DAYS_MS, REBLOCK_STATE_PREFIX, REBLOCK_STATE_SUFFIX);
+  } catch (_) {
+    // Never affects the current decision.
+  }
+  if (stateDir !== STATE_DIR) {
+    try {
+      if (fsx.existsSync(stateDir)) {
+        const nowMs = now();
+        for (const f of fsx.readdirSync(stateDir)) {
+          if (!f.startsWith(REBLOCK_STATE_PREFIX) || !f.endsWith(REBLOCK_STATE_SUFFIX)) continue;
+          const full = path.join(stateDir, f);
+          try {
+            const st = fsx.statSync(full);
+            if (nowMs - st.mtimeMs > SEVEN_DAYS_MS) fsx.unlinkSync(full);
+          } catch (_) {
+            // Per-file failure: ignore, keep scanning the rest.
+          }
+        }
+      }
+    } catch (_) {
+      // Never affects the current decision.
+    }
+  }
+
+  const sessionIdRaw = stdinInfo && stdinInfo.session_id;
+  if (isBlankSessionId(sessionIdRaw)) {
+    return {
+      action: "block",
+      reason:
+        baseResult.reason +
+        "\n\n[stop-guard-bounded-reblock] session_id missing or malformed on stdin: bounded re-block " +
+        "tracking disabled for this invocation (fail-closed). Every block behaves as an unconditional " +
+        "block until a valid session_id is present.",
+    };
+  }
+
+  const sessionKey = sanitizeForFilename(sessionIdRaw);
+  const statePath = reblockStatePath(stateDir, sessionKey);
+  const state = readReblockState(fsx, statePath);
+
+  const nowMs = now();
+  const nowIso = new Date(nowMs).toISOString();
+  state.session_id = sessionIdRaw;
+  state.stop_hook_active_last = stdinInfo.stop_hook_active === true;
+  if (!state.created_at) state.created_at = nowIso;
+  state.updated_at = nowIso;
+  if (!state.items || typeof state.items !== "object") state.items = {};
+
+  // Partition on the PRE-increment strike count -- this is what makes "3
+  // identical blocks then a yield" land exactly on the 4th invocation: an
+  // item already at the cap (from a PRIOR invocation) is high-strike and
+  // gets no further increment (it's already exhausted, nothing more to
+  // count); an item still under the cap is low-strike, blocks THIS
+  // invocation too, and is the one that gets incremented -- even when that
+  // increment lands it exactly on the cap (its 3rd block), since the cap
+  // check that turns it into a yield only applies starting the NEXT time
+  // it's seen.
+  const lowStrike = [];
+  const highStrike = [];
+  for (const item of baseResult.items) {
+    const key = computeItemKey(item.kind, item.rawIdentity);
+    const existing = state.items[key];
+    const existingStrikes = existing && typeof existing.strikes === "number" ? existing.strikes : 0;
+    if (existingStrikes >= REBLOCK_STRIKE_CAP) {
+      highStrike.push({ item, key, strikes: existingStrikes });
+      continue; // already exhausted from a prior invocation -- no further increment.
+    }
+    const strikes = existingStrikes + 1;
+    state.items[key] = {
+      kind: item.kind,
+      identity: normalizePathForCompare(item.rawIdentity) || "",
+      strikes,
+      first_block_at: (existing && existing.first_block_at) || nowIso,
+      last_block_at: nowIso,
+    };
+    lowStrike.push({ item, key, strikes });
+  }
+
+  const writeResult = writeReblockStateAtomic(fsx, stateDir, statePath, state);
+  if (!writeResult.ok) {
+    return {
+      action: "block",
+      reason:
+        baseResult.reason +
+        `\n\n[stop-guard-bounded-reblock] state write failed at ${statePath}: ${writeResult.error} -- ` +
+        "blocking to avoid a silent premature yield (classification succeeded; persistence failed).",
+    };
+  }
+
+  if (lowStrike.length > 0) {
+    const capped = lowStrike.slice(0, REASON_ITEM_CAP);
+    const lines = capped.map((e) => e.item.line);
+    if (lowStrike.length > REASON_ITEM_CAP) {
+      lines.push(`...and ${lowStrike.length - REASON_ITEM_CAP} more`);
+    }
+    let reason = lines.join("\n");
+    if (highStrike.length > 0) {
+      reason +=
+        `\n(${highStrike.length} item(s) omitted here after reaching the ${REBLOCK_STRIKE_CAP}-block cap; ` +
+        `see the eventual yield summary or ${yieldLogPath}.)`;
+    }
+    return { action: "block", reason };
+  }
+
+  // Every item this invocation is blocking on has reached the cap -- allow,
+  // summarize, and log (spec §3 step 6).
+  const summaryLines = highStrike.map((e) => `- ${e.item.line} (strikes: ${e.strikes})`);
+  const message =
+    `STALE ITEMS REMAIN (stop-guard-bounded-reblock: yielded after ${REBLOCK_STRIKE_CAP} identical blocks ` +
+    "per item; this will not be re-blocked again this session -- resolve manually if it still matters):\n" +
+    summaryLines.join("\n") +
+    `\nDurable record: ${yieldLogPath}`;
+
+  for (const e of highStrike) {
+    appendYieldLogLine(fsx, yieldLogPath, {
+      ts: nowIso,
+      session_id: sessionIdRaw,
+      item: e.key,
+      strikes: e.strikes,
+      summary: e.item.line,
+    });
+  }
+
+  return { action: "allow-message", message };
 }
 
 // Export pure functions for unit-test isolation.
@@ -1307,6 +1644,21 @@ module.exports = {
   hasUnintegratedCommits,
   parseReflogLastTimestampMs,
   detectWorktreeActivity,
+  // Bounded re-block (docs/specs/stop-guard-bounded-reblock.md).
+  REBLOCK_STRIKE_CAP,
+  REBLOCK_STATE_PREFIX,
+  REBLOCK_STATE_SUFFIX,
+  REBLOCK_YIELD_LOG_PATH,
+  reblockStatePath,
+  computeItemKey,
+  isOperatorOnlyFinding,
+  itemsForFindings,
+  itemsForUnknown,
+  itemsForDeadline,
+  readReblockState,
+  writeReblockStateAtomic,
+  appendYieldLogLine,
+  applyBoundedReblock,
 };
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -1342,6 +1694,23 @@ function main() {
   let result;
   try {
     result = evaluateStop(targetDir, {});
+    // JUDGE_STOP_GUARD_STATE_DIR overrides where bounded-reblock state and
+    // the yields log live -- same override-via-env convention as
+    // JUDGE_STOP_GUARD_QUIET_MINUTES above. Exists primarily for this
+    // file's own test suite (isolating each subprocess call's strike state
+    // from every other), and secondarily for an install that wants its
+    // state directory relocated (e.g. a read-only hooks install path).
+    const reblockDeps = {};
+    const stateDirOverride = process.env.JUDGE_STOP_GUARD_STATE_DIR;
+    if (typeof stateDirOverride === "string" && stateDirOverride.trim() !== "") {
+      reblockDeps.stateDir = stateDirOverride;
+      reblockDeps.yieldLogPath = path.join(stateDirOverride, "stop-stale-worktrees-guard.yields.log");
+    }
+    result = applyBoundedReblock(
+      result,
+      { session_id: parsed.session_id, stop_hook_active: parsed.stop_hook_active === true },
+      reblockDeps
+    );
   } catch (_) {
     // An unexpected bug in THIS guard's own code (not a classified git
     // failure -- those are returned, never thrown) must never brick every

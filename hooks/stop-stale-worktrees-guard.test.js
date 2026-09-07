@@ -33,6 +33,9 @@ const {
   defaultExecGit,
   normalizePathForCompare,
   resolveTargetDir,
+  REBLOCK_STRIKE_CAP,
+  computeItemKey,
+  applyBoundedReblock,
 } = require(HOOK_PATH);
 
 // ─── Low-level git/fs helpers ──────────────────────────────────────────────
@@ -142,6 +145,36 @@ function withPathEnv(baseEnv, newPathValue) {
   return env;
 }
 
+// ─── Bounded-reblock test isolation ────────────────────────────────────────
+// Every `runHook` call now goes through `main()`'s real bounded-reblock
+// layer (docs/specs/stop-guard-bounded-reblock.md), which persists
+// per-session, per-item strike state to disk. Two things must be true for
+// the pre-existing (non-bounded-reblock) tests below to keep behaving as
+// independent, single-shot checks: (1) each subprocess call gets its own
+// fresh state directory, so unrelated tests never share strike counts via
+// the real `hooks/state/` directory or via reusing the same session id,
+// and (2) each call gets its own fresh `session_id` unless a test
+// explicitly supplies one (including explicitly `undefined`, to exercise
+// the missing-session_id path -- see the `'session_id' in payload` check
+// below, which treats an explicit `session_id: undefined` as "caller
+// wants it truly absent," distinct from "caller didn't think about it").
+let reblockSessionCounter = 0;
+const reblockTempDirs = [];
+function freshReblockStateDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "judge-stop-guard-state-"));
+  reblockTempDirs.push(dir);
+  return dir;
+}
+process.on("exit", () => {
+  for (const dir of reblockTempDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (_) {
+      // best-effort
+    }
+  }
+});
+
 /**
  * Run the hook as a subprocess. `opts.env` is merged over process.env;
  * `opts.cwd` is the child process's own working directory (independent of
@@ -151,12 +184,22 @@ function withPathEnv(baseEnv, newPathValue) {
 function runHook(payload, opts) {
   opts = opts || {};
   const env = Object.assign({}, process.env, opts.env || {});
+  if (!env.JUDGE_STOP_GUARD_STATE_DIR) {
+    env.JUDGE_STOP_GUARD_STATE_DIR = freshReblockStateDir();
+  }
+  let finalPayload = payload || {};
+  if (finalPayload && typeof finalPayload === "object" && !("session_id" in finalPayload)) {
+    reblockSessionCounter += 1;
+    finalPayload = Object.assign({}, finalPayload, {
+      session_id: `test-session-${process.pid}-${reblockSessionCounter}-${Date.now()}`,
+    });
+  }
   let exitCode = 0;
   let stdout = "";
   let stderr = "";
   try {
     stdout = execFileSync(process.execPath, [HOOK_PATH], {
-      input: JSON.stringify(payload || {}),
+      input: JSON.stringify(finalPayload),
       encoding: "utf8",
       timeout: 30000,
       env,
@@ -171,7 +214,11 @@ function runHook(payload, opts) {
 }
 
 function runHookInRepo(repoDir, payload, envOverrides) {
-  return runHook(payload || { session_id: "s1", stop_hook_active: false, cwd: repoDir },
+  // No hardcoded default session_id here (a shared literal like "s1" would
+  // reintroduce the exact cross-test strike pollution the isolation
+  // machinery above exists to prevent) -- `runHook` itself fills in a
+  // fresh, unique one whenever the payload doesn't mention the key at all.
+  return runHook(payload || { stop_hook_active: false, cwd: repoDir },
     { env: Object.assign({ CLAUDE_PROJECT_DIR: repoDir }, envOverrides || {}) });
 }
 
@@ -1441,6 +1488,401 @@ test("primary_worktree_active_dirty_on_stale_branch_allows_with_message: R4-04 e
     assert.match(decision.systemMessage, /active worktree on merged branch feature/);
   } finally {
     rmTree(dir);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Bounded re-block (docs/specs/stop-guard-bounded-reblock.md), direct unit
+// tests against `applyBoundedReblock` with an injected `fs`/`now`/
+// `stateDir` -- mirroring how `deadline_exceeded_blocks_with_partial_
+// classification` above injects into `evaluateStop`.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function realFsDeps() {
+  return {
+    readFileSync: (p, enc) => fs.readFileSync(p, enc),
+    writeFileSync: (p, data) => fs.writeFileSync(p, data),
+    renameSync: (a, b) => fs.renameSync(a, b),
+    mkdirSync: (p, opts) => fs.mkdirSync(p, opts),
+    existsSync: (p) => fs.existsSync(p),
+    readdirSync: (p) => fs.readdirSync(p),
+    statSync: (p) => fs.statSync(p),
+    unlinkSync: (p) => fs.unlinkSync(p),
+    openSync: (p, flags) => fs.openSync(p, flags),
+    writeSync: (fd, data) => fs.writeSync(fd, data),
+    closeSync: (fd) => fs.closeSync(fd),
+  };
+}
+
+function mkReblockDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "judge-reblock-unit-"));
+}
+
+function oneItemBlock(kind, rawIdentity, line) {
+  return { action: "block", reason: line, items: [{ kind, rawIdentity, line }] };
+}
+
+function readYieldLogLines(yieldLogPath) {
+  if (!fs.existsSync(yieldLogPath)) return [];
+  return fs
+    .readFileSync(yieldLogPath, "utf8")
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .map((l) => JSON.parse(l));
+}
+
+test("reblock_three_identical_blocks_then_yield: same item blocked 3x then yields with a durable log line", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 1000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-a", stop_hook_active: false };
+    let r;
+    for (let i = 0; i < 3; i++) {
+      r = applyBoundedReblock(oneItemBlock("worktree", "C:/w/foo", "[worktree:linked] C:/w/foo — stale"), stdinInfo, deps);
+      assert.equal(r.action, "block");
+      assert.match(r.reason, /C:\/w\/foo — stale/);
+    }
+    r = applyBoundedReblock(oneItemBlock("worktree", "C:/w/foo", "[worktree:linked] C:/w/foo — stale"), stdinInfo, deps);
+    assert.equal(r.action, "allow-message");
+    assert.match(r.message, /STALE ITEMS REMAIN/);
+    assert.match(r.message, /C:\/w\/foo — stale/);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    assert.match(r.message, new RegExp(yieldLogPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    const lines = readYieldLogLines(yieldLogPath);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].session_id, "sess-a");
+    assert.equal(lines[0].strikes, REBLOCK_STRIKE_CAP);
+    assert.equal(lines[0].item, computeItemKey("worktree", "C:/w/foo"));
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_per_item_independence: a fresh second item keeps blocking even once the first has reached the cap", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 2000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-b", stop_hook_active: false };
+    for (let i = 0; i < 3; i++) {
+      applyBoundedReblock(oneItemBlock("branch", "feature-a", "[branch] feature-a — stale"), stdinInfo, deps);
+    }
+    const r = applyBoundedReblock(
+      {
+        action: "block",
+        reason: "n/a",
+        items: [
+          { kind: "branch", rawIdentity: "feature-a", line: "[branch] feature-a — stale" },
+          { kind: "branch", rawIdentity: "feature-b", line: "[branch] feature-b — stale" },
+        ],
+      },
+      stdinInfo,
+      deps
+    );
+    assert.equal(r.action, "block");
+    assert.match(r.reason, /feature-b — stale/);
+    assert.doesNotMatch(r.reason, /feature-a — stale/);
+    assert.match(r.reason, /1 item\(s\) omitted/);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_churn_does_not_reset_strikes: an item's absence on one call does not reset its count", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 3000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-c", stop_hook_active: false };
+    const stuck = () => oneItemBlock("branch", "stuck", "[branch] stuck — stale");
+    let r;
+    r = applyBoundedReblock(stuck(), stdinInfo, deps); // stuck: strikes 1
+    assert.equal(r.action, "block");
+    r = applyBoundedReblock(stuck(), stdinInfo, deps); // stuck: strikes 2
+    assert.equal(r.action, "block");
+    // Churn: "stuck" is absent this call; an unrelated item blocks instead.
+    // "stuck"'s stored strike count must be left untouched at 2, not reset.
+    r = applyBoundedReblock(oneItemBlock("branch", "other", "[branch] other — stale"), stdinInfo, deps);
+    assert.equal(r.action, "block");
+    // "stuck" reappears: if its count had survived the churn at 2, this is
+    // its 3rd block (pre-increment 2 < 3, still blocks, becomes 3). If the
+    // churn had wrongly reset it to 0, this would only be its 1st block --
+    // either way this single call still blocks, so it alone doesn't prove
+    // non-reset; the NEXT call does (see below).
+    r = applyBoundedReblock(stuck(), stdinInfo, deps);
+    assert.equal(r.action, "block");
+    // Only two calls (this one plus the one before it) have happened for
+    // "stuck" since the churn -- under a (buggy) reset-on-absence
+    // implementation, "stuck" would be at strikes 2 here, still < cap,
+    // and this call would block again. Under the correct
+    // never-reset-within-session behavior, "stuck" is now at strikes 3
+    // (pre-increment) and this call yields instead.
+    r = applyBoundedReblock(stuck(), stdinInfo, deps);
+    assert.equal(r.action, "allow-message");
+    assert.match(r.message, /stuck — stale/);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_identity_normalization_case_and_separator: case/slash variants of the same path share one item key", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 4000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-d", stop_hook_active: false };
+    let r;
+    r = applyBoundedReblock(oneItemBlock("worktree", "C:\\dev\\proj\\bar\\", "[worktree:linked] C:\\dev\\proj\\bar\\ — stale"), stdinInfo, deps);
+    assert.equal(r.action, "block"); // strikes 1
+    r = applyBoundedReblock(oneItemBlock("worktree", "c:/dev/PROJ/bar", "[worktree:linked] c:/dev/PROJ/bar — stale"), stdinInfo, deps);
+    assert.equal(r.action, "block"); // strikes 2 -- same key as above despite case/separator differences
+    r = applyBoundedReblock(oneItemBlock("worktree", "C:/dev/proj/bar", "[worktree:linked] C:/dev/proj/bar — stale"), stdinInfo, deps);
+    assert.equal(r.action, "block"); // strikes 3 (pre-increment was 2, still blocks)
+    r = applyBoundedReblock(oneItemBlock("worktree", "C:\\dev\\proj\\BAR", "[worktree:linked] C:\\dev\\proj\\BAR — stale"), stdinInfo, deps);
+    assert.equal(r.action, "allow-message"); // a 4th case/separator variant -- still the SAME item key, now yields
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_missing_session_id_blocks_no_state_write", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 5000, fs: realFsDeps() };
+    const r = applyBoundedReblock(
+      oneItemBlock("branch", "feature", "[branch] feature — stale"),
+      { session_id: undefined, stop_hook_active: false },
+      deps
+    );
+    assert.equal(r.action, "block");
+    assert.match(r.reason, /session_id missing or malformed/);
+    assert.ok(!fs.existsSync(stateDir) || fs.readdirSync(stateDir).length === 0);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_state_write_failure_blocks", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    fsx.writeFileSync = () => {
+      throw new Error("ENOSPC: injected");
+    };
+    const deps = { stateDir, now: () => 6000, fs: fsx };
+    const r = applyBoundedReblock(
+      oneItemBlock("branch", "feature", "[branch] feature — stale"),
+      { session_id: "sess-e", stop_hook_active: false },
+      deps
+    );
+    assert.equal(r.action, "block");
+    assert.match(r.reason, /state write failed/);
+    assert.match(r.reason, /ENOSPC: injected/);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_yield_log_line_written: well-formed JSON line with every required field", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 7000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-f", stop_hook_active: false };
+    // REBLOCK_STRIKE_CAP calls all still block (the call whose increment
+    // lands exactly on the cap is itself counted as a block -- see
+    // `applyBoundedReblock`'s own comment); one further call is what
+    // actually yields.
+    for (let i = 0; i < REBLOCK_STRIKE_CAP; i++) {
+      const blocked = applyBoundedReblock(oneItemBlock("remote", "origin/gone", "[remote] origin/gone — stale-remote"), stdinInfo, deps);
+      assert.equal(blocked.action, "block");
+    }
+    const yielded = applyBoundedReblock(oneItemBlock("remote", "origin/gone", "[remote] origin/gone — stale-remote"), stdinInfo, deps);
+    assert.equal(yielded.action, "allow-message");
+    const lines = readYieldLogLines(path.join(stateDir, "stop-stale-worktrees-guard.yields.log"));
+    assert.equal(lines.length, 1);
+    const line = lines[0];
+    assert.equal(typeof line.ts, "string");
+    assert.equal(line.session_id, "sess-f");
+    assert.equal(line.item, computeItemKey("remote", "origin/gone"));
+    assert.equal(line.strikes, REBLOCK_STRIKE_CAP);
+    assert.match(line.summary, /origin\/gone — stale-remote/);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_env_bypass_writes_no_state: JUDGE_STOP_GUARD=off never reaches the bounded-reblock layer", () => {
+  const dir = initRepo("main");
+  const stateDir = mkReblockDir();
+  try {
+    git(dir, ["checkout", "-q", "-b", "stale-branch"]);
+    git(dir, ["checkout", "-q", "main"]);
+    const { exitCode, stdout } = runHookInRepo(dir, { session_id: "sess-g", stop_hook_active: false, cwd: dir }, {
+      JUDGE_STOP_GUARD: "off",
+      JUDGE_STOP_GUARD_STATE_DIR: stateDir,
+    });
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision && decision.systemMessage);
+    assert.match(decision.systemMessage, /bypassed/);
+    assert.ok(!fs.existsSync(stateDir) || fs.readdirSync(stateDir).length === 0);
+  } finally {
+    rmTree(dir);
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_seven_day_sweep_removes_old_state: a backdated state file for a different session is removed", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const stalePath = path.join(stateDir, "stop-stale-worktrees-guard.old-session.json");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(stalePath, JSON.stringify({ items: {} }));
+    const eightDaysAgo = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    fs.utimesSync(stalePath, new Date(eightDaysAgo), new Date(eightDaysAgo));
+    assert.ok(fs.existsSync(stalePath));
+
+    const deps = { stateDir, now: () => Date.now(), fs: realFsDeps() };
+    applyBoundedReblock(
+      oneItemBlock("branch", "feature", "[branch] feature — stale"),
+      { session_id: "sess-h", stop_hook_active: false },
+      deps
+    );
+    assert.ok(!fs.existsSync(stalePath), "8-day-old state file for a different session should be swept");
+    assert.ok(fs.existsSync(path.join(stateDir, "stop-stale-worktrees-guard.sess-h.json")));
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_state_write_atomicity_temp_then_rename: writes a temp file and renames it onto the final path", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const writeTargets = [];
+    const renameCalls = [];
+    fsx.writeFileSync = (p, data) => {
+      writeTargets.push(p);
+      fs.writeFileSync(p, data);
+    };
+    fsx.renameSync = (a, b) => {
+      renameCalls.push([a, b]);
+      fs.renameSync(a, b);
+    };
+    const deps = { stateDir, now: () => 8000, fs: fsx };
+    applyBoundedReblock(
+      oneItemBlock("branch", "feature", "[branch] feature — stale"),
+      { session_id: "sess-i", stop_hook_active: false },
+      deps
+    );
+    const finalPath = path.join(stateDir, "stop-stale-worktrees-guard.sess-i.json");
+    assert.equal(writeTargets.length, 1);
+    assert.notEqual(writeTargets[0], finalPath);
+    assert.match(writeTargets[0], /\.tmp\./);
+    assert.equal(renameCalls.length, 1);
+    assert.equal(renameCalls[0][0], writeTargets[0]);
+    assert.equal(renameCalls[0][1], finalPath);
+    assert.ok(fs.existsSync(finalPath));
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_deadline_item_collapses_across_steps: different notReached steps share the single 'deadline' item key", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 9000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-j", stop_hook_active: false };
+    let r;
+    r = applyBoundedReblock(oneItemBlock("deadline", "deadline", "deadline while classifying base-branch-resolution"), stdinInfo, deps);
+    assert.equal(r.action, "block");
+    r = applyBoundedReblock(oneItemBlock("deadline", "deadline", "deadline while classifying worktree-list"), stdinInfo, deps);
+    assert.equal(r.action, "block");
+    r = applyBoundedReblock(oneItemBlock("deadline", "deadline", "deadline while classifying branch-list"), stdinInfo, deps);
+    assert.equal(r.action, "block"); // pre-increment count was 2 -- still a block, becomes 3
+    r = applyBoundedReblock(oneItemBlock("deadline", "deadline", "deadline while classifying remote-list"), stdinInfo, deps);
+    assert.equal(r.action, "allow-message");
+    assert.match(r.message, /deadline while classifying remote-list/);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_operator_only_item_annotated: a push --delete fix line is annotated as externally visible", () => {
+  const findings = [
+    {
+      kind: "branch",
+      name: "old-feature",
+      class: "stale",
+      evidence: "upstream-tip-ancestor",
+      fixLines: ["git branch -D old-feature", "git push origin --delete old-feature"],
+    },
+  ];
+  const { itemsForFindings } = require(HOOK_PATH);
+  const items = itemsForFindings(findings);
+  assert.equal(items.length, 1);
+  assert.match(items[0].line, /externally visible, run it or ask the operator/);
+});
+
+test("reblock_stop_hook_active_recorded_not_branched: decision is identical regardless of stop_hook_active", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 10000, fs: realFsDeps() };
+    const rTrue = applyBoundedReblock(
+      oneItemBlock("branch", "feature", "[branch] feature — stale"),
+      { session_id: "sess-k", stop_hook_active: true },
+      deps
+    );
+    assert.equal(rTrue.action, "block");
+    const statePath = path.join(stateDir, "stop-stale-worktrees-guard.sess-k.json");
+    const stateAfterTrue = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(stateAfterTrue.stop_hook_active_last, true);
+
+    const rFalse = applyBoundedReblock(
+      oneItemBlock("branch", "feature", "[branch] feature — stale"),
+      { session_id: "sess-k", stop_hook_active: false },
+      deps
+    );
+    assert.equal(rFalse.action, "block");
+    const stateAfterFalse = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(stateAfterFalse.stop_hook_active_last, false);
+    assert.equal(stateAfterFalse.items[computeItemKey("branch", "feature")].strikes, 2);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("reblock_forty_item_cap_applies_after_yield_filtering: the 40-item cap counts only the still-blocking list", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 11000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-l", stop_hook_active: false };
+    // Yield 3 items first (reach 3 strikes each).
+    const yielded = ["y1", "y2", "y3"];
+    for (let i = 0; i < REBLOCK_STRIKE_CAP; i++) {
+      applyBoundedReblock(
+        {
+          action: "block",
+          reason: "n/a",
+          items: yielded.map((name) => ({ kind: "branch", rawIdentity: name, line: `[branch] ${name} — stale` })),
+        },
+        stdinInfo,
+        deps
+      );
+    }
+    // Now block on 42 fresh low-strike items alongside the 3 already-yielded ones.
+    const freshItems = [];
+    for (let i = 0; i < 42; i++) {
+      freshItems.push({ kind: "branch", rawIdentity: `fresh-${i}`, line: `[branch] fresh-${i} — stale` });
+    }
+    const allItems = [
+      ...yielded.map((name) => ({ kind: "branch", rawIdentity: name, line: `[branch] ${name} — stale` })),
+      ...freshItems,
+    ];
+    const r = applyBoundedReblock({ action: "block", reason: "n/a", items: allItems }, stdinInfo, deps);
+    assert.equal(r.action, "block");
+    assert.match(r.reason, /\.\.\.and 2 more/);
+    assert.doesNotMatch(r.reason, /y1 — stale/);
+    assert.match(r.reason, /3 item\(s\) omitted/);
+  } finally {
+    rmTree(stateDir);
   }
 });
 
