@@ -94,6 +94,9 @@ const {
   genericSpans,
   loadMergedSettings,
   evaluateDispatchWithCwd,
+  buildSandboxRoots,
+  isWithinSandbox,
+  resolvePathForSandboxCompare,
 } = require(HOOK_PATH);
 
 // ---------------------------------------------------------------------------
@@ -936,6 +939,95 @@ test("H-extra: settings-unparsable finding fires even for an exempt-less SendMes
   const res = runHook(sendMessagePayload(COMPLIANT_CLEAN_PROMPT, dir));
   assert.equal(res.exitCode, 2);
   assert.match(res.stderr, /settings-unparsable/);
+});
+
+// ---------------------------------------------------------------------------
+// Lint (f) sandbox-root resolution: resolvePathForSandboxCompare /
+// isWithinSandbox (fix/preflight-sandbox-path-resolve).
+//
+// Bug fixed: normalizePathStr was a purely LEXICAL transform (backslash ->
+// slash, lowercase, trailing-slash strip) with no "." / ".." collapsing, so
+// a candidate like "C:/Projects/acct/dev/../Windows/System32/x.txt" started
+// with the "C:/Projects/acct/dev" root as a bare string while resolving
+// OUTSIDE every root once ".." is applied. isWithinSandbox's separator-
+// boundary check (root === candidate, or candidate.startsWith(root + "/"))
+// was already correct for the sibling "dev" vs "development" prefix case —
+// S5 below is a regression test pinning that it stays correct, not a fix.
+// ---------------------------------------------------------------------------
+
+test("SANDBOX-S1: '..' traversal under a root resolves outside -> isWithinSandbox false", () => {
+  const roots = ["c:/projects/acct/dev"];
+  assert.equal(
+    isWithinSandbox("C:/Projects/acct/dev/../Windows/System32/x.txt", roots),
+    false
+  );
+});
+
+test("SANDBOX-S2: '.' segments resolve to the same inside path -> isWithinSandbox true", () => {
+  const roots = ["c:/projects/acct/dev"];
+  assert.equal(
+    isWithinSandbox("C:/Projects/acct/dev/./sub/x.txt", roots),
+    true
+  );
+});
+
+test("SANDBOX-S3: sibling-prefix 'development' vs root 'dev' -> isWithinSandbox false (boundary regression)", () => {
+  const roots = ["c:/projects/acct/dev"];
+  assert.equal(
+    isWithinSandbox("C:/Projects/acct/development/foo.txt", roots),
+    false
+  );
+});
+
+test("SANDBOX-S4: mixed separators and case, genuinely inside -> isWithinSandbox true", () => {
+  const roots = ["c:/projects/acct/dev"];
+  assert.equal(
+    isWithinSandbox("C:\\Projects\\ACCT\\Dev\\sub\\FILE.txt", roots),
+    true
+  );
+});
+
+test("SANDBOX-S5: UNC path -> isWithinSandbox false (never a local drive-letter root)", () => {
+  const roots = ["c:/projects/acct/dev"];
+  assert.equal(isWithinSandbox("\\\\server\\share\\x", roots), false);
+  assert.equal(resolvePathForSandboxCompare("\\\\server\\share\\x"), null);
+});
+
+test("SANDBOX-S6: drive-relative 'C:x.txt' -> isWithinSandbox false (unresolvable, total-classification default)", () => {
+  const roots = ["c:/projects/acct/dev"];
+  assert.equal(isWithinSandbox("C:x.txt", roots), false);
+  assert.equal(resolvePathForSandboxCompare("C:x.txt"), null);
+});
+
+test("SANDBOX-S7: a root supplied with a trailing slash (e.g. from local-policy.json) resolves and matches its own boundary correctly", () => {
+  // Roots reach isWithinSandbox pre-resolved via buildSandboxRoots's own
+  // pushRoot/resolvePathForSandboxCompare pass (see SANDBOX-S8) — a raw,
+  // never-resolved root string is not a shape isWithinSandbox is ever
+  // actually called with in production. Exercise that same resolution step
+  // directly on a trailing-slash root, the shape local-policy.json's
+  // "roots" array can supply.
+  const rawRoot = "c:/projects/acct/dev/"; // trailing slash, as a human might write it
+  const resolvedRoot = resolvePathForSandboxCompare(rawRoot);
+  assert.equal(resolvedRoot, "c:/projects/acct/dev", "trailing slash must be stripped on resolution");
+  const roots = [resolvedRoot];
+  // Exact-equal-to-root form.
+  assert.equal(isWithinSandbox("C:/Projects/acct/dev", roots), true);
+  // Genuinely inside.
+  assert.equal(isWithinSandbox("C:/Projects/acct/dev/sub/x.txt", roots), true);
+  // Sibling still rejected even though the root was supplied with a
+  // trailing slash before resolution.
+  assert.equal(isWithinSandbox("C:/Projects/acct/development/x.txt", roots), false);
+});
+
+test("SANDBOX-S8: buildSandboxRoots collapses '..' in a policy-supplied root before comparison", () => {
+  // Exercises buildSandboxRoots' own resolvePathForSandboxCompare pass over
+  // roots (not just candidate tokens) — a root sourced with an un-collapsed
+  // ".." must not silently widen or narrow the sandbox.
+  const cwd = "C:/Projects/acct/dev/judge/../judge-pr8";
+  const roots = buildSandboxRoots(cwd);
+  const resolvedCwdRoot = resolvePathForSandboxCompare(cwd);
+  assert.ok(roots.includes(resolvedCwdRoot), "cwd root should be resolved, not kept raw");
+  assert.ok(!roots.some((r) => r.indexOf("..") !== -1), "no root should retain an un-collapsed '..'");
 });
 
 // ---------------------------------------------------------------------------
