@@ -46,6 +46,11 @@ const {
   readOrCreateHmacKey,
   canonicalizeItems,
   computeMac,
+  computeMacV2,
+  canonicalizeHarnessManaged,
+  formatHarnessManagedLine,
+  HARNESS_BRANCH_RE,
+  HARNESS_MANAGED_DISPLAY_CAP,
 } = require(HOOK_PATH);
 
 // ─── Low-level git/fs helpers ──────────────────────────────────────────────
@@ -1943,7 +1948,7 @@ test("resolveTargetDir: falls back to process.cwd() when both unset", () => {
 // stateDir/fs-injection conventions as the bounded-reblock section above.
 // ═══════════════════════════════════════════════════════════════════════════
 
-test("mac_written_on_every_state_write: written state file's mac verifies against sessionKey + canonical(items)", () => {
+test("mac_written_on_every_state_write: written state file's mac verifies against the v2 input (session key + canonical items + canonical harness_managed_reported)", () => {
   const stateDir = mkReblockDir();
   try {
     const deps = { stateDir, now: () => 5000, fs: realFsDeps() };
@@ -1952,11 +1957,12 @@ test("mac_written_on_every_state_write: written state file's mac verifies agains
 
     const statePath = reblockStatePath(stateDir, "sess-mac");
     const written = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(written.v, 2);
     assert.equal(typeof written.mac, "string");
     assert.ok(written.mac.length > 0);
 
     const keyBytes = fs.readFileSync(hmacKeyPath(stateDir));
-    const expected = computeMac(keyBytes, "sess-mac", written.items);
+    const expected = computeMacV2(keyBytes, "sess-mac", written.items, written.harness_managed_reported);
     assert.equal(written.mac, expected);
   } finally {
     rmTree(stateDir);
@@ -2320,6 +2326,606 @@ test("tamper_reset_only_delays_never_grants: forged strikes:3 state is reset, re
     const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
     const tamperLines = readYieldLogLines(yieldLogPath).filter((l) => l.event === "tamper");
     assert.equal(tamperLines.length, 1);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// harness_managed branch classification (docs/specs/stop-guard-harness-
+// branches.md §2/§7) -- real-temp-git-repo, subprocess tests, mirroring the
+// "Branch classification" section's own conventions above.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("harness_branch_never_blocks: worktree-agent-<id> branch merged into base never appears in a block reason", () => {
+  const dir = initRepo("main");
+  try {
+    git(dir, ["branch", "worktree-agent-a1b2c3"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision, "expected an allow-with-message naming the harness-managed branch");
+    assert.equal(decision.decision, undefined);
+    assert.match(decision.systemMessage, /harness-managed branches present/);
+    assert.match(decision.systemMessage, /worktree-agent-a1b2c3/);
+  } finally {
+    rmTree(dir);
+  }
+});
+
+test("harness_branch_active_worktree_override_wins: harness-named branch with an attached active worktree classifies active, not harness_managed", () => {
+  const dir = initRepo("main");
+  const linked = path.join(mkTmpDir("stop-guard-linked-parent-"), "wt");
+  try {
+    git(dir, ["branch", "worktree-agent-a1b2c3"]);
+    git(dir, ["worktree", "add", "-q", linked, "worktree-agent-a1b2c3"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    fs.writeFileSync(path.join(linked, "dirty.txt"), "uncommitted\n");
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, undefined);
+    assert.match(decision.systemMessage, /active worktree on merged branch worktree-agent-a1b2c3/);
+    assert.doesNotMatch(decision.systemMessage, /harness-managed branches present/);
+  } finally {
+    rmTree(dir);
+    rmTree(path.dirname(linked));
+  }
+});
+
+test("harness_head_branch_still_blocks_with_checkout_fix: HEAD exemption (R1) -- current-HEAD harness-named branch is never reclassified", () => {
+  const dir = initRepo("main");
+  const linked = path.join(mkTmpDir("stop-guard-linked-parent-"), "wt-main");
+  try {
+    git(dir, ["checkout", "-q", "-b", "worktree-agent-a1b2c3"]);
+    // The checkout itself is a recent reflog event on the PRIMARY worktree;
+    // without backdating it, R4-04's active-worktree carve-out (condition
+    // (c), recent reflog activity) would override this branch to `active`
+    // before row 0.5 (or even the ordinary `stale` row) ever gets a chance
+    // to fire -- unrelated to this test's own HEAD-exemption scenario.
+    backdateReflog(primaryGitDir(dir), 3600);
+    git(dir, ["worktree", "add", "-q", linked, "main"]);
+    writeAndCommit(linked, "b.txt", "b\n", "advance main via a scratch linked worktree");
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, "block");
+    assert.match(decision.reason, /worktree-agent-a1b2c3/);
+    assert.match(decision.reason, /evidence: ancestor/);
+    assert.match(decision.reason, /git checkout main/);
+  } finally {
+    rmTree(dir);
+    rmTree(path.dirname(linked));
+  }
+});
+
+test("harness_ok_row_branch_not_reported: empty-local harness-named branch (row 7) is unchanged, not reported (R2)", () => {
+  const dir = initRepo("main");
+  try {
+    git(dir, ["branch", "worktree-agent-a1b2c3"]); // zero commits of its own, no upstream -> row 7 empty-local.
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    assert.equal(stdout, "", "an ok-row harness-named branch produces no output at all, exactly as before this spec");
+  } finally {
+    rmTree(dir);
+  }
+});
+
+test("harness_live_style_regression: worktree-agent-<id> branch merged then its worktree removed -- reports once, silent after", () => {
+  // Mirrors the owner-transcript incident this spec exists to fix (spec
+  // §1): an Agent tool worktree isolation branch gets merged and its
+  // worktree cleaned up by the harness, leaving the branch behind. Three
+  // Stop invocations against the SAME session/state dir: the first prints
+  // the informational line once (never a block); the second and third are
+  // silent for this signal.
+  const dir = initRepo("main");
+  const linked = path.join(mkTmpDir("stop-guard-linked-parent-"), "wt");
+  const stateDir = mkReblockDir();
+  try {
+    git(dir, ["worktree", "add", "-q", "-b", "worktree-agent-abc123", linked, "main"]);
+    writeAndCommit(linked, "agent.txt", "agent work\n", "agent commit");
+    git(dir, ["merge", "-q", "--no-ff", "-m", "merge agent work", "worktree-agent-abc123"]);
+    git(dir, ["worktree", "remove", "-f", linked]);
+
+    const payload = { session_id: "sess-live-style", stop_hook_active: false, cwd: dir };
+    const envOverrides = { JUDGE_STOP_GUARD_STATE_DIR: stateDir };
+
+    const r1 = runHookInRepo(dir, payload, envOverrides);
+    assert.equal(r1.exitCode, 0);
+    const d1 = parseDecision(r1.stdout);
+    assert.ok(d1, "first Stop should print the informational line");
+    assert.equal(d1.decision, undefined);
+    assert.match(d1.systemMessage, /harness-managed branches present/);
+    assert.match(d1.systemMessage, /worktree-agent-abc123/);
+
+    const r2 = runHookInRepo(dir, payload, envOverrides);
+    assert.equal(r2.exitCode, 0);
+    assert.equal(r2.stdout, "", "second Stop must be silent for this signal");
+
+    const r3 = runHookInRepo(dir, payload, envOverrides);
+    assert.equal(r3.exitCode, 0);
+    assert.equal(r3.stdout, "", "third Stop must be silent for this signal");
+  } finally {
+    rmTree(dir);
+    rmTree(path.dirname(linked));
+    rmTree(stateDir);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// harness_managed reporting (docs/specs/stop-guard-harness-branches.md §3),
+// direct unit tests against `applyBoundedReblock` -- same stateDir/fs-
+// injection conventions as the bounded-reblock section above.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("harness_branch_report_once: first call reports, second (same name, no new names) is silent for this signal", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 100000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-hm-once", stop_hook_active: false };
+    const r1 = applyBoundedReblock({ action: "allow", harnessManaged: ["worktree-agent-aaa"] }, stdinInfo, deps);
+    assert.equal(r1.action, "allow-message");
+    assert.match(r1.message, /worktree-agent-aaa/);
+
+    const r2 = applyBoundedReblock({ action: "allow", harnessManaged: ["worktree-agent-aaa"] }, stdinInfo, deps);
+    assert.equal(r2.action, "allow");
+    assert.equal(r2.message, undefined);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("harness_branch_report_again_only_when_set_grows: growth reports again, the un-grown name is not re-flagged as new", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 101000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-hm-grow", stop_hook_active: false };
+    const r1 = applyBoundedReblock({ action: "allow", harnessManaged: ["worktree-agent-aaa"] }, stdinInfo, deps);
+    assert.match(r1.message, /worktree-agent-aaa/);
+
+    const r2 = applyBoundedReblock(
+      { action: "allow", harnessManaged: ["worktree-agent-aaa", "worktree-agent-bbb"] },
+      stdinInfo,
+      deps
+    );
+    assert.equal(r2.action, "allow-message");
+    assert.match(r2.message, /worktree-agent-bbb/);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("harness_branch_shrinking_set_no_new_report: a name dropping out of the set triggers no new report", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 102000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-hm-shrink", stop_hook_active: false };
+    applyBoundedReblock(
+      { action: "allow", harnessManaged: ["worktree-agent-aaa", "worktree-agent-bbb"] },
+      stdinInfo,
+      deps
+    );
+    const r2 = applyBoundedReblock({ action: "allow", harnessManaged: ["worktree-agent-aaa"] }, stdinInfo, deps);
+    assert.equal(r2.action, "allow");
+    assert.equal(r2.message, undefined);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("harness_managed_durable_record_on_first_report_and_growth_only: yields.log gets one line per report, none on repeat", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 103000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-hm-durable", stop_hook_active: false };
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+
+    applyBoundedReblock({ action: "allow", harnessManaged: ["worktree-agent-aaa"] }, stdinInfo, deps);
+    applyBoundedReblock(
+      { action: "allow", harnessManaged: ["worktree-agent-aaa", "worktree-agent-bbb"] },
+      stdinInfo,
+      deps
+    );
+    applyBoundedReblock(
+      { action: "allow", harnessManaged: ["worktree-agent-aaa", "worktree-agent-bbb"] },
+      stdinInfo,
+      deps
+    );
+
+    const lines = readYieldLogLines(yieldLogPath).filter((l) => l.event === "harness_managed");
+    assert.equal(lines.length, 2);
+    assert.deepEqual(lines[0].names, ["worktree-agent-aaa"]);
+    assert.equal(lines[0].count, 1);
+    assert.deepEqual(lines[1].names, ["worktree-agent-aaa", "worktree-agent-bbb"]);
+    assert.equal(lines[1].count, 2);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("harness_managed_display_cap_does_not_affect_recorded_set: systemMessage caps at 20, the log/state stay uncapped", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 104000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-hm-cap", stop_hook_active: false };
+    const names = Array.from({ length: 25 }, (_, i) => `worktree-agent-${String(i).padStart(6, "0")}`).sort();
+
+    const r = applyBoundedReblock({ action: "allow", harnessManaged: names }, stdinInfo, deps);
+    assert.equal(r.action, "allow-message");
+    assert.match(r.message, /\(25, informational only, never blocked\)/);
+    assert.match(r.message, /\.\.\.and 5 more/);
+
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const lines = readYieldLogLines(yieldLogPath).filter((l) => l.event === "harness_managed");
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].names.length, 25);
+    assert.equal(lines[0].count, 25);
+
+    const statePath = reblockStatePath(stateDir, "sess-hm-cap");
+    const written = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(written.harness_managed_reported.length, 25);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("hmac_covers_harness_managed_reported_field: tampering with harness_managed_reported alone invalidates the whole state (R4)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const deps = { stateDir, now: () => 105000, fs: fsx };
+    const stdinInfo = { session_id: "sess-hm-mac", stop_hook_active: false };
+    applyBoundedReblock({ action: "allow", harnessManaged: ["worktree-agent-aaa"] }, stdinInfo, deps);
+
+    const statePath = reblockStatePath(stateDir, "sess-hm-mac");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    state.harness_managed_reported.push("worktree-agent-injected"); // in-place edit, mac NOT recomputed.
+    fs.writeFileSync(statePath, JSON.stringify(state));
+
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const beforeTamper = readYieldLogLines(yieldLogPath).filter((l) => l.event === "tamper").length;
+    const read = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-hm-mac",
+      sessionIdRaw: "sess-hm-mac",
+      yieldLogPath,
+      now: () => 105500,
+    });
+    assert.deepEqual(read, { items: {} });
+    assert.equal(
+      readYieldLogLines(yieldLogPath).filter((l) => l.event === "tamper").length,
+      beforeTamper + 1
+    );
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// State schema v2 / versioned MAC (docs/specs/stop-guard-harness-
+// branches.md §3, R4), direct unit tests.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("legacy_state_file_without_harness_field_loads: a verifying pre-this-spec v1 file migrates silently to v2", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const statePath = reblockStatePath(stateDir, "sess-migrate");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const items = {
+      "branch:legacy-item": { kind: "branch", identity: "legacy-item", strikes: 2, first_block_at: "t", last_block_at: "t" },
+    };
+    const mac = computeMac(keyBytes, "sess-migrate", items); // legacy two-part input, no `v`.
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        session_id: "sess-migrate",
+        stop_hook_active_last: false,
+        created_at: "2026-01-01T00:00:00.000Z",
+        updated_at: "2026-01-01T00:00:00.000Z",
+        items,
+        mac,
+      })
+    );
+
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const beforeTamper = readYieldLogLines(yieldLogPath).filter((l) => l.event === "tamper").length;
+    const state = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-migrate",
+      sessionIdRaw: "sess-migrate",
+      yieldLogPath,
+      now: () => 1000,
+    });
+    assert.equal(state.v, 2);
+    assert.deepEqual(state.harness_managed_reported, []);
+    assert.equal(state.items["branch:legacy-item"].strikes, 2);
+    assert.equal(
+      readYieldLogLines(yieldLogPath).filter((l) => l.event === "tamper").length,
+      beforeTamper,
+      "a verifying legacy file migrates silently -- no tamper line"
+    );
+
+    // End-to-end: a real invocation against this legacy-but-valid file
+    // continues from strikes 2 (not reset to 0) and writes back v2.
+    const deps = { stateDir, now: () => 2000, fs: fsx };
+    const r = applyBoundedReblock(
+      oneItemBlock("branch", "legacy-item", "[branch] legacy-item — stale"),
+      { session_id: "sess-migrate", stop_hook_active: false },
+      deps
+    );
+    assert.equal(r.action, "block"); // pre-increment strikes 2 < cap -> still blocks (its 3rd block).
+    assert.match(r.reason, /legacy-item — stale/);
+    const written = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(written.v, 2);
+    assert.equal(written.items["branch:legacy-item"].strikes, 3);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("legacy_v1_state_bad_mac_still_tamper: a legacy-shaped file whose mac does not verify is still tamper (R4)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const statePath = reblockStatePath(stateDir, "sess-badlegacy");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        items: { "branch:x": { kind: "branch", identity: "x", strikes: 3, first_block_at: "t", last_block_at: "t" } },
+        mac: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      })
+    );
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const state = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-badlegacy",
+      sessionIdRaw: "sess-badlegacy",
+      yieldLogPath,
+      now: () => 1000,
+    });
+    assert.deepEqual(state, { items: {} });
+    const lines = readYieldLogLines(yieldLogPath);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].event, "tamper");
+    assert.equal(lines[0].reason, undefined); // plain tamper, not the unknown_schema_version variant.
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("unknown_schema_version_reset_logged_once: an unrecognized v resets and logs reason unknown_schema_version, once per invocation", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const statePath = reblockStatePath(stateDir, "sess-v3");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        v: 3,
+        items: { "branch:x": { kind: "branch", identity: "x", strikes: 3, first_block_at: "t", last_block_at: "t" } },
+        harness_managed_reported: [],
+        mac: "irrelevant-never-checked-for-an-unrecognized-version",
+      })
+    );
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const state = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-v3",
+      sessionIdRaw: "sess-v3",
+      yieldLogPath,
+      now: () => 1000,
+    });
+    assert.deepEqual(state, { items: {} });
+    let lines = readYieldLogLines(yieldLogPath);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].event, "tamper");
+    assert.equal(lines[0].reason, "unknown_schema_version");
+    assert.equal(lines[0].v, 3);
+
+    // "Logged once" means once per invocation that encounters it, not a
+    // session-level suppression -- a second read of the still-unrecognized
+    // file logs again.
+    const state2 = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-v3",
+      sessionIdRaw: "sess-v3",
+      yieldLogPath,
+      now: () => 2000,
+    });
+    assert.deepEqual(state2, { items: {} });
+    lines = readYieldLogLines(yieldLogPath);
+    assert.equal(lines.length, 2);
+    assert.equal(lines[1].reason, "unknown_schema_version");
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Yield-once semantics (docs/specs/stop-guard-harness-branches.md §4),
+// direct unit tests against `applyBoundedReblock`.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("yield_summary_emitted_once: item yields exactly once, silent thereafter", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 200000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-yield-once", stop_hook_active: false };
+    const stuck = () => oneItemBlock("branch", "stuck-item", "[branch] stuck-item — stale");
+    let r;
+    for (let i = 0; i < REBLOCK_STRIKE_CAP; i++) {
+      r = applyBoundedReblock(stuck(), stdinInfo, deps);
+      assert.equal(r.action, "block");
+    }
+    r = applyBoundedReblock(stuck(), stdinInfo, deps);
+    assert.equal(r.action, "allow-message");
+    assert.match(r.message, /STALE ITEMS REMAIN/);
+
+    r = applyBoundedReblock(stuck(), stdinInfo, deps);
+    assert.equal(r.action, "allow");
+    assert.equal(r.message, undefined);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("yields_log_one_line_per_item_per_session: two items yield together once, silent on repeats (not 2xN)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 201000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-two-yield", stop_hook_active: false };
+    const both = () => ({
+      action: "block",
+      reason: "n/a",
+      items: [
+        { kind: "branch", rawIdentity: "y1", line: "[branch] y1 — stale" },
+        { kind: "branch", rawIdentity: "y2", line: "[branch] y2 — stale" },
+      ],
+    });
+    for (let i = 0; i < REBLOCK_STRIKE_CAP; i++) {
+      const r = applyBoundedReblock(both(), stdinInfo, deps);
+      assert.equal(r.action, "block");
+    }
+    let r = applyBoundedReblock(both(), stdinInfo, deps); // both reach the cap together -> yield.
+    assert.equal(r.action, "allow-message");
+    for (let i = 0; i < 3; i++) {
+      r = applyBoundedReblock(both(), stdinInfo, deps); // repeats: silent every time.
+      assert.equal(r.action, "allow");
+    }
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const lines = readYieldLogLines(yieldLogPath).filter((l) => l.item);
+    assert.equal(lines.length, 2, "one line per item, not one per item per repeat invocation");
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("silent_stop_after_yield_no_output: after an item yields, a further identical Stop produces no stdout at all", () => {
+  const dir = initRepo("main");
+  const stateDir = mkReblockDir();
+  try {
+    git(dir, ["branch", "oldfeature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    const payload = { session_id: "sess-silent", stop_hook_active: false, cwd: dir };
+    const envOverrides = { JUDGE_STOP_GUARD_STATE_DIR: stateDir };
+    for (let i = 0; i < REBLOCK_STRIKE_CAP; i++) {
+      const r = runHookInRepo(dir, payload, envOverrides);
+      assert.equal(parseDecision(r.stdout).decision, "block");
+    }
+    const yieldCall = runHookInRepo(dir, payload, envOverrides);
+    assert.match(parseDecision(yieldCall.stdout).systemMessage, /STALE ITEMS REMAIN/);
+
+    const silentCall = runHookInRepo(dir, payload, envOverrides);
+    assert.equal(silentCall.exitCode, 0);
+    assert.equal(silentCall.stdout, "");
+  } finally {
+    rmTree(dir);
+    rmTree(stateDir);
+  }
+});
+
+test("yield_reappearance_no_new_strikes_no_new_line: absence then reappearance of an already-yielded item is silent", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 202000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-reappear", stop_hook_active: false };
+    const stuck = () => oneItemBlock("branch", "reappear-item", "[branch] reappear-item — stale");
+    for (let i = 0; i < REBLOCK_STRIKE_CAP; i++) {
+      applyBoundedReblock(stuck(), stdinInfo, deps);
+    }
+    let r = applyBoundedReblock(stuck(), stdinInfo, deps); // yields.
+    assert.equal(r.action, "allow-message");
+
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const countAfterYield = readYieldLogLines(yieldLogPath).filter((l) => l.item).length;
+    assert.equal(countAfterYield, 1);
+
+    // Disappears: an unrelated item blocks instead this call.
+    r = applyBoundedReblock(oneItemBlock("branch", "other-item", "[branch] other-item — stale"), stdinInfo, deps);
+    assert.equal(r.action, "block");
+
+    // Reappears: already yielded, silent, no new strikes, no new line.
+    r = applyBoundedReblock(stuck(), stdinInfo, deps);
+    assert.equal(r.action, "allow");
+    assert.equal(readYieldLogLines(yieldLogPath).filter((l) => l.item).length, countAfterYield);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("harness_yield_same_name_new_tip_reblocks: content drift on an already-yielded branch item resets and re-blocks (R3)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 203000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-drift", stop_hook_active: false };
+    const itemAt = (tip) => ({
+      action: "block",
+      reason: "n/a",
+      items: [{ kind: "branch", rawIdentity: "drift-branch", line: "[branch] drift-branch — stale", tip }],
+    });
+    for (let i = 0; i < REBLOCK_STRIKE_CAP; i++) {
+      applyBoundedReblock(itemAt("tip-A"), stdinInfo, deps);
+    }
+    let r = applyBoundedReblock(itemAt("tip-A"), stdinInfo, deps);
+    assert.equal(r.action, "allow-message"); // yields at tip A.
+
+    // Force-pushed / reset to a new tip B, same short name.
+    r = applyBoundedReblock(itemAt("tip-B"), stdinInfo, deps);
+    assert.equal(r.action, "block", "treated as a brand-new item this invocation -- not silent");
+    assert.match(r.reason, /drift-branch — stale/);
+
+    const statePath = reblockStatePath(stateDir, "sess-drift");
+    const key = computeItemKey("branch", "drift-branch");
+    let written = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(written.items[key].strikes, 1);
+
+    for (let i = 0; i < REBLOCK_STRIKE_CAP - 1; i++) {
+      applyBoundedReblock(itemAt("tip-B"), stdinInfo, deps);
+    }
+    r = applyBoundedReblock(itemAt("tip-B"), stdinInfo, deps);
+    assert.equal(r.action, "allow-message"); // yields again, at the new tip.
+    written = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(written.items[key].yielded_tip, "tip-B");
+
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const lines = readYieldLogLines(yieldLogPath).filter((l) => l.item === key);
+    assert.equal(lines.length, 2, "one yields.log line for each genuine yield -- tip A's and tip B's");
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("harness_yield_same_name_same_tip_silent: unchanged tip stays silently alreadyYielded (R3)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 204000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-nodrift", stop_hook_active: false };
+    const itemAtA = () => ({
+      action: "block",
+      reason: "n/a",
+      items: [{ kind: "branch", rawIdentity: "stable-branch", line: "[branch] stable-branch — stale", tip: "tip-A" }],
+    });
+    for (let i = 0; i < REBLOCK_STRIKE_CAP; i++) {
+      applyBoundedReblock(itemAtA(), stdinInfo, deps);
+    }
+    let r = applyBoundedReblock(itemAtA(), stdinInfo, deps);
+    assert.equal(r.action, "allow-message"); // yields.
+
+    r = applyBoundedReblock(itemAtA(), stdinInfo, deps); // tip unchanged.
+    assert.equal(r.action, "allow");
+    assert.equal(r.message, undefined);
   } finally {
     rmTree(stateDir);
   }
