@@ -298,6 +298,17 @@
 //     tool name" language (friction over silent escape), but it means lint
 //     (f) will likely fire more often in this real environment than a
 //     "does the settings system actually grant this" oracle would predict.
+//   - Lint (f)'s sandbox-root check (isWithinSandbox / resolvePathForSandboxCompare)
+//     is a PURELY LEXICAL resolution: it collapses "." and ".." segments with
+//     path.win32.normalize but never calls fs.realpath. A symlink or NTFS
+//     junction/reparse point inside a sandbox root whose target resolves
+//     OUTSIDE every root is invisible to this check and is treated as
+//     "inside" — same for a Windows 8.3 short-name alias (e.g.
+//     "C:\Projects\acct\DEV~1\..\Windows\System32") and for two paths that
+//     differ only by case on a case-sensitive volume (e.g. WSL2 ext4) where
+//     this hook's lowercase-everything comparison treats them as identical
+//     when the filesystem would not. None of these are exercised by this
+//     change's tests; they are pre-existing gaps this fix does not close.
 //   - That the orchestrator actually rewrites the dispatch correctly after a
 //     block, or that a clean ALLOW means the subagent's actual runtime
 //     behavior (as opposed to its dispatch TEXT) stays permission-safe —
@@ -711,18 +722,74 @@ function normalizePathStr(p) {
   return p.replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
 }
 
+// Resolve a path token to a normalized (lowercase, forward-slash,
+// dot-segment-collapsed) string suitable for prefix comparison against
+// sandbox roots, or return null when the token cannot be safely resolved.
+// TOTAL CLASSIFICATION: an unresolvable token is NEVER "inside" a root —
+// callers must fold null into "outside every root" (the lint's block
+// branch), never "allow". This is the fix for the lexical-startsWith
+// evasion (a `C:/Projects/acct/dev/../Windows/System32/x.txt` token starts
+// with the `C:/Projects/acct/dev` root as a bare string, yet resolves
+// outside every root once `..` is collapsed).
+//
+// - UNC paths ("\\server\share\..." / "//server/share/...") never resolve
+//   under a local drive-letter root; returned as null rather than run
+//   through win32 normalization (which accepts them as well-formed and
+//   would otherwise produce a string that happens never to match today,
+//   but should not be relied on to keep not matching).
+// - Drive-relative paths ("C:foo.txt" — a drive letter with no separator
+//   immediately after the colon) resolve against the current directory OF
+//   THAT DRIVE, which this process has no reliable way to know; returned
+//   as null rather than guessed at.
+// - Everything else (a native Windows absolute path, or the "/c/..."
+//   POSIX/MSYS drive form already rewritten to "c:/...") is run through
+//   path.win32.normalize to collapse "." and ".." segments — purely
+//   lexical, no filesystem access. This does NOT resolve symlinks or
+//   junctions (no fs.realpath): this hook has never done that here, and
+//   this fix does not change that posture — see the header section "WHAT
+//   THIS HOOK CANNOT ENFORCE" for the documented blind spot.
+function resolvePathForSandboxCompare(p) {
+  if (typeof p !== "string" || p === "") return null;
+  let s = p.replace(/\\/g, "/");
+  // Normalize "/c/..." form to "c:/..." so it resolves on equal footing
+  // with native Windows absolute paths.
+  s = s.replace(/^\/([A-Za-z])\//, "$1:/");
+
+  if (/^\/\//.test(s)) return null; // UNC — never a local drive-letter root
+  if (/^[A-Za-z]:[^/]/.test(s)) return null; // drive-relative "C:foo.txt"
+
+  let resolved;
+  try {
+    resolved = path.win32.normalize(s);
+  } catch (_) {
+    return null;
+  }
+  resolved = resolved.replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
+  return resolved || null;
+}
+
 // Sandbox roots are machine/project-specific, so they never live in this
 // file: they come from the optional ~/.claude/hooks/local-policy.json
 // (hooks/lib/local-policy.js). Absent that file, the only root is cwd.
+// Roots get the SAME dot-collapsing resolution as candidate tokens (a root
+// sourced from local-policy.json or a symlinked cwd/tmpdir could otherwise
+// itself contain an un-collapsed "..", silently widening or narrowing the
+// prefix check). An unresolvable root is dropped rather than kept in its
+// raw lexical form — it can never safely anchor a prefix match.
 function buildSandboxRoots(cwd) {
   const policy = loadLocalPolicy();
-  const roots = [normalizePathStr(cwd)];
+  const roots = [];
+  const pushRoot = (raw) => {
+    const resolved = resolvePathForSandboxCompare(raw);
+    if (resolved) roots.push(resolved);
+  };
+  pushRoot(cwd);
   for (const root of policy.roots) {
-    roots.push(normalizePathStr(root));
+    pushRoot(root);
   }
   try {
     const tmp = os.tmpdir();
-    if (tmp) roots.push(normalizePathStr(tmp));
+    if (tmp) pushRoot(tmp);
   } catch (_) {
     // ignore
   }
@@ -730,10 +797,15 @@ function buildSandboxRoots(cwd) {
 }
 
 function isWithinSandbox(pathToken, sandboxRoots) {
-  let norm = normalizePathStr(pathToken);
-  // Normalize "/c/..." form to "c:/..." so it compares against Windows-style
-  // roots on equal footing.
-  norm = norm.replace(/^\/([a-z])\//, "$1:/");
+  const norm = resolvePathForSandboxCompare(pathToken);
+  // Unresolvable token (UNC, drive-relative, or any other resolution
+  // failure) is never "inside" a root — total-classification default is
+  // block, never allow.
+  if (norm === null) return false;
+  // Separator-boundary equality/prefix check: `root` must equal the
+  // candidate exactly, or be followed immediately by "/" — never a bare
+  // string prefix. This is what stops a root `c:/projects/acct/dev` from
+  // matching a sibling directory `c:/projects/acct/development/...`.
   return sandboxRoots.some((root) => root && (norm === root || norm.startsWith(root + "/")));
 }
 
@@ -1110,6 +1182,7 @@ module.exports = {
   loadMergedSettings,
   buildSandboxRoots,
   isWithinSandbox,
+  resolvePathForSandboxCompare,
   buildBlockMessage,
   evaluateDispatchWithCwd, // defined below, exported for tests
 };
