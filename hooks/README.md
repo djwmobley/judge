@@ -117,6 +117,41 @@ conservative default rather than throwing.
   per-CLI tables and the two adversary rounds behind this design.
 - **Override:** prefix the command with `SHELL_WRITE_OK=1 ` (logged) for a
   deliberate, reviewed exception.
+- **PROTECTED_PATH (branch 5):** a shell write whose resolved target lands
+  inside the guard framework's own `hooks/state` directory (or is
+  unresolvable but the raw command text still names it literally) is
+  blocked unconditionally — the `SHELL_WRITE_OK=1` override never applies
+  to this class. See `docs/specs/hook-state-write-guard.md` §2.3; closes
+  the same forgeable-state-file gap `hook-state-write-guard.js` below
+  closes for Write/Edit/NotebookEdit/MultiEdit.
+
+### hook-state-write-guard.js
+- **Event:** `PreToolUse` (Write / Edit / NotebookEdit / MultiEdit)
+- **Blocks:** any of those four tools writing into the guard framework's
+  own protected state directory (`STATE_DIR`, exported by
+  `model-routing-guards.state.js`) — or a path segment-matching
+  `hooks/state` anywhere else, a deliberate over-block. Closes the
+  forgeable-state-file gap: without this guard, an agent has ordinary
+  Write/Edit access to forge `stop-stale-worktrees-guard.js`'s own
+  strike-counter accounting state directly and force a premature yield
+  (`docs/specs/stop-guard-bounded-reblock.md` §2 item 3 / §6 / §9 BR-01).
+- **No override.** Unlike `shell-write-guard.js`'s gated-extension
+  friction, there is no legitimate reason for an agent's own tool call to
+  write inside the guard's own accounting state.
+- **Depends on:** `worktree-isolation-guard.js`'s exported
+  `normalizeForCompare` (reused, not reimplemented) and
+  `model-routing-guards.state.js`'s exported `STATE_DIR`. Its own exported
+  `isProtectedStatePath` is in turn reused by `shell-write-guard.js`'s
+  PROTECTED_PATH check above, so the two layers can never independently
+  drift on what counts as "inside the protected state directory."
+- **Paired with `stop-stale-worktrees-guard.js`'s Layer 2:** an HMAC-SHA256
+  keyfile (`hooks/state/.hmac-key`, 32 bytes) signs each bounded-reblock
+  state file's `items`, bound to the session key. A missing/wrong-length
+  keyfile, missing `mac`, or mismatched `mac` is treated as tampered — the
+  state resets to absent for that invocation and a `{"event":"tamper",...}`
+  line is appended to the guard's existing yields log. See
+  `docs/specs/hook-state-write-guard.md` §3 and its §6 for the declared
+  blind spots this pair of layers does not close.
 
 ### bash-powershell-guard.js
 - **Event:** `PreToolUse` (Bash)
@@ -438,14 +473,32 @@ removed rather than kept as an unexercised fallback:
   into a different `session_id` — **accepted blind spot:** once an item
   yields, it is silently omitted from every block reason for the rest of
   that same session even if it recurs unchanged 50 more times; only a new
-  session resets it. **Accepted blind spot:** the state file is plain,
-  unsigned JSON — an agent with ordinary file access to the state
-  directory can forge a `strikes >= 3` record to force an immediate yield
-  (this guard's threat model is a forgetful agent, not an adversarial one,
-  consistent with its other accepted gaps below). `JUDGE_STOP_GUARD_STATE_DIR`
-  overrides where this layer's state and yields log live (used by this
-  file's own test suite for isolation; also usable to relocate state on a
-  real install).
+  session resets it. **Tamper evidence** (`docs/specs/hook-state-write-guard.md`
+  §3, closes the previously-accepted "plain, unsigned JSON, forgeable" gap):
+  every write signs the state file's `items` with an HMAC-SHA256 keyfile
+  (`hooks/state/.hmac-key`, 32 bytes) bound to the session key, so a
+  byte-identical `items` blob copied into a *different* session's own
+  state filename no longer verifies (closes cross-session replay). On
+  read, a missing/wrong-length keyfile, a missing `mac`, or a mismatched
+  `mac` (including every pre-this-change state file, which has no `mac`
+  field at all) is treated identically to an absent state file — strikes
+  reset to 0 for that invocation, which can only *delay* a yield, never
+  grant one — and one `{"event":"tamper","session":...,"ts":...}` line is
+  appended to the yields log below. Layer 1
+  (`hooks/hook-state-write-guard.js`, plus this file's own
+  `shell-write-guard.js` PROTECTED_PATH extension) denies the forging
+  write outright before it reaches disk; this signing is the backstop for
+  whichever write path Layer 1 doesn't cover. **Remaining declared blind
+  spots** (spec §6, not closed by this pair of layers): same-session
+  self-replay/rollback (restoring an earlier, legitimately-signed state
+  file from the SAME session needs no key access); a junction/symlink
+  pointing into `STATE_DIR`; an agent that reads the keyfile directly
+  (`Read`/`cat`/`Get-Content` — out of scope for a write-denial layer) can
+  mint its own valid `mac`; and writes via any tool this repo's PreToolUse
+  hooks don't match (an MCP filesystem server, etc.).
+  `JUDGE_STOP_GUARD_STATE_DIR` overrides where this layer's state, keyfile,
+  and yields log live (used by this file's own test suite for isolation;
+  also usable to relocate state on a real install).
 - **Other declared blind spots** (see the guard's own header and
   `docs/specs/stop-stale-worktrees-guard.md` §8 for the full list): a
   squash-merge whose matching base commit falls outside the 500-commit

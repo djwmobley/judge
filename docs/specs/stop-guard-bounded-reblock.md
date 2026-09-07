@@ -82,7 +82,13 @@ each finding to its resolution):
    State lives at `<hooks dir>/state/stop-stale-worktrees-guard.<sanitized
    session_id>.json` — the same directory and `sanitizeForFilename`
    convention `hooks/agent-tier-ledger.js` already uses, **not**
-   `os.tmpdir()`. Writes are atomic (temp file in the same directory, then
+   `os.tmpdir()`. The state directory is created on first run by the write
+   path itself: `writeReblockStateAtomic` calls `fsx.mkdirSync(stateDir,
+   { recursive: true })` before writing the temp file, with no separate
+   directory-creation step anywhere else in this layer — a `mkdirSync`
+   failure there is caught by that same function's surrounding try/catch
+   and surfaces as an ordinary write failure (§2 item 8), not a distinct
+   error path. Writes are atomic (temp file in the same directory, then
    `fs.renameSync`). **Accepted, not closed:** the fingerprint/strike state
    is a plain, unsigned JSON file; an agent (or any subagent whose shell
    isn't guard-blocked) with ordinary file access to this directory can
@@ -173,6 +179,10 @@ one per thing that invocation is blocking on:
 | A deadline expiry (`buildDeadlineReason`, any step) | `deadline` | the literal string `"deadline"` | collapsed regardless of which step timed out (§2 item 2) |
 
 **Item key** = `` `${kind}:${normalizePathForCompare(rawIdentity) || ""}` ``.
+Because `kind` is drawn from a small fixed enum never influenced by git
+output, a colon or substring inside `rawIdentity` cannot alias one kind's
+key onto another's — delimiter injection is closed by construction, not by
+escaping.
 `active`, `active-remote`, `stale-remote-foreign`, and `excluded` items
 never reach this table — they never appear in a block `reason` in the
 first place (base classification, unchanged), so there is no unreachable
@@ -313,6 +323,9 @@ before this log write is attempted.
   stop being blocked on, jumping straight to a premature yield without
   ever having attempted a fix. Accepted per this guard's established
   forgetful-agent threat model (§2 item 3); not closed by this revision.
+  See `docs/specs/hook-state-write-guard.md` for a follow-on spec that
+  closes most of this gap via a write-denial PreToolUse hook plus a
+  tamper-evident MAC on the state file itself.
 - **Session-scoped non-blocking pass, concretely.** Once an item reaches 3
   strikes, this guard never `block`s on it again **for the rest of that
   session** (§3 step 6), even if the exact same Stop chain repeats 50 more
@@ -360,6 +373,11 @@ before this log write is attempted.
   convention rather than a new gap — but it is a genuine, if narrow,
   expansion of that function's use into a domain (ref names) it wasn't
   originally written for.
+- **A branch/worktree rename, or an evidence-class boundary (e.g. the
+  quiet-window line) flipping between calls, produces a new item identity
+  and therefore a spurious strike reset for what is effectively the same
+  underlying item.** This causes one extra block cycle, never a silent
+  allow — accepted as safe-direction noise.
 - **Unbounded yields-log growth** (§5) over a long-lived, never-restarted
   install. Accepted given the expected low event rate; no rotation is
   applied so the record stays complete rather than lossy.

@@ -17,8 +17,17 @@
 //   2. write detected, resolved target extension NOT gated -> allow
 //   3. write detected, resolved target extension IS gated  -> BLOCK
 //   4. write-shaped but target is unresolvable/ambiguous   -> BLOCK
+//   5. write resolves inside the guard framework's own protected state
+//      directory (hooks/state), OR is unresolvable but the raw command
+//      text still names it literally -> BLOCK, override never applies
+//      (docs/specs/hook-state-write-guard.md §2.3)
 // A write verb whose target we cannot classify is branch 4, never silently
-// branch 1 — see resolveTarget/classifyExtension below.
+// branch 1 — see resolveTarget/classifyExtension below. Branch 5 is
+// strictly higher-severity than 1-4 and is checked inside resolveTarget
+// itself, ahead of the gated-extension tier logic (§2.3(a)); `pickWorst`/
+// `consider` selecting the numerically highest branch is what makes a
+// single branch-5 finding anywhere in a multi-stage command dominate the
+// final result with no other change to that selection logic.
 //
 // ── Detector -> branch table (see report for the full worked table) ────────
 //   redirect >,>> ; tee ; sed -i ; cp/mv/install ; dd of= ; truncate ; rsync ;
@@ -179,6 +188,13 @@ const {
   computeSegmentCwds,
 } = require(path.join(HOOKS_DIR, "worktree-isolation-guard.js"));
 
+// ── Reused: hook-state-write-guard.js (docs/specs/hook-state-write-guard.md
+// §2.3) — the SAME containment predicate that hook covers for Write/Edit/
+// NotebookEdit/MultiEdit, reused directly here rather than reimplemented,
+// so the two layers can never independently drift on what counts as
+// "inside the protected state directory".
+const { isProtectedStatePath } = require(path.join(HOOKS_DIR, "hook-state-write-guard.js"));
+
 // ── Logging (D4: shared helper, matches every sibling hook) ────────────────
 const { createLogger } = require(path.join(HOOKS_DIR, "model-routing-guards.log.js"));
 const appendDebug = createLogger("shell-write-guard");
@@ -258,6 +274,18 @@ function resolveTarget(rawTarget, cwd, gatedExts) {
   let normalized;
   try { normalized = normalizeForCompare(abs); } catch (_) { normalized = null; }
   if (!normalized) return { branch: 4, reason: "path-resolve-failed", target: rawTarget };
+
+  // Protected-state-directory check (docs/specs/hook-state-write-guard.md
+  // §2.3(a)) — runs BEFORE classifyExtension, ahead of the gated-extension
+  // tier logic, so a shell write into the guard's own STATE_DIR is never
+  // classified merely as an ordinary gated/non-gated extension. Branch 5
+  // is strictly higher-severity than 1-4 (see classifyCommand's own
+  // override-reordering comment) and is never eligible for the
+  // SHELL_WRITE_OK=1 override.
+  if (isProtectedStatePath(normalized)) {
+    return { branch: 5, reason: "protected-state-dir", target: normalized };
+  }
+
   const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
   const cls = classifyExtension(basename, gatedExts);
   return {
@@ -2875,12 +2903,52 @@ function analyzePowerShell(cmd, initialCwd, gatedExts) {
 // ── Override + top-level dispatch ──────────────────────────────────────────
 
 const OVERRIDE_RE = /^SHELL_WRITE_OK=1\s/;
+const STATE_DIR_RAW_TEXT_RE = /hooks\/state/;
+
+/**
+ * Normalize raw command text for the branch-4 raw-text fallback (spec
+ * §2.3(b)(2)/A3): strip `'`/`"` quote characters, backslash -> forward
+ * slash, collapse repeated `/` and `/./` segments, lowercase. Comment text
+ * is deliberately NOT stripped — this has no shell-comment parser, so a
+ * `#`-comment mentioning the literal `hooks/state` still matches (accepted
+ * friction, declared blind spot §6 item (d)).
+ */
+function normalizeRawCommandForStateDirCheck(cmd) {
+  let s = String(cmd);
+  s = s.replace(/['"]/g, "");
+  s = s.replace(/\\/g, "/");
+  s = s.replace(/\/\.\//g, "/").replace(/\/{2,}/g, "/");
+  return s.toLowerCase();
+}
 
 function classifyCommand(cmd, cwd, toolName, gatedExts) {
   if (typeof cmd !== "string" || cmd === "") return { allow: true, branch: 1 };
-  if (OVERRIDE_RE.test(cmd)) return { allow: true, branch: 1, overridden: true, detector: "override" };
-  if (toolName === "PowerShell") return analyzePowerShell(cmd, cwd, gatedExts);
-  return analyzeBash(cmd, cwd, gatedExts);
+
+  // Classification runs FIRST, unconditionally — the override is consulted
+  // only afterward, as a downgrade (spec §2.3(b)(1)).
+  const result = toolName === "PowerShell" ? analyzePowerShell(cmd, cwd, gatedExts) : analyzeBash(cmd, cwd, gatedExts);
+
+  // Raw-text fallback for unresolvable targets (spec §2.3(b)(2)/A3): only
+  // upgrades an EXACT branch-4 result (write-shaped, target unresolvable)
+  // whose raw, normalized command text still names the protected directory
+  // literally.
+  if (result.branch === 4 && STATE_DIR_RAW_TEXT_RE.test(normalizeRawCommandForStateDirCheck(cmd))) {
+    result.branch = 5;
+    result.allow = false;
+    result.reason = "protected-state-dir-raw-text-fallback";
+    result.detector = result.detector || "raw-text-fallback";
+  }
+
+  // Override reordering (spec §2.3(b)(1)): consulted only as a downgrade,
+  // and only when the resulting branch is <= 4. A branch-5 result (direct
+  // resolveTarget hit, or the raw-text fallback just above) is NEVER
+  // eligible — an override that could suppress branch 5 would just be a
+  // second, one-token forgery vector replacing the first.
+  if (OVERRIDE_RE.test(cmd) && result.branch <= 4) {
+    return { allow: true, branch: 1, overridden: true, detector: "override" };
+  }
+
+  return result;
 }
 
 module.exports = {
@@ -2889,6 +2957,7 @@ module.exports = {
   analyzePowerShell,
   classifyExtension,
   resolveTarget,
+  normalizeRawCommandForStateDirCheck,
   findPrimaryVerbIndex,
   isAmbiguousToken,
   detectCmdCIndirection,
@@ -2967,6 +3036,22 @@ function main() {
   });
 
   if (result.allow) process.exit(0);
+
+  if (result.branch === 5) {
+    // Distinct message, on purpose (spec §2.3(b)): this is categorically
+    // different from ordinary gated-extension friction, and the override
+    // does not apply here (§2.3(b)(1)) — an agent hitting this path should
+    // not retry with SHELL_WRITE_OK=1.
+    process.stderr.write(
+      `shell-write-guard: BLOCKED (branch 5) — detector: ${result.detector || "unknown"}` +
+      (result.target ? `, resolved target: ${result.target}` : ", target: unresolvable (raw-text match)") + ".\n" +
+      "Reason: this command writes inside the guard framework's own protected state directory " +
+      "(hooks/state) or a directory matching its reserved layout.\n" +
+      "There is no legitimate reason for a shell command to write there; the SHELL_WRITE_OK=1 override " +
+      "does NOT apply to this class of block, and retrying with it will not succeed.\n"
+    );
+    process.exit(2);
+  }
 
   process.stderr.write(
     `shell-write-guard: BLOCKED (branch ${result.branch}) — detector: ${result.detector || "unknown"}` +

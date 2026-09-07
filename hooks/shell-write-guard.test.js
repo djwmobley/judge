@@ -52,6 +52,7 @@ const {
   splitPsStatements,
   loadConfig,
   DEFAULT_GATED_EXTENSIONS,
+  normalizeRawCommandForStateDirCheck,
 } = require(HOOK_PATH);
 
 const GATED = DEFAULT_GATED_EXTENSIONS.slice(); // [".ps1", ".psm1", ".psd1"]
@@ -2570,4 +2571,157 @@ t('MIXED-79 (RV-01 regression proof, quoted recognized flag): psql "-f" x.sql ->
 t('MIXED-80 (RV-01 regression proof, quoted recognized flag, PowerShell): psql "-c" "select 1" -> block on -c itself (quoted recognized INLINE flag still matches)', () => {
   const r = ps('psql "-c" "select 1"');
   assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROTECTED_PATH extension (docs/specs/hook-state-write-guard.md §2.3) —
+// branch 5, a shell write into the guard framework's own STATE_DIR. Uses
+// literal "hooks/state/..." targets throughout: the segment-bounded
+// /hooks/state/ over-block rule (spec §2.2 rule 2, reused here via
+// isProtectedStatePath) fires regardless of the actual resolved STATE_DIR
+// for this install, which is the deliberate behavior under test.
+// ═══════════════════════════════════════════════════════════════════════════
+
+t("PROTECTED-01 (bash_cp_into_state_dir_denied): cp forged.json hooks/state/x.json -> branch 5 deny", () => {
+  const r = bash("cp forged.json hooks/state/stop-stale-worktrees-guard.abc.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-02 (bash_tee_into_state_dir_denied): tee hooks/state/x.json -> branch 5 deny", () => {
+  const r = bash("tee hooks/state/x.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-03 (bash_redirect_gt_into_state_dir_denied): echo '{}' > hooks/state/x.json -> branch 5 deny", () => {
+  const r = bash("echo '{}' > hooks/state/x.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-04 (bash_redirect_append_into_state_dir_denied): echo '{}' >> hooks/state/x.json -> branch 5 deny", () => {
+  const r = bash("echo '{}' >> hooks/state/x.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-05 (bash_backslash_path_into_state_dir_denied): cp forged.json hooks\\state\\x.json -> branch 5 deny", () => {
+  const r = bash("cp forged.json hooks\\state\\x.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t('PROTECTED-06 (bash_quoted_target_into_state_dir_denied): cp forged.json "hooks/state/x.json" -> branch 5 deny', () => {
+  const r = bash('cp forged.json "hooks/state/x.json"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-07 (powershell_set_content_into_state_dir_denied): Set-Content -Path hooks/state/x.json -Value '{}' -> branch 5 deny", () => {
+  const r = ps("Set-Content -Path hooks/state/x.json -Value '{}'");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-08 (powershell_out_file_into_state_dir_denied): '{}' | Out-File hooks/state/x.json -> branch 5 deny", () => {
+  const r = ps("'{}' | Out-File hooks/state/x.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-09 (powershell_redirect_into_state_dir_denied): '{}' > hooks/state/x.json -> branch 5 deny", () => {
+  const r = ps("'{}' > hooks/state/x.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-10 (override_does_not_suppress_state_dir_write): SHELL_WRITE_OK=1 cp forged.json hooks/state/x.json -> still branch 5 deny", () => {
+  const r = bash("SHELL_WRITE_OK=1 cp forged.json hooks/state/x.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+  assert.notEqual(r.overridden, true);
+});
+
+t("PROTECTED-11 (override_still_suppresses_ordinary_gated_ext_write): SHELL_WRITE_OK=1 cp x.ps1 y.ps1 -> allow (unchanged)", () => {
+  const r = bash("SHELL_WRITE_OK=1 cp x.ps1 y.ps1");
+  assert.equal(r.allow, true, JSON.stringify(r));
+  assert.equal(r.overridden, true);
+});
+
+t("PROTECTED-12 (dotdot_traversal_into_state_dir_denied): cp forged.json hooks/state/../state/x.json -> branch 5 deny", () => {
+  const r = bash("cp forged.json hooks/state/../state/x.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t('PROTECTED-13 (unresolvable_target_with_literal_hooks_state_text_denied): STATEDIR=hooks/state; cp forged.json "$STATEDIR/x.json" -> branch 5 deny (raw-text fallback)', () => {
+  const r = bash('STATEDIR=hooks/state; cp forged.json "$STATEDIR/x.json"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t('PROTECTED-14 (unresolvable_target_quoted_literal_hooks_state_denied): STATEDIR="hooks/state"; cp forged.json "$STATEDIR/x.json" -> branch 5 deny (quote-strip)', () => {
+  const r = bash('STATEDIR="hooks/state"; cp forged.json "$STATEDIR/x.json"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-15 (unresolvable_target_no_literal_text_stays_branch4): fully indirect target, no hooks/state text anywhere -> branch 4, ordinary friction", () => {
+  const r = bash('D=$(cat /tmp/target-dir-name); cp forged.json "$D/x.json"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+});
+
+t("PROTECTED-16 (split_variable_target_stays_branch4): H1=hooks; H2=state; cp forged.json \"$H1/$H2/x.json\" -> branch 4, declared blind spot §6(e)", () => {
+  const r = bash('H1=hooks; H2=state; cp forged.json "$H1/$H2/x.json"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+});
+
+t("PROTECTED-17 (unresolvable_target_comment_text_literal_denied): a #-comment line naming hooks/state, unrelated real write on a later line -> branch 5 deny (accepted friction, blind spot §6(d))", () => {
+  const cmd = ["# writing to hooks/state is fine, do not worry", 'D=$(cat /tmp/target-dir-name); cp forged.json "$D/x.json"'].join(
+    "\n"
+  );
+  const r = bash(cmd);
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-18 (cat_state_dir_file_allowed): cat hooks/state/x.json -> allow (branch 1, read verb)", () => {
+  const r = bash("cat hooks/state/stop-stale-worktrees-guard.abc.json");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PROTECTED-19 (grep_state_dir_allowed): grep strikes hooks/state/*.json -> allow", () => {
+  const r = bash("grep strikes hooks/state/x.json");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PROTECTED-20 (sibling_dir_name_prefix_allowed): cp x.txt hooks/state-backup/y.txt -> allow (prefix boundary)", () => {
+  const r = bash("cp x.txt hooks/state-backup/y.txt");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PROTECTED-21 (hooks_statement_sibling_allowed): cp x.txt hooks/statement/y.txt -> allow (not a segment match)", () => {
+  const r = bash("cp x.txt hooks/statement/y.txt");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PROTECTED-22 (write_outside_state_dir_unaffected): cp a.txt b.ps1 -> existing branch 3 behavior, unchanged", () => {
+  const r = bash("cp a.txt b.ps1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 3);
+});
+
+t("PROTECTED-23 (multi-stage command, branch 5 dominates): cp a.txt b.ps1; cp c.txt hooks/state/x.json -> branch 5, not 3", () => {
+  const r = bash("cp a.txt b.ps1; cp c.txt hooks/state/x.json");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 5);
+});
+
+t("PROTECTED-24 (normalizeRawCommandForStateDirCheck): strips quotes/backslashes, lowercases, collapses slashes", () => {
+  assert.equal(normalizeRawCommandForStateDirCheck('STATEDIR="Hooks/State"'), "statedir=hooks/state");
+  assert.equal(normalizeRawCommandForStateDirCheck("hooks\\\\state\\\\x.json"), "hooks/state/x.json");
+  assert.equal(normalizeRawCommandForStateDirCheck("hooks//state/./x.json"), "hooks/state/x.json");
 });

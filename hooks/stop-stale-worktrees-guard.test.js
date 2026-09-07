@@ -36,6 +36,16 @@ const {
   REBLOCK_STRIKE_CAP,
   computeItemKey,
   applyBoundedReblock,
+  reblockStatePath,
+  readReblockState,
+  writeReblockStateAtomic,
+  appendYieldLogLine,
+  HMAC_KEY_FILENAME,
+  HMAC_KEY_BYTES,
+  hmacKeyPath,
+  readOrCreateHmacKey,
+  canonicalizeItems,
+  computeMac,
 } = require(HOOK_PATH);
 
 // ─── Low-level git/fs helpers ──────────────────────────────────────────────
@@ -1501,7 +1511,7 @@ test("primary_worktree_active_dirty_on_stale_branch_allows_with_message: R4-04 e
 function realFsDeps() {
   return {
     readFileSync: (p, enc) => fs.readFileSync(p, enc),
-    writeFileSync: (p, data) => fs.writeFileSync(p, data),
+    writeFileSync: (p, data, opts) => fs.writeFileSync(p, data, opts),
     renameSync: (a, b) => fs.renameSync(a, b),
     mkdirSync: (p, opts) => fs.mkdirSync(p, opts),
     existsSync: (p) => fs.existsSync(p),
@@ -1758,9 +1768,9 @@ test("reblock_state_write_atomicity_temp_then_rename: writes a temp file and ren
     const fsx = realFsDeps();
     const writeTargets = [];
     const renameCalls = [];
-    fsx.writeFileSync = (p, data) => {
+    fsx.writeFileSync = (p, data, opts) => {
       writeTargets.push(p);
-      fs.writeFileSync(p, data);
+      fs.writeFileSync(p, data, opts);
     };
     fsx.renameSync = (a, b) => {
       renameCalls.push([a, b]);
@@ -1773,12 +1783,17 @@ test("reblock_state_write_atomicity_temp_then_rename: writes a temp file and ren
       deps
     );
     const finalPath = path.join(stateDir, "stop-stale-worktrees-guard.sess-i.json");
-    assert.equal(writeTargets.length, 1);
-    assert.notEqual(writeTargets[0], finalPath);
-    assert.match(writeTargets[0], /\.tmp\./);
-    assert.equal(renameCalls.length, 1);
-    assert.equal(renameCalls[0][0], writeTargets[0]);
-    assert.equal(renameCalls[0][1], finalPath);
+    // A fresh state dir also creates the `.hmac-key` keyfile on this same
+    // invocation (docs/specs/hook-state-write-guard.md §3.1), via the
+    // identical tmp-then-rename convention -- so this isolates the
+    // state-file-specific write/rename pair rather than asserting a total
+    // write count across the whole invocation (which now legitimately
+    // includes the keyfile's own first-run write too).
+    const stateRename = renameCalls.find((r) => r[1] === finalPath);
+    assert.ok(stateRename, "expected a rename onto the state file's final path");
+    assert.notEqual(stateRename[0], finalPath);
+    assert.match(stateRename[0], /\.tmp\./);
+    assert.ok(writeTargets.includes(stateRename[0]));
     assert.ok(fs.existsSync(finalPath));
   } finally {
     rmTree(stateDir);
@@ -1918,5 +1933,394 @@ test("resolveTargetDir: falls back to process.cwd() when both unset", () => {
     assert.equal(resolveTargetDir({}), process.cwd());
   } finally {
     if (orig !== undefined) process.env.CLAUDE_PROJECT_DIR = orig;
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tamper evidence (docs/specs/hook-state-write-guard.md §3), direct unit
+// tests against readReblockState/readOrCreateHmacKey/computeMac, plus a
+// couple of end-to-end tests through applyBoundedReblock — same
+// stateDir/fs-injection conventions as the bounded-reblock section above.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("mac_written_on_every_state_write: written state file's mac verifies against sessionKey + canonical(items)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const deps = { stateDir, now: () => 5000, fs: realFsDeps() };
+    const stdinInfo = { session_id: "sess-mac", stop_hook_active: false };
+    applyBoundedReblock(oneItemBlock("branch", "feature-x", "[branch] feature-x — stale"), stdinInfo, deps);
+
+    const statePath = reblockStatePath(stateDir, "sess-mac");
+    const written = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(typeof written.mac, "string");
+    assert.ok(written.mac.length > 0);
+
+    const keyBytes = fs.readFileSync(hmacKeyPath(stateDir));
+    const expected = computeMac(keyBytes, "sess-mac", written.items);
+    assert.equal(written.mac, expected);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("mac_verifies_on_normal_read: write then read via the same key -> state as-is, no tamper log line", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const deps = { stateDir, now: () => 5000, fs: fsx };
+    const stdinInfo = { session_id: "sess-round", stop_hook_active: false };
+    applyBoundedReblock(oneItemBlock("branch", "feature-y", "[branch] feature-y — stale"), stdinInfo, deps);
+
+    const statePath = reblockStatePath(stateDir, "sess-round");
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const state = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-round",
+      sessionIdRaw: "sess-round",
+      yieldLogPath,
+      now: () => 6000,
+    });
+    assert.equal(Object.keys(state.items).length, 1);
+    assert.equal(Object.values(state.items)[0].strikes, 1);
+    assert.equal(readYieldLogLines(yieldLogPath).filter((l) => l.event === "tamper").length, 0);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("valid_round_trip_honored: write, read back immediately, no tampering", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const deps = { stateDir, now: () => 7000, fs: fsx };
+    const stdinInfo = { session_id: "sess-rt", stop_hook_active: false };
+    applyBoundedReblock(oneItemBlock("worktree", "C:/w/rt", "[worktree:linked] C:/w/rt — stale"), stdinInfo, deps);
+
+    const statePath = reblockStatePath(stateDir, "sess-rt");
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const state = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-rt",
+      sessionIdRaw: "sess-rt",
+      yieldLogPath,
+      now: () => 7500,
+    });
+    assert.equal(Object.keys(state.items).length, 1);
+    assert.equal(Object.values(state.items)[0].strikes, 1);
+    assert.equal(readYieldLogLines(yieldLogPath).length, 0);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("cross_session_replay_of_valid_items_denied: byte-identical items+mac copied into a different session's filename fails verification (A5)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const deps = { stateDir, now: () => 9000, fs: fsx };
+    const stdinA = { session_id: "sess-A", stop_hook_active: false };
+    // Strike a real item to the cap under session A so its own state file
+    // is fully "legitimately produced" and self-consistent.
+    for (let i = 0; i < REBLOCK_STRIKE_CAP; i++) {
+      applyBoundedReblock(oneItemBlock("branch", "replay-me", "[branch] replay-me — stale"), stdinA, deps);
+    }
+    const pathA = reblockStatePath(stateDir, "sess-A");
+    const bodyA = fs.readFileSync(pathA, "utf8");
+
+    // Copy the BYTE-IDENTICAL body (items + mac, unmodified) into a
+    // DIFFERENT session's own state filename.
+    const pathB = reblockStatePath(stateDir, "sess-B");
+    fs.writeFileSync(pathB, bodyA);
+
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const beforeCount = readYieldLogLines(yieldLogPath).length;
+    const stateB = readReblockState(fsx, pathB, {
+      keyBytes,
+      sessionKey: "sess-B",
+      sessionIdRaw: "sess-B",
+      yieldLogPath,
+      now: () => 9500,
+    });
+    assert.deepEqual(stateB, { items: {} });
+    const after = readYieldLogLines(yieldLogPath);
+    assert.equal(after.length, beforeCount + 1);
+    assert.equal(after[after.length - 1].event, "tamper");
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("keyfile_created_on_first_run: fresh state dir, no .hmac-key -> created, 32 bytes", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    assert.equal(fs.existsSync(hmacKeyPath(stateDir)), false);
+    const key = readOrCreateHmacKey(fsx, stateDir);
+    assert.ok(Buffer.isBuffer(key));
+    assert.equal(key.length, HMAC_KEY_BYTES);
+    assert.equal(fs.existsSync(hmacKeyPath(stateDir)), true);
+    assert.equal(fs.statSync(hmacKeyPath(stateDir)).size, HMAC_KEY_BYTES);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("keyfile_reused_across_runs: second run's key is byte-identical to the first (not regenerated)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const key1 = readOrCreateHmacKey(fsx, stateDir);
+    const key2 = readOrCreateHmacKey(fsx, stateDir);
+    assert.ok(key1.equals(key2));
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("keyfile_unreadable_fails_closed: injected read/create failure -> state treated as absent", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    fsx.readFileSync = () => {
+      throw new Error("boom");
+    };
+    fsx.writeFileSync = () => {
+      throw new Error("boom");
+    };
+    fsx.renameSync = () => {
+      throw new Error("boom");
+    };
+    const key = readOrCreateHmacKey(fsx, stateDir);
+    assert.equal(key, null);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("keyfile_zero_bytes_fails_closed: 0-byte keyfile is unavailable, not regenerated (A4)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(hmacKeyPath(stateDir), Buffer.alloc(0));
+    const key = readOrCreateHmacKey(realFsDeps(), stateDir);
+    assert.equal(key, null);
+    assert.equal(fs.statSync(hmacKeyPath(stateDir)).size, 0); // not silently overwritten
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("keyfile_truncated_fails_closed: fewer than 32 bytes -> unavailable (A4)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(hmacKeyPath(stateDir), Buffer.alloc(10, 1));
+    const key = readOrCreateHmacKey(realFsDeps(), stateDir);
+    assert.equal(key, null);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("keyfile_oversized_fails_closed: more than 32 bytes -> unavailable (A4)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(hmacKeyPath(stateDir), Buffer.alloc(40, 2));
+    const key = readOrCreateHmacKey(realFsDeps(), stateDir);
+    assert.equal(key, null);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("forged_strikes_without_mac_reset_and_logged: hand-written state with no mac field treated as absent, one tamper line", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const statePath = reblockStatePath(stateDir, "sess-forged");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        items: { "worktree:x": { kind: "worktree", identity: "x", strikes: 3, first_block_at: "t", last_block_at: "t" } },
+      })
+    );
+
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const state = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-forged",
+      sessionIdRaw: "sess-forged",
+      yieldLogPath,
+      now: () => 1000,
+    });
+    assert.deepEqual(state, { items: {} });
+    const lines = readYieldLogLines(yieldLogPath);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].event, "tamper");
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("forged_state_wrong_mac_treated_as_absent: a mac value present but not matching its own items", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const statePath = reblockStatePath(stateDir, "sess-wrongmac");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        items: { "branch:x": { kind: "branch", identity: "x", strikes: 3, first_block_at: "t", last_block_at: "t" } },
+        mac: "deadbeefdeadbeefdeadbeefdeadbeef",
+      })
+    );
+
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const state = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-wrongmac",
+      sessionIdRaw: "sess-wrongmac",
+      yieldLogPath,
+      now: () => 1000,
+    });
+    assert.deepEqual(state, { items: {} });
+    assert.equal(readYieldLogLines(yieldLogPath).length, 1);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("pre_change_state_file_no_mac_field_treated_as_tampered: shaped exactly like the pre-this-spec format (explicit backward-compat case)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const statePath = reblockStatePath(stateDir, "sess-legacy");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        session_id: "sess-legacy",
+        stop_hook_active_last: false,
+        created_at: "2026-01-01T00:00:00.000Z",
+        updated_at: "2026-01-01T00:00:00.000Z",
+        items: {
+          "branch:legacy": { kind: "branch", identity: "legacy", strikes: 3, first_block_at: "t", last_block_at: "t" },
+        },
+      })
+    );
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const state = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-legacy",
+      sessionIdRaw: "sess-legacy",
+      yieldLogPath,
+      now: () => 1000,
+    });
+    assert.deepEqual(state, { items: {} });
+    assert.equal(readYieldLogLines(yieldLogPath).length, 1);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("tamper_log_line_well_formed: exactly one JSON line with event/session/ts fields", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const statePath = reblockStatePath(stateDir, "sess-wf");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(statePath, JSON.stringify({ items: {} })); // shape-valid, no mac.
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-wf",
+      sessionIdRaw: "sess-wf",
+      yieldLogPath,
+      now: () => 4242,
+    });
+    const lines = readYieldLogLines(yieldLogPath);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].event, "tamper");
+    assert.equal(lines[0].session, "sess-wf");
+    assert.equal(typeof lines[0].ts, "string");
+    assert.ok(!Number.isNaN(Date.parse(lines[0].ts)));
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("ordinary_first_run_not_logged_as_tamper: no state file exists at all -> zero tamper lines", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const statePath = reblockStatePath(stateDir, "sess-fresh");
+    const keyBytes = readOrCreateHmacKey(fsx, stateDir);
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const state = readReblockState(fsx, statePath, {
+      keyBytes,
+      sessionKey: "sess-fresh",
+      sessionIdRaw: "sess-fresh",
+      yieldLogPath,
+      now: () => 1,
+    });
+    assert.deepEqual(state, { items: {} });
+    assert.equal(readYieldLogLines(yieldLogPath).length, 0);
+  } finally {
+    rmTree(stateDir);
+  }
+});
+
+test("tamper_reset_only_delays_never_grants: forged strikes:3 state is reset, real stale item still blocks from scratch (end-to-end)", () => {
+  const stateDir = mkReblockDir();
+  try {
+    const fsx = realFsDeps();
+    const sessionId = "sess-tamper-e2e";
+    const statePath = reblockStatePath(stateDir, sessionId);
+    fs.mkdirSync(stateDir, { recursive: true });
+    // Forged: strikes already at the cap, no mac -- an agent trying to
+    // force an immediate yield on the very first REAL Stop invocation for
+    // this session.
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        items: {
+          "worktree:c:/w/still-stale": {
+            kind: "worktree",
+            identity: "c:/w/still-stale",
+            strikes: 3,
+            first_block_at: "t",
+            last_block_at: "t",
+          },
+        },
+      })
+    );
+    const deps = { stateDir, now: () => 1000, fs: fsx };
+    const stdinInfo = { session_id: sessionId, stop_hook_active: false };
+    const r = applyBoundedReblock(
+      oneItemBlock("worktree", "C:/w/still-stale", "[worktree:linked] C:/w/still-stale — stale"),
+      stdinInfo,
+      deps
+    );
+    // The forged strikes:3 was NOT honored -- this invocation still
+    // BLOCKS (reset to 0, then incremented to 1 by this real block), never
+    // allows on the forged value.
+    assert.equal(r.action, "block");
+    assert.match(r.reason, /still-stale — stale/);
+
+    const yieldLogPath = path.join(stateDir, "stop-stale-worktrees-guard.yields.log");
+    const tamperLines = readYieldLogLines(yieldLogPath).filter((l) => l.event === "tamper");
+    assert.equal(tamperLines.length, 1);
+  } finally {
+    rmTree(stateDir);
   }
 });
