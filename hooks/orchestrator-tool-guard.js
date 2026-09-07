@@ -16,11 +16,45 @@ const { isBlankAfterStrip } = require("./model-routing-guards.unicode.js");
 const state = require("./model-routing-guards.state.js");
 const rules = require("./model-routing-guards.rules.js");
 const { createLogger } = require("./model-routing-guards.log.js");
+const decisions = require("./model-routing-guards.decisions.js");
 
 const appendDebug = createLogger("orchestrator-tool-guard");
 
+// docs/specs/routing-scorecard.md §2.4 — this guard has no pre-existing
+// version constant of its own; a new local one is required for the
+// decision ledger's guard_version field.
+const DECISIONS_GUARD_VERSION = "1";
+
+// docs/specs/routing-scorecard.md §2.1 R1 — raw stdin is captured into a
+// module-level (outer-scope) variable BEFORE main() runs, so the top-level
+// catch below (which has never had access to main()'s own local `raw`) can
+// pass it to appendCrashRecord for best-effort session_id recovery. This
+// changes only WHEN the read happens (module scope, immediately before
+// main() is invoked, in the same synchronous turn) — not what gets read,
+// how a read failure is classified, or any block/allow/fail_open outcome.
+let rawStdinBuffer;
+let stdinReadFailed = false;
+
+function captureStdin() {
+  try {
+    rawStdinBuffer = fs.readFileSync(0, "utf8");
+  } catch (_) {
+    stdinReadFailed = true;
+  }
+}
+
+function decisionRecord(fields) {
+  return Object.assign({ guard: "orchestrator-tool-guard", guard_version: DECISIONS_GUARD_VERSION }, fields);
+}
+
 function failOpen(reason, extra) {
   appendDebug(Object.assign({ ts: new Date().toISOString(), event: "fail_open", reason }, extra || {}));
+  // §2.5: caller is "unknown" at every fail_open triggered before
+  // agent_id has been parsed at all — true for all three fail_open reasons
+  // this guard can produce (stdin_read_error/json_parse_error/parsed_not_object).
+  decisions.appendDecision(
+    decisionRecord({ event: "fail_open", session_id: null, agent_id: null, caller: "unknown", tool_name: null, reason })
+  );
   process.exit(0);
 }
 
@@ -33,19 +67,24 @@ function buildBlockMessage(findings, toolName) {
   return msg;
 }
 
-function block(findings, toolName, extra) {
-  appendDebug(
-    Object.assign(
-      { ts: new Date().toISOString(), event: "block", tool_name: toolName, finding_ids: findings.map((f) => f.id) },
-      extra || {}
+function block(findings, toolName, extra, ctx) {
+  const findingIds = findings.map((f) => f.id);
+  appendDebug(Object.assign({ ts: new Date().toISOString(), event: "block", tool_name: toolName, finding_ids: findingIds }, extra || {}));
+  decisions.appendDecision(
+    decisionRecord(
+      Object.assign(
+        { event: "block", tool_name: toolName, finding_ids: findingIds },
+        ctx || {}
+      )
     )
   );
   process.stderr.write(buildBlockMessage(findings, toolName));
   process.exit(2);
 }
 
-function allow(toolName, extra) {
+function allow(toolName, extra, ctx) {
   appendDebug(Object.assign({ ts: new Date().toISOString(), event: "allow", tool_name: toolName }, extra || {}));
+  decisions.appendDecision(decisionRecord(Object.assign({ event: "allow", tool_name: toolName }, ctx || {})));
   process.exit(0);
 }
 
@@ -63,13 +102,11 @@ function emitLogNotes(logNotes) {
 }
 
 function main() {
-  let raw;
-  try {
-    raw = fs.readFileSync(0, "utf8");
-  } catch (_) {
+  if (stdinReadFailed) {
     failOpen("stdin_read_error");
     return;
   }
+  const raw = rawStdinBuffer;
 
   let parsed;
   try {
@@ -91,11 +128,24 @@ function main() {
   const toolName = typeof parsed.tool_name === "string" ? parsed.tool_name : "";
   const toolInput = parsed.tool_input && typeof parsed.tool_input === "object" ? parsed.tool_input : {};
   const sessionIdRaw = parsed.session_id;
+  const sessionIdForDecision = typeof sessionIdRaw === "string" ? sessionIdRaw : null;
+  const agentIdForDecision = typeof parsed.agent_id === "string" ? parsed.agent_id : null;
+  const toolUseIdForDecision = typeof parsed.tool_use_id === "string" && parsed.tool_use_id !== "" ? parsed.tool_use_id : null;
 
   try {
     const caller = classifyCaller(parsed.agent_id);
     if (caller === "subagent") {
       appendDebug({ ts: new Date().toISOString(), event: "exempt_subagent", tool_name: toolName });
+      decisions.appendDecision(
+        decisionRecord({
+          event: "exempt_subagent",
+          session_id: sessionIdForDecision,
+          agent_id: agentIdForDecision,
+          caller,
+          tool_name: toolName,
+          tool_use_id: toolUseIdForDecision,
+        })
+      );
       process.exit(0);
     }
 
@@ -118,7 +168,9 @@ function main() {
       default:
         block(
           [{ id: "unexpected_tool_name", detail: `unexpected tool_name "${toolName}" reached this hook (matcher should be Read|Bash|PowerShell|Write|Edit only).` }],
-          toolName || "(missing)"
+          toolName || "(missing)",
+          {},
+          { session_id: sessionIdForDecision, agent_id: agentIdForDecision, caller, tool_use_id: toolUseIdForDecision }
         );
         return;
     }
@@ -130,6 +182,22 @@ function main() {
     if (typeof result.tally_edits === "number") extra.tally_edits = result.tally_edits;
     if (typeof result.tally_reads === "number") extra.tally_reads = result.tally_reads;
 
+    // §2.2 target_hash: resolved file path (Read/Write/Edit) or the raw
+    // command string (Bash/PowerShell) — never the raw value itself.
+    let target = null;
+    if (toolName === "Bash" || toolName === "PowerShell") {
+      target = typeof toolInput.command === "string" ? toolInput.command : null;
+    } else if (toolName === "Read" || toolName === "Write" || toolName === "Edit") {
+      target = typeof result.resolvedPath === "string" ? result.resolvedPath : null;
+    }
+    const ctx = {
+      session_id: sessionIdForDecision,
+      agent_id: agentIdForDecision,
+      caller,
+      tool_use_id: toolUseIdForDecision,
+      target_hash: decisions.hashTarget(target),
+    };
+
     if (result.allow) {
       if (result.orchestratorDirect) {
         appendDebug({
@@ -137,13 +205,14 @@ function main() {
           event: "orchestrator_direct_shell",
           tool_name: toolName,
           command: toolInput.command,
-          session_id: typeof sessionIdRaw === "string" ? sessionIdRaw : null,
+          session_id: sessionIdForDecision,
         });
+        decisions.appendDecision(decisionRecord(Object.assign({ event: "orchestrator_direct_shell", tool_name: toolName }, ctx)));
         process.exit(0);
       }
-      allow(toolName, extra);
+      allow(toolName, extra, ctx);
     } else {
-      block(result.findings, toolName, extra);
+      block(result.findings, toolName, extra, ctx);
     }
   } catch (internalErr) {
     appendDebug({
@@ -153,12 +222,24 @@ function main() {
       finding_ids: ["internal_exception"],
       message: String((internalErr && internalErr.message) || internalErr),
     });
+    decisions.appendDecision(
+      decisionRecord({
+        event: "block",
+        tool_name: toolName,
+        finding_ids: ["internal_exception"],
+        session_id: sessionIdForDecision,
+        agent_id: agentIdForDecision,
+        caller: classifyCaller(parsed.agent_id),
+        tool_use_id: toolUseIdForDecision,
+      })
+    );
     process.stderr.write("orchestrator-tool-guard: BLOCKED — internal error during classification — treat as block.\n");
     process.exit(2);
   }
 }
 
 if (require.main === module) {
+  captureStdin();
   try {
     main();
   } catch (topErr) {
@@ -171,6 +252,12 @@ if (require.main === module) {
       });
       process.stderr.write("orchestrator-tool-guard: BLOCKED — internal error during classification — treat as block.\n");
     } catch (_) {}
+    // §2.1 R1 — best-effort session recovery from the raw stdin captured
+    // before main() ran; routes to that session's own file as event
+    // "block" when session_id is recoverable, else to the global-fallback
+    // file as event "guard_crash". Never throws; the guard's own exit code
+    // (2, unchanged from before this spec) is decided independently below.
+    decisions.appendCrashRecord(rawStdinBuffer, "orchestrator-tool-guard", DECISIONS_GUARD_VERSION);
     process.exit(2);
   }
 }
