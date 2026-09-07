@@ -32,6 +32,16 @@
 //   - No state file, no strike counter, no session-keyed ledger. Every
 //     Stop invocation independently re-runs full classification from
 //     scratch -- see JUDGE_STOP_GUARD below for the one and only bypass.
+//   - Remote-tracking refs (refs/remotes/*, spec section 13, adversaried a
+//     third round -- section 14) are a third classification target
+//     alongside worktrees and local branches: `stale-remote` (merged into
+//     base, on the base's OWN remote only) blocks; `stale-remote-foreign`
+//     (merged into base, on any OTHER remote -- the operator has no
+//     standing to delete it) allows with a systemMessage instead. Never
+//     fetches; an atomically-failing `for-each-ref refs/remotes` (one bad
+//     object blacks out the whole call) falls back to `show-ref` plus
+//     per-ref `rev-parse --verify` so one corrupt ref can't hide every
+//     sibling ref's classification.
 //
 // Bypass: set JUDGE_STOP_GUARD=off in the hook process's OWN inherited
 // environment (not something an agent can set from inside its own shell
@@ -74,7 +84,22 @@ const FER_FORMAT =
   "%(objectname)" + FIELD_SEP +
   "%(tree)" + FIELD_SEP +
   "%(upstream)" + FIELD_SEP +
-  "%(upstream:track)";
+  "%(upstream:track)" + FIELD_SEP +
+  "%(upstream:remotename)";
+
+// refs/remotes/* enumeration format (spec §3 "Remote-tracking branches").
+// Full refname (for the `/HEAD`-suffix exclusion and exact-ref-equality
+// exclusion) AND short name (for remote-ownership/branch-name extraction,
+// §3's whole-ref-path-string principle, round-3 finding R3-07).
+const FER_REMOTE_FORMAT =
+  "%(refname)" + FIELD_SEP +
+  "%(refname:short)" + FIELD_SEP +
+  "%(objectname)" + FIELD_SEP +
+  "%(tree)";
+
+// Active-worktree carve-out (spec §15, live finding 2026-09-07; revised
+// per adversary round 4, spec §16).
+const DEFAULT_QUIET_MINUTES = 30;
 
 // In-progress-operation markers, checked in priority order (first match
 // wins) under the primary worktree's own git dir. §3's "detached HEAD,
@@ -229,7 +254,9 @@ function resolveBaseBranch(targetDir, execGit, budget) {
       const verify = gitCall(execGit, ["rev-parse", "--verify", "-q", target], targetDir, budget);
       if (callFailed(verify)) return { ok: false, deadlineExpired: true };
       if (verify.ok) {
-        return { ok: true, base: { name: m[1], tip: verify.stdout.trim(), ref: target } };
+        // viaOriginHead: true -- base's own remote (spec §3, §13) is the
+        // literal, hardcoded "origin" this waterfall already assumes.
+        return { ok: true, base: { name: m[1], tip: verify.stdout.trim(), ref: target, viaOriginHead: true } };
       }
       // Dangling symref (target ref doesn't actually exist) -- fall through.
     }
@@ -239,7 +266,10 @@ function resolveBaseBranch(targetDir, execGit, budget) {
     const verify = gitCall(execGit, ["rev-parse", "--verify", "-q", `refs/heads/${candidate}`], targetDir, budget);
     if (callFailed(verify)) return { ok: false, deadlineExpired: true };
     if (verify.ok) {
-      return { ok: true, base: { name: candidate, tip: verify.stdout.trim(), ref: `refs/heads/${candidate}` } };
+      // viaOriginHead: false -- base's own remote (if any) must instead be
+      // read off this local branch's own %(upstream:remotename), resolved
+      // later once the refs/heads for-each-ref call has run.
+      return { ok: true, base: { name: candidate, tip: verify.stdout.trim(), ref: `refs/heads/${candidate}`, viaOriginHead: false } };
     }
   }
 
@@ -329,14 +359,295 @@ function parseForEachRef(stdout) {
     .map((line) => {
       const parts = line.split(FIELD_SEP);
       const upstream = parts[3];
+      const upstreamRemoteName = parts[5];
       return {
         name: parts[0] || "",
         tip: parts[1] || "",
         tree: parts[2] || "",
         upstreamRef: upstream && upstream.trim() !== "" ? upstream : null,
         trackRaw: parts[4] || "",
+        upstreamRemoteName: upstreamRemoteName && upstreamRemoteName.trim() !== "" ? upstreamRemoteName : null,
       };
     });
+}
+
+// ─── Remote-tracking ref enumeration and classification (spec §3 "Remote-
+// tracking branches", §13, adversary round 3 §14) ─────────────────────────
+
+function parseForEachRefRemotes(stdout) {
+  return stdout
+    .split(/\r?\n/)
+    .filter((l) => l !== "")
+    .map((line) => {
+      const parts = line.split(FIELD_SEP);
+      return { refname: parts[0] || "", shortName: parts[1] || "", tip: parts[2] || "", tree: parts[3] || "" };
+    });
+}
+
+// Fallback enumeration format (round-3 finding R3-02, corrected during
+// implementation -- see the note below): refname + objectname ONLY, no
+// %(tree). `%(objectname)` is the raw SHA stored directly IN the ref, so
+// resolving it never requires opening the target object; requesting
+// %(tree) is what forces git to load and parse the commit for every ref
+// in one for-each-ref invocation, which is the actual mechanism behind
+// the atomic, whole-namespace failure this fallback exists to route
+// around.
+const FER_REMOTE_FALLBACK_FORMAT = "%(refname)" + FIELD_SEP + "%(refname:short)" + FIELD_SEP + "%(objectname)";
+
+function parseForEachRefRemotesFallback(stdout) {
+  return stdout
+    .split(/\r?\n/)
+    .filter((l) => l !== "")
+    .map((line) => {
+      const parts = line.split(FIELD_SEP);
+      return { refname: parts[0] || "", shortName: parts[1] || "", tip: parts[2] || "" };
+    });
+}
+
+/**
+ * Enumerates every ref under refs/remotes/*. Fast path: one batched
+ * for-each-ref call (rich format, incl. tree). Fallback (round-3 finding
+ * R3-02): that call fails ATOMICALLY -- zero rows for the whole namespace,
+ * not per-ref -- when even one ref's object is missing/unreadable, since
+ * resolving %(tree) requires loading the commit object for every ref in
+ * one pass.
+ *
+ * CORRECTED DURING IMPLEMENTATION, not as originally specified: R3-02's
+ * text named `git show-ref` as the safe, non-dereferencing fallback.
+ * Verified empirically (git 2.52.0.windows.1) that `git show-ref` ALSO
+ * fails atomically on the exact same ref -- `fatal: git show-ref: bad ref
+ * ... (<sha>)` -- for every ref in the repo, not just the bad one. The
+ * actually-safe primitive is a REDUCED `for-each-ref` call requesting only
+ * `%(refname)`/`%(objectname)` (never `%(tree)`), confirmed to succeed
+ * against the identical fixture. Fallback here uses that reduced call,
+ * then verifies each surviving ref's commit AND tree individually via
+ * `git rev-parse --verify` (matching R3-02's per-ref-verify intent); a ref
+ * that fails becomes its own isolated `unknown` result instead of taking
+ * every sibling ref down with it.
+ * Returns { ok:true, refs:[{refname,shortName,tip,tree}], unknownRefs:[{refname,reasonNote,timedOut?}], usedFallback? }
+ * or { ok:false, deadlineExpired:true } or { ok:false, message }.
+ */
+function listRemoteRefs(execGit, cwd, budget) {
+  const fast = gitCall(execGit, ["for-each-ref", "--format=" + FER_REMOTE_FORMAT, "refs/remotes"], cwd, budget);
+  if (fast.ok) {
+    return { ok: true, refs: parseForEachRefRemotes(fast.stdout), unknownRefs: [] };
+  }
+  if (callFailed(fast)) return { ok: false, deadlineExpired: true };
+
+  const listRes = gitCall(execGit, ["for-each-ref", "--format=" + FER_REMOTE_FALLBACK_FORMAT, "refs/remotes"], cwd, budget);
+  if (!listRes.ok) {
+    return callFailed(listRes)
+      ? { ok: false, deadlineExpired: true }
+      : { ok: false, message: listRes.message || "git for-each-ref (fallback enumeration) failed" };
+  }
+
+  const refs = [];
+  const unknownRefs = [];
+  for (const candidate of parseForEachRefRemotesFallback(listRes.stdout)) {
+    const { refname, shortName } = candidate;
+    if (budget.remaining() <= 0) {
+      unknownRefs.push({ refname, reasonNote: "deadline expired during fallback per-ref verification", timedOut: true });
+      continue;
+    }
+    const commitRes = gitCall(execGit, ["rev-parse", "--verify", "-q", refname + "^{commit}"], cwd, budget);
+    if (!commitRes.ok) {
+      unknownRefs.push({ refname, reasonNote: "object missing or unreadable (fallback verify failed)", timedOut: !!(commitRes.timedOut || commitRes.deadlineExpired) });
+      continue;
+    }
+    const treeRes = gitCall(execGit, ["rev-parse", "--verify", "-q", refname + "^{tree}"], cwd, budget);
+    if (!treeRes.ok) {
+      unknownRefs.push({ refname, reasonNote: "tree object missing or unreadable (fallback verify failed)", timedOut: !!(treeRes.timedOut || treeRes.deadlineExpired) });
+      continue;
+    }
+    refs.push({ refname, shortName, tip: commitRes.stdout.trim(), tree: treeRes.stdout.trim() });
+  }
+  return { ok: true, refs, unknownRefs, usedFallback: true };
+}
+
+/**
+ * Determines which configured remote owns `shortName` (e.g. "origin/main")
+ * by longest-matching-prefix against the known remote name list -- never
+ * by splitting the ref path itself (round-3 finding R3-07: a remote name
+ * may legitimately contain "/"). Returns the remote name, or null if no
+ * configured remote's name is a prefix (e.g. a stale cached ref from a
+ * since-removed remote).
+ */
+function remoteForRef(shortName, remoteNames) {
+  let best = null;
+  for (const name of remoteNames) {
+    const prefix = name + "/";
+    if (shortName.startsWith(prefix) && (!best || name.length > best.length)) best = name;
+  }
+  return best;
+}
+
+/**
+ * Classifies one refs/remotes/* ref against `base`. First match wins, per
+ * spec §3 "Remote-tracking branches". Returns one of:
+ *   { class:"excluded" }
+ *   { class:"active-remote" }
+ *   { class:"stale-remote"|"stale-remote-foreign", evidence, owner }
+ *   { class:"unknown", reasonNote, timedOut? }
+ */
+function classifyRemoteRef(ref, base, baseRemoteName, remoteNames, excludedRefName, execGit, cwd, budget) {
+  if (ref.refname.endsWith("/HEAD")) return { class: "excluded" }; // structural name-suffix match (R3-01) -- never symref detection.
+  if (excludedRefName && ref.refname === excludedRefName) return { class: "excluded" };
+  if (ref.tip === base.tip) return { class: "excluded" }; // mandatory tip-equality guard -- closes the §12 bug for remote refs too.
+
+  const anc = isAncestor(execGit, cwd, budget, ref.tip, base.tip);
+  if (anc.failure) {
+    return { class: "unknown", reasonNote: "git merge-base --is-ancestor failed", timedOut: !!(anc.timedOut || anc.deadlineExpired) };
+  }
+  let evidence = null;
+  if (anc.result) {
+    evidence = "ancestor";
+  } else if (base.treeSet.has(ref.tree)) {
+    evidence = "tree-equality";
+  } else {
+    const cherryRes = cherryAllApplied(execGit, cwd, budget, base.tip, ref.tip);
+    if (cherryRes.failure) {
+      return { class: "unknown", reasonNote: "git cherry failed", timedOut: !!(cherryRes.timedOut || cherryRes.deadlineExpired) };
+    }
+    if (cherryRes.result) evidence = "cherry";
+  }
+  if (!evidence) return { class: "active-remote" };
+
+  const owner = remoteForRef(ref.shortName, remoteNames);
+  const isBaseRemote = !!baseRemoteName && owner === baseRemoteName;
+  return { class: isBaseRemote ? "stale-remote" : "stale-remote-foreign", evidence, owner: owner || "(unrecognized remote)" };
+}
+
+/**
+ * Fix sequence, verbatim, spec §13 (round-3 findings R3-03/R3-04) -- base
+ * remote only. `remoteRef.shortName` is e.g. "origin/feature"; the branch
+ * part is extracted by stripping the KNOWN `remoteName + "/"` prefix
+ * (never by guessing where the remote name ends -- R3-07).
+ */
+function buildRemoteFixLines(remoteRef, remoteName) {
+  const branchPart = remoteRef.shortName.slice(remoteName.length + 1);
+  return [
+    `git fetch --prune ${remoteName}  # the ref may already be gone on the server`,
+    `git rev-parse --verify -q refs/remotes/${remoteRef.shortName}  # re-check after fetch --prune -- if this now fails, the ref is already gone; skip the push --delete below`,
+    `git push ${remoteName} --delete ${branchPart}  # externally visible: deletes the branch on the remote`,
+    `git branch -dr ${remoteRef.shortName}  # fallback if push --delete is refused (no push rights) -- local only: recurs after the next fetch until the branch is actually gone server-side`,
+  ];
+}
+
+// A branch classified via §3 Branches row 6 may already carry its own
+// "git push origin --delete <name>" line; when that branch is grouped
+// with an independently-classified stale-remote finding (§13), the new
+// remote fix sequence above supersedes it -- strip it to avoid emitting
+// the same remote mutation twice.
+function stripRedundantPushDeleteLine(fixLines) {
+  return fixLines.filter((l) => !/^git push \S+ --delete /.test(l));
+}
+
+// ─── Active-worktree carve-out (spec §15/§16) ──────────────────────────────
+
+function getQuietWindowMs(env) {
+  const raw = (env || process.env).JUDGE_STOP_GUARD_QUIET_MINUTES;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return DEFAULT_QUIET_MINUTES * 60000;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_QUIET_MINUTES * 60000;
+  return n * 60000;
+}
+
+/**
+ * Round-4 finding R4-03: a bare `git rev-list --count base..HEAD` reads a
+ * fully rebase/squash-merged branch (rewritten hashes, content already
+ * landed) as "active" forever. Reuses the exact same three detectors the
+ * branch table itself uses (ancestor / tree-equality / cherry) so
+ * condition (b) only fires for content genuinely NOT YET integrated into
+ * base by any known signature -- any git-call failure along the way is
+ * treated as "not a signal" (false), never as a reason to call the
+ * worktree active, matching this guard's friction-over-silent-escape
+ * default: an uncertain integration check still leaves the branch's own
+ * classifyBranch pass (run later, independently) to reach its own
+ * unknown/block verdict if the same calls fail there too.
+ */
+function hasUnintegratedCommits(execGit, worktreePath, base, budget) {
+  const headRes = gitCall(execGit, ["rev-parse", "--verify", "-q", "HEAD"], worktreePath, budget);
+  if (!headRes.ok) return false;
+  const tip = headRes.stdout.trim();
+  if (tip === base.tip) return false;
+
+  const anc = isAncestor(execGit, worktreePath, budget, tip, base.tip);
+  if (anc.failure) return false;
+  if (anc.result) return false; // fast-forward-integrated already.
+
+  const treeRes = gitCall(execGit, ["rev-parse", "--verify", "-q", "HEAD^{tree}"], worktreePath, budget);
+  if (treeRes.ok && base.treeSet && base.treeSet.has(treeRes.stdout.trim())) return false; // squash-integrated.
+
+  const cherryRes = cherryAllApplied(execGit, worktreePath, budget, base.tip, tip);
+  if (cherryRes.failure) return false;
+  if (cherryRes.result) return false; // rebase-integrated.
+
+  return true; // genuinely has commits not yet integrated into base.
+}
+
+function parseReflogLastTimestampMs(content) {
+  const lines = content.split(/\r?\n/).filter((l) => l.trim() !== "");
+  if (lines.length === 0) return null;
+  const last = lines[lines.length - 1];
+  const m = /\s(\d{10,})\s+[+-]\d{4}\t/.exec(last);
+  if (!m) return null;
+  return parseInt(m[1], 10) * 1000;
+}
+
+/**
+ * Condition (c), revised per round-4 finding R4-02: uses ONLY the
+ * timestamp recorded in `logs/HEAD`'s (the reflog) own last line -- never
+ * a file mtime for HEAD/index -- plus `COMMIT_EDITMSG`'s mtime. `index`
+ * was dropped entirely: `git status` (which condition (a) must run on
+ * every invocation) rewrites the on-disk index whenever its stat cache is
+ * out of date, including from a cosmetic mtime touch with no content
+ * change -- using index mtime as a recency signal is self-refreshing,
+ * potentially even by this guard's own prior run. The reflog is written
+ * only by real ref-moving operations (checkout/commit/reset/merge), never
+ * by `status`. Round-4 finding R4-06: a future/skewed mtime is clamped to
+ * "not recent" (never fresh) by requiring a non-negative delta.
+ */
+function isWorktreeRecentlyActive(gitDir, fsx, nowMs, quietWindowMs) {
+  if (!(quietWindowMs > 0)) return false;
+  let newest = -Infinity;
+  try {
+    const content = fsx.readFileSync(path.join(gitDir, "logs", "HEAD"), "utf8");
+    const ts = parseReflogLastTimestampMs(content);
+    if (typeof ts === "number" && ts > newest) newest = ts;
+  } catch (_) {
+    // reflog absent/unreadable -- not a signal.
+  }
+  try {
+    const st = fsx.statSync(path.join(gitDir, "COMMIT_EDITMSG"));
+    if (st && typeof st.mtimeMs === "number" && st.mtimeMs > newest) newest = st.mtimeMs;
+  } catch (_) {
+    // absent -- not a signal.
+  }
+  if (newest === -Infinity) return false;
+  const delta = nowMs - newest;
+  return delta >= 0 && delta <= quietWindowMs;
+}
+
+/**
+ * Spec §15/§16: for ANY worktree (primary or linked, round-4 finding
+ * R4-04) whose checked-out branch would otherwise classify `stale`,
+ * checks whether the worktree itself is active via any of (a) dirty,
+ * (b) unintegrated commits, (c) recent reflog/commit activity. Returns
+ * { active: true, reason } or { active: false }.
+ */
+function detectWorktreeActivity(execGit, worktreePath, base, budget, fsx, quietWindowMs) {
+  const statusRes = gitCall(execGit, ["status", "--porcelain"], worktreePath, budget);
+  if (statusRes.ok && statusRes.stdout.trim() !== "") {
+    return { active: true, reason: "uncommitted changes present" };
+  }
+  if (hasUnintegratedCommits(execGit, worktreePath, base, budget)) {
+    return { active: true, reason: "has commits not yet integrated into base" };
+  }
+  const gitDirRes = resolveGitDir(execGit, worktreePath, budget);
+  if (gitDirRes.ok && isWorktreeRecentlyActive(gitDirRes.gitDir, fsx, Date.now(), quietWindowMs)) {
+    return { active: true, reason: "recent worktree activity" };
+  }
+  return { active: false };
 }
 
 /**
@@ -501,14 +812,21 @@ function classifyBranch(branch, base, execGit, cwd, budget) {
 const INSPECT_FIRST = (p) => `git -C ${p} status --porcelain  # inspect for uncommitted changes before removing`;
 
 /**
- * Returns { findings, inProgressMessage, checkedOutMap }.
+ * Returns { findings, inProgressMessage, activeMessages, checkedOutMap, consumedRemoteRefs }.
  * `checkedOutMap`: Map<branchShortName, { isPrimary: boolean }> for every
  * worktree record that has a `branch` line (detached records excluded).
+ * `remoteByTrackingBranchName`/`baseRemoteName` (spec §13): used to append
+ * a grouped stale-remote fix onto a covered branch's combined item
+ * (three-way grouping, round-3 finding R3-05). `quietWindowMs` (spec §15):
+ * used by the active-linked-worktree carve-out.
  */
-function classifyWorktrees(records, branchResultsByName, execGit, targetDir, budget, fsx) {
+function classifyWorktrees(records, branchResultsByName, execGit, targetDir, budget, fsx, remoteByTrackingBranchName, baseRemoteName) {
+  remoteByTrackingBranchName = remoteByTrackingBranchName || new Map();
   const findings = [];
   let inProgressMessage = null;
+  const activeMessages = [];
   const checkedOutMap = new Map();
+  const consumedRemoteRefs = new Set();
 
   records.forEach((rec, idx) => {
     if (rec.branch) checkedOutMap.set(shortBranchName(rec.branch), { isPrimary: idx === 0 });
@@ -537,9 +855,23 @@ function classifyWorktrees(records, branchResultsByName, execGit, targetDir, bud
           text: `primary worktree ${rec.worktree} is at a detached HEAD with no in-progress git operation detected`,
           fixLines: null,
         });
+        return;
       }
-      // On a branch -> ok (row 3): nothing to add here; that branch's own
-      // staleness, if any, is reported separately via the branch table.
+      // On a branch: round-4 finding R4-04 extends the active-worktree
+      // carve-out to the primary worktree too -- the override already
+      // happened at branch-classification time (evaluateStop), so all
+      // that's left here is surfacing the informational message when it
+      // did. Otherwise that branch's own staleness, if any, is reported
+      // separately via the branch table (still leads with `git checkout
+      // <base>` for a genuinely clean, quiet, stale primary branch -- the
+      // original incident class R4-04 preserves).
+      {
+        const primaryName = shortBranchName(rec.branch);
+        const primaryRes = branchResultsByName.get(primaryName);
+        if (primaryRes && primaryRes.viaWorktreeActivity) {
+          activeMessages.push(`active worktree on merged branch ${primaryName} (${primaryRes.activityReason}); clean up when done`);
+        }
+      }
       return;
     }
 
@@ -576,13 +908,38 @@ function classifyWorktrees(records, branchResultsByName, execGit, targetDir, bud
 
     const name = shortBranchName(rec.branch);
     const branchRes = branchResultsByName.get(name);
+
+    // Spec §15/§16 (live finding 2026-09-07, adversary round 4): the
+    // active-worktree override already happened at branch-classification
+    // time (evaluateStop) -- a branch whose worktree is active never
+    // reaches this guard's own ancestor/tree/cherry/gone rows at all
+    // (round-4 finding R4-01: gating only HERE, after the fact, would
+    // leave the branch independently re-reported via branchFindings).
+    // All that's left here is surfacing the informational message.
+    if (branchRes && branchRes.viaWorktreeActivity) {
+      activeMessages.push(`active worktree on merged branch ${name} (${branchRes.activityReason}); clean up when done`);
+      return;
+    }
+
     if (branchRes && branchRes.class === "stale") {
       const fixLines = [INSPECT_FIRST(rec.worktree)];
       if (rec.locked) fixLines.push(`git worktree unlock ${rec.worktree}`);
-      fixLines.push(`git worktree remove ${rec.worktree}`, ...branchRes.fixLines);
+      fixLines.push(`git worktree remove ${rec.worktree}`);
+
+      let branchFixLines = branchRes.fixLines;
+      let evidence = branchRes.evidence;
+      const groupedRemote = remoteByTrackingBranchName.get(name);
+      if (groupedRemote && baseRemoteName) {
+        fixLines.push(...buildRemoteFixLines(groupedRemote, baseRemoteName));
+        branchFixLines = stripRedundantPushDeleteLine(branchFixLines);
+        consumedRemoteRefs.add(groupedRemote.refname);
+        evidence = `${evidence}+remote-${groupedRemote.evidence}`;
+      }
+      fixLines.push(...branchFixLines);
+
       findings.push({
         kind: "worktree", role: "linked", path: rec.worktree, class: "stale",
-        evidence: `branch-${branchRes.evidence}`, fixLines, coveredBranch: name,
+        evidence: `branch-${evidence}`, fixLines, coveredBranch: name,
       });
       return;
     }
@@ -597,17 +954,19 @@ function classifyWorktrees(records, branchResultsByName, execGit, targetDir, bud
     // ok: not prunable, dir exists, branch is base/empty-local/active.
   });
 
-  return { findings, inProgressMessage, checkedOutMap };
+  return { findings, inProgressMessage, activeMessages, checkedOutMap, consumedRemoteRefs };
 }
 
 // ─── Reason text assembly ──────────────────────────────────────────────────
 
 function formatFinding(f) {
-  let line = f.kind === "worktree"
-    ? `[worktree:${f.role}] ${f.path} — ${f.class}`
-    : `[branch] ${f.name} — ${f.class}`;
+  let line;
+  if (f.kind === "worktree") line = `[worktree:${f.role}] ${f.path} — ${f.class}`;
+  else if (f.kind === "remote") line = `[remote] ${f.refname} — ${f.class}`;
+  else line = `[branch] ${f.name} — ${f.class}`;
   if (f.evidence) line += ` (evidence: ${f.evidence})`;
   if (f.text) line += `: ${f.text}`;
+  if (f.note) line += ` [${f.note}]`;
   if (f.fixLines && f.fixLines.length > 0) {
     line += ` — fix: ${f.fixLines.join(" ; ")}`;
   } else {
@@ -664,8 +1023,13 @@ function evaluateStop(targetDir, deps) {
   const execGit = deps.execGit || defaultExecGit;
   const now = deps.now || Date.now;
   const deadlineMs = typeof deps.deadlineMs === "number" ? deps.deadlineMs : INTERNAL_DEADLINE_MS;
-  const fsx = deps.fs || { existsSync: (p) => fs.existsSync(p) };
+  const fsx = deps.fs || {
+    existsSync: (p) => fs.existsSync(p),
+    statSync: (p) => fs.statSync(p),
+    readFileSync: (p, enc) => fs.readFileSync(p, enc),
+  };
   const budget = makeBudget(now, deadlineMs);
+  const quietWindowMs = getQuietWindowMs(deps.env);
 
   const scope = classifyScope(targetDir, execGit, budget);
   if (scope.status === "out-of-scope") return { action: "allow" };
@@ -709,13 +1073,31 @@ function evaluateStop(targetDir, deps) {
   base.treeSet = new Set(treeSetRes.stdout.split(/\r?\n/).filter(Boolean));
   classified.push({ kind: "step", id: "base-tree-set", class: `${base.treeSet.size} tree(s)` });
 
+  // ── Active-worktree pre-pass (spec §15/§16, round-4 finding R4-01/R4-04)
+  // Computed BEFORE branch classification, for every worktree (primary or
+  // linked) with a checked-out branch, so an active worktree's branch can
+  // be overridden to `active` before it ever reaches the ancestor/tree/
+  // cherry/gone rows -- fixing it only after the fact (inside
+  // classifyWorktrees) would leave the branch independently re-reported
+  // via branchFindings (R4-01).
+  const activeInfoByBranchName = new Map();
+  for (const rec of records) {
+    if (rec.bare || !rec.branch) continue;
+    if (budget.remaining() <= 0) break; // deadline pressure: fail toward NOT overriding (still-safe stale/unknown path).
+    const activity = detectWorktreeActivity(execGit, rec.worktree, base, budget, fsx, quietWindowMs);
+    if (activity.active) activeInfoByBranchName.set(shortBranchName(rec.branch), activity.reason);
+  }
+
   const branchResultsByName = new Map();
   for (const br of branches) {
     if (budget.remaining() <= 0) {
       notReached.push({ kind: "branch", id: br.name });
       continue;
     }
-    const result = classifyBranch(br, base, execGit, targetDir, budget);
+    let result = classifyBranch(br, base, execGit, targetDir, budget);
+    if (result.class === "stale" && activeInfoByBranchName.has(br.name)) {
+      result = { class: "active", row: 9, viaWorktreeActivity: true, wouldHaveBeenEvidence: result.evidence, activityReason: activeInfoByBranchName.get(br.name) };
+    }
     branchResultsByName.set(br.name, result);
     classified.push({ kind: "branch", id: br.name, class: result.class });
   }
@@ -723,11 +1105,76 @@ function evaluateStop(targetDir, deps) {
     return { action: "block", reason: buildDeadlineReason(classified, notReached) };
   }
 
+  // ── Remote-tracking refs (spec §3 "Remote-tracking branches", §13) ──
+  const baseBranchRow = branches.find((b) => b.name === base.name);
+  const excludedRefName = base.viaOriginHead ? base.ref : (baseBranchRow && baseBranchRow.upstreamRef) || null;
+  let baseRemoteName = null;
+  let remoteResults = [];
+
+  const remoteEnumRes = listRemoteRefs(execGit, targetDir, budget);
+  if (!remoteEnumRes.ok) {
+    return remoteEnumRes.deadlineExpired
+      ? { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "remote-list" }]) }
+      : { action: "block", reason: buildUnknownReason("remote-list-failed", remoteEnumRes.message || "git for-each-ref refs/remotes and its show-ref fallback both failed") };
+  }
+  classified.push({ kind: "step", id: "remote-list", class: `${remoteEnumRes.refs.length} ref(s)${remoteEnumRes.usedFallback ? " (via fallback)" : ""}` });
+
+  const remoteCandidates = remoteEnumRes.refs;
+  const remoteUnknownFromEnum = remoteEnumRes.unknownRefs || [];
+
+  if (remoteCandidates.length > 0 || remoteUnknownFromEnum.length > 0) {
+    if (base.viaOriginHead) {
+      baseRemoteName = "origin";
+    } else if (baseBranchRow && baseBranchRow.upstreamRemoteName) {
+      baseRemoteName = baseBranchRow.upstreamRemoteName;
+    }
+
+    const remotesListRes = gitCall(execGit, ["remote"], targetDir, budget);
+    if (!remotesListRes.ok) {
+      return callFailed(remotesListRes)
+        ? { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "remote-names" }]) }
+        : { action: "block", reason: buildUnknownReason("remote-names-failed", remotesListRes.message || "git remote failed") };
+    }
+    const remoteNames = remotesListRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    classified.push({ kind: "step", id: "remote-names", class: `${remoteNames.length} remote(s)` });
+
+    const remoteNotReached = [];
+    for (const ref of remoteCandidates) {
+      if (budget.remaining() <= 0) {
+        remoteNotReached.push({ kind: "remote", id: ref.shortName });
+        continue;
+      }
+      const result = classifyRemoteRef(ref, base, baseRemoteName, remoteNames, excludedRefName, execGit, targetDir, budget);
+      remoteResults.push(Object.assign({ refname: ref.refname, shortName: ref.shortName }, result));
+      classified.push({ kind: "remote", id: ref.shortName, class: result.class });
+    }
+    for (const u of remoteUnknownFromEnum) {
+      const shortName = u.refname.replace(/^refs\/remotes\//, "");
+      remoteResults.push({ refname: u.refname, shortName, class: "unknown", reasonNote: u.reasonNote, timedOut: u.timedOut });
+      classified.push({ kind: "remote", id: shortName, class: "unknown" });
+    }
+    if (remoteNotReached.length > 0) {
+      return { action: "block", reason: buildDeadlineReason(classified, remoteNotReached) };
+    }
+  }
+
+  const remoteByRefname = new Map(remoteResults.map((r) => [r.refname, r]));
+  const branchByUpstreamRef = new Map();
+  for (const br of branches) {
+    if (br.upstreamRef) branchByUpstreamRef.set(br.upstreamRef, br.name);
+  }
+  const remoteByTrackingBranchName = new Map();
+  for (const br of branches) {
+    if (!br.upstreamRef) continue;
+    const rr = remoteByRefname.get(br.upstreamRef);
+    if (rr && rr.class === "stale-remote") remoteByTrackingBranchName.set(br.name, rr);
+  }
+
   if (budget.remaining() <= 0) {
     return { action: "block", reason: buildDeadlineReason(classified, [{ kind: "step", id: "worktree-classification" }]) };
   }
 
-  const wtOutcome = classifyWorktrees(records, branchResultsByName, execGit, targetDir, budget, fsx);
+  const wtOutcome = classifyWorktrees(records, branchResultsByName, execGit, targetDir, budget, fsx, remoteByTrackingBranchName, baseRemoteName);
 
   const coveredBranches = new Set(
     wtOutcome.findings.filter((f) => f.coveredBranch).map((f) => f.coveredBranch)
@@ -748,15 +1195,71 @@ function evaluateStop(targetDir, deps) {
     }
 
     const co = wtOutcome.checkedOutMap.get(name);
-    let fixLines = res.fixLines.slice();
-    if (co && co.isPrimary) fixLines = [`git checkout ${base.name}`, ...fixLines];
-    branchFindings.push({ kind: "branch", name, class: "stale", evidence: res.evidence, fixLines });
+    let checkoutLine = null;
+    let branchFix = res.fixLines.slice();
+    if (co && co.isPrimary) checkoutLine = `git checkout ${base.name}`;
+
+    let evidence = res.evidence;
+    const parts = [];
+    if (checkoutLine) parts.push(checkoutLine);
+    const groupedRemote = remoteByTrackingBranchName.get(name);
+    if (groupedRemote && baseRemoteName && !wtOutcome.consumedRemoteRefs.has(groupedRemote.refname)) {
+      parts.push(...buildRemoteFixLines(groupedRemote, baseRemoteName));
+      branchFix = stripRedundantPushDeleteLine(branchFix);
+      wtOutcome.consumedRemoteRefs.add(groupedRemote.refname);
+      evidence = `${evidence}+remote-${groupedRemote.evidence}`;
+    }
+    parts.push(...branchFix);
+
+    branchFindings.push({ kind: "branch", name, class: "stale", evidence, fixLines: parts });
   }
 
-  const allFindings = [...wtOutcome.findings, ...branchFindings];
+  // ── Standalone remote-tracking-ref findings and foreign-remote messages
+  // (spec §13, round-3 finding R3-03) ──
+  const remoteFindings = [];
+  const foreignMessages = [];
+  for (const r of remoteResults) {
+    if (r.class === "excluded" || r.class === "active-remote") continue;
+
+    if (r.class === "unknown") {
+      remoteFindings.push({
+        kind: "remote", refname: r.shortName, class: "unknown",
+        text: `${r.reasonNote}${r.timedOut ? " (timed out)" : ""}`,
+        fixLines: null,
+      });
+      continue;
+    }
+
+    if (r.class === "stale-remote-foreign") {
+      foreignMessages.push(
+        `${r.shortName} classifies stale-remote-foreign (evidence: ${r.evidence}) on remote "${r.owner}" — ` +
+        `allowed, no fix offered: this is not the base's own remote, the operator has no standing to delete it here.`
+      );
+      continue;
+    }
+
+    // r.class === "stale-remote" (base remote)
+    if (wtOutcome.consumedRemoteRefs.has(r.refname)) continue; // absorbed into a worktree/branch grouped item above.
+    const trackingBranchName = branchByUpstreamRef.get(r.refname);
+    const trackingResult = trackingBranchName ? branchResultsByName.get(trackingBranchName) : null;
+    if (trackingResult && trackingResult.class === "stale") continue; // handled by the branchFindings grouping loop above.
+
+    const fixLines = buildRemoteFixLines(r, baseRemoteName);
+    let note = null;
+    if (trackingResult && trackingResult.class === "active") {
+      note = `tracking local branch ${trackingBranchName} is active and untouched (§9 open question 2 lean)`;
+    }
+    remoteFindings.push({ kind: "remote", refname: r.shortName, class: "stale-remote", evidence: r.evidence, fixLines, note });
+  }
+
+  const allFindings = [...wtOutcome.findings, ...branchFindings, ...remoteFindings];
 
   if (allFindings.length === 0) {
-    if (wtOutcome.inProgressMessage) return { action: "allow-message", message: wtOutcome.inProgressMessage };
+    const messages = [];
+    if (wtOutcome.inProgressMessage) messages.push(wtOutcome.inProgressMessage);
+    if (wtOutcome.activeMessages && wtOutcome.activeMessages.length) messages.push(...wtOutcome.activeMessages);
+    if (foreignMessages.length) messages.push(...foreignMessages);
+    if (messages.length) return { action: "allow-message", message: messages.join("\n") };
     return { action: "allow" };
   }
 
@@ -789,6 +1292,20 @@ module.exports = {
   buildUnknownReason,
   buildDeadlineReason,
   evaluateStop,
+  FER_REMOTE_FORMAT,
+  FER_REMOTE_FALLBACK_FORMAT,
+  parseForEachRefRemotes,
+  parseForEachRefRemotesFallback,
+  listRemoteRefs,
+  remoteForRef,
+  classifyRemoteRef,
+  buildRemoteFixLines,
+  stripRedundantPushDeleteLine,
+  getQuietWindowMs,
+  isWorktreeRecentlyActive,
+  hasUnintegratedCommits,
+  parseReflogLastTimestampMs,
+  detectWorktreeActivity,
 };
 
 // ─── Main ───────────────────────────────────────────────────────────────────
