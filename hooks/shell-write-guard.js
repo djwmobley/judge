@@ -364,7 +364,17 @@ function findPrimaryVerbIndex(stage) {
     if (inWrapper && /^-/.test(t.value)) { j++; continue; } // sudo/env's own no-arg flags (-i, -E, ...)
     break;
   }
-  return j < stage.length ? j : -1;
+  // §2 step 1 (spec: docs/specs/shell-write-guard-mixed-cli-tier.md):
+  // a RECOGNIZED wrapper token (sudo/env/wsl/VAR=val) that exhausts the
+  // stage with no inner verb remaining (`sudo -i`, a bare `ssh host`-style
+  // interactive session shape reached via env, ...) is no longer silently
+  // branch 1 — it is WRAPPER_EXHAUSTED, a distinct sentinel from "no
+  // wrapper token was ever seen at all" (-1, still allow — an empty stage
+  // has nothing to be suspicious about). This is a deliberate, global
+  // change to this function's contract, not scoped to KNOWN_MIXED; see the
+  // spec's blind-spots section for the documented side effect.
+  if (j >= stage.length) return inWrapper ? WRAPPER_EXHAUSTED : -1;
+  return j;
 }
 
 /**
@@ -1154,6 +1164,544 @@ function catchAllUnknownVerb(stage, verbIdx, gatedExts) {
   return null;
 }
 
+// ── KNOWN_MIXED tier: psql/sqlite3/mysql-style CLIs ────────────────────────
+// Spec: docs/specs/shell-write-guard-mixed-cli-tier.md (adversary rounds
+// 1-2). Every token after the verb resolves to exactly one role — FILE,
+// INLINE (content-blind FRICTION), OUTPUT, BENIGN (declared arity, incl.
+// OPTIONAL glued-only), CONNECTION/positional, or UNKNOWN (FRICTION by
+// itself). No token dispatched here ever reaches catchAllUnknownVerb.
+
+const KNOWN_MIXED_VERBS = new Set(["psql", "sqlite3", "mysql"]);
+
+// §7.1 psql — postgresql.org/docs/16/app-psql.html.
+const PSQL_MIXED_TABLE = {
+  maxPositionals: 2,
+  entries: [
+    { short: "-f", long: "--file", arity: 1, role: "FILE" },
+    { short: "-c", long: "--command", arity: 1, role: "INLINE" },
+    { short: "-o", long: "--output", arity: 1, role: "OUTPUT" },
+    { short: "-L", long: "--log-file", arity: 1, role: "OUTPUT" },
+    { short: "-d", long: "--dbname", arity: 1, role: "BENIGN" },
+    { short: "-h", long: "--host", arity: 1, role: "BENIGN" },
+    { short: "-p", long: "--port", arity: 1, role: "BENIGN" },
+    { short: "-U", long: "--username", arity: 1, role: "BENIGN" },
+    { short: "-w", long: "--no-password", arity: 0, role: "BENIGN" },
+    { short: "-W", long: "--password", arity: 0, role: "BENIGN" },
+    { short: "-A", long: "--no-align", arity: 0, role: "BENIGN" },
+    { short: "-a", long: "--echo-all", arity: 0, role: "BENIGN" },
+    { short: "-b", long: "--echo-errors", arity: 0, role: "BENIGN" },
+    { short: "-e", long: "--echo-queries", arity: 0, role: "BENIGN" },
+    { short: "-E", long: "--echo-hidden", arity: 0, role: "BENIGN" },
+    { short: "-q", long: "--quiet", arity: 0, role: "BENIGN" },
+    { short: "-t", long: "--tuples-only", arity: 0, role: "BENIGN" },
+    { short: "-x", long: "--expanded", arity: 0, role: "BENIGN" },
+    { short: "-H", long: "--html", arity: 0, role: "BENIGN" },
+    { short: null, long: "--csv", arity: 0, role: "BENIGN" },
+    { short: "-z", long: "--field-separator-zero", arity: 0, role: "BENIGN" },
+    { short: "-0", long: "--record-separator-zero", arity: 0, role: "BENIGN" },
+    { short: "-1", long: "--single-transaction", arity: 0, role: "BENIGN" },
+    { short: "-s", long: "--single-step", arity: 0, role: "BENIGN" },
+    { short: "-S", long: "--single-line", arity: 0, role: "BENIGN" },
+    { short: "-n", long: "--no-readline", arity: 0, role: "BENIGN" },
+    { short: "-X", long: "--no-psqlrc", arity: 0, role: "BENIGN" },
+    { short: "-l", long: "--list", arity: 0, role: "BENIGN" },
+    { short: "-V", long: "--version", arity: 0, role: "BENIGN" },
+    { short: "-F", long: "--field-separator", arity: 1, role: "BENIGN" },
+    { short: "-R", long: "--record-separator", arity: 1, role: "BENIGN" },
+    { short: "-T", long: "--table-attr", arity: 1, role: "BENIGN" },
+    { short: "-P", long: "--pset", arity: 1, role: "BENIGN" },
+    { short: "-v", long: "--set", arity: 1, role: "BENIGN" },
+    { short: "-?", long: "--help", arity: "opt", role: "BENIGN" },
+  ],
+};
+
+// §7.2 sqlite3 — sqlite.org/cli.html unreachable in both rounds; per
+// explicit operator instruction, only -cmd/-init (decision-mandated) are
+// classified. Every other flag is UNKNOWN -> FRICTION by omission from
+// this table (the dispatcher's default for an unmatched `-`-prefixed
+// token) rather than a reconstructed-from-memory BENIGN guess.
+const SQLITE_MIXED_TABLE = {
+  maxPositionals: 1,
+  entries: [
+    { short: "-cmd", long: null, arity: 1, role: "INLINE" },
+    { short: "-init", long: null, arity: 1, role: "FILE" },
+  ],
+};
+
+// §7.3 mysql — dev.mysql.com/doc/refman/8.0/en/mysql-command-options.html.
+const MYSQL_MIXED_TABLE = {
+  maxPositionals: 1,
+  entries: [
+    { short: "-e", long: "--execute", arity: 1, role: "INLINE" },
+    { short: null, long: "--init-command", arity: 1, role: "INLINE" },
+    { short: null, long: "--result-file", arity: 1, role: "OUTPUT" },
+    { short: null, long: "--tee", arity: 1, role: "OUTPUT" },
+    { short: "-D", long: "--database", arity: 1, role: "BENIGN" },
+    { short: "-h", long: "--host", arity: 1, role: "BENIGN" },
+    { short: "-P", long: "--port", arity: 1, role: "BENIGN" },
+    { short: "-u", long: "--user", arity: 1, role: "BENIGN" },
+    { short: "-S", long: "--socket", arity: 1, role: "BENIGN" },
+    { short: "-p", long: "--password", arity: "opt", role: "BENIGN" },
+    { short: "-C", long: "--compress", arity: "opt", role: "BENIGN" },
+    { short: "-c", long: "--comments", arity: 0, role: "BENIGN" },
+    { short: "-B", long: "--batch", arity: 0, role: "BENIGN" },
+    { short: "-N", long: "--skip-column-names", arity: 0, role: "BENIGN" },
+    { short: "-t", long: "--table", arity: 0, role: "BENIGN" },
+    { short: "-H", long: "--html", arity: 0, role: "BENIGN" },
+    { short: "-X", long: "--xml", arity: 0, role: "BENIGN" },
+    { short: "-r", long: "--raw", arity: 0, role: "BENIGN" },
+    { short: "-s", long: "--silent", arity: 0, role: "BENIGN" },
+    { short: "-v", long: "--verbose", arity: 0, role: "BENIGN" },
+    { short: "-V", long: "--version", arity: 0, role: "BENIGN" },
+    { short: "-w", long: "--wait", arity: 0, role: "BENIGN" },
+    { short: "-A", long: "--no-auto-rehash", arity: 0, role: "BENIGN" },
+    { short: "-b", long: "--no-beep", arity: 0, role: "BENIGN" },
+    { short: "-i", long: "--ignore-spaces", arity: 0, role: "BENIGN" },
+    { short: "-n", long: "--unbuffered", arity: 0, role: "BENIGN" },
+    { short: "-q", long: "--quick", arity: 0, role: "BENIGN" },
+    { short: "-U", long: "--safe-updates", arity: 0, role: "BENIGN" },
+    { short: "-G", long: "--named-commands", arity: 0, role: "BENIGN" },
+    { short: "-E", long: "--vertical", arity: 0, role: "BENIGN" },
+    { short: "-L", long: "--skip-line-numbers", arity: 0, role: "BENIGN" },
+    { short: "-o", long: "--one-database", arity: 0, role: "BENIGN" },
+    { short: "-T", long: "--debug-info", arity: 0, role: "BENIGN" },
+    { short: "-j", long: "--syslog", arity: 0, role: "BENIGN" },
+    { short: "-W", long: "--pipe", arity: 0, role: "BENIGN" },
+    { short: "-f", long: "--force", arity: 0, role: "BENIGN" },
+    { short: "-#", long: "--debug", arity: 1, role: "BENIGN" },
+    { short: null, long: "--connect-timeout", arity: 1, role: "BENIGN" },
+    { short: null, long: "--max-allowed-packet", arity: 1, role: "BENIGN" },
+    { short: null, long: "--max-join-size", arity: 1, role: "BENIGN" },
+    { short: null, long: "--net-buffer-length", arity: 1, role: "BENIGN" },
+    { short: null, long: "--select-limit", arity: 1, role: "BENIGN" },
+    { short: null, long: "--delimiter", arity: 1, role: "BENIGN" },
+    { short: null, long: "--pager", arity: 1, role: "BENIGN" },
+    { short: null, long: "--prompt", arity: 1, role: "BENIGN" },
+    { short: null, long: "--protocol", arity: 1, role: "BENIGN" },
+    { short: null, long: "--default-character-set", arity: 1, role: "BENIGN" },
+    { short: null, long: "--defaults-group-suffix", arity: 1, role: "BENIGN" },
+    { short: null, long: "--bind-address", arity: 1, role: "BENIGN" },
+    { short: null, long: "--network-namespace", arity: 1, role: "BENIGN" },
+    { short: null, long: "--compression-algorithms", arity: 1, role: "BENIGN" },
+    { short: null, long: "--tls-version", arity: 1, role: "BENIGN" },
+    { short: null, long: "--tls-ciphersuites", arity: 1, role: "BENIGN" },
+    { short: null, long: "--defaults-file", arity: 1, role: "BENIGN" },
+    { short: null, long: "--defaults-extra-file", arity: 1, role: "BENIGN" },
+    { short: null, long: "--login-path", arity: 1, role: "BENIGN" },
+    { short: null, long: "--plugin-dir", arity: 1, role: "BENIGN" },
+    { short: null, long: "--character-sets-dir", arity: 1, role: "BENIGN" },
+    { short: null, long: "--load-data-local-dir", arity: 1, role: "BENIGN" },
+    { short: null, long: "--server-public-key-path", arity: 1, role: "BENIGN" },
+    { short: null, long: "--ssl-ca", arity: 1, role: "BENIGN" },
+    { short: null, long: "--ssl-capath", arity: 1, role: "BENIGN" },
+    { short: null, long: "--ssl-cert", arity: 1, role: "BENIGN" },
+    { short: null, long: "--ssl-key", arity: 1, role: "BENIGN" },
+    { short: null, long: "--ssl-crl", arity: 1, role: "BENIGN" },
+    { short: null, long: "--ssl-crlpath", arity: 1, role: "BENIGN" },
+  ],
+};
+
+const MIXED_TABLES = { psql: PSQL_MIXED_TABLE, sqlite3: SQLITE_MIXED_TABLE, mysql: MYSQL_MIXED_TABLE };
+const MIXED_FILE_FLAG_NAME = { psql: "-f/--file", sqlite3: "-init", mysql: null };
+
+// §5 stdin-source table: a literal regular-file path is the only ALLOW
+// shape. Every stdin sentinel / process-substitution / ambiguous shape is
+// FRICTION naming the tempfile canon (MC-01).
+function classifyMixedFileArg(value) {
+  if (value === undefined || value === "") return { ok: false, reason: "missing-file-argument" };
+  if (value === "-") return { ok: false, reason: "stdin-sentinel-use-tempfile" };
+  if (/^\/dev\/stdin$/.test(value)) return { ok: false, reason: "stdin-sentinel-use-tempfile" };
+  if (/^\/dev\/fd\/\d+$/.test(value)) return { ok: false, reason: "stdin-sentinel-use-tempfile" };
+  if (/^\/proc\/self\/fd\/\d+$/.test(value)) return { ok: false, reason: "stdin-sentinel-use-tempfile" };
+  if (/[<>()]/.test(value)) return { ok: false, reason: "redirect-or-grouping-char-in-target" }; // MC2-01(b)
+  if (isAmbiguousToken(value)) return { ok: false, reason: "ambiguous-target-token" };
+  return { ok: true };
+}
+
+function mixedFriction(verb, reason, target) {
+  return { branch: 4, detector: `${verb} (KNOWN_MIXED)`, reason, target: target === undefined ? null : target };
+}
+
+// A stage token whose value contains any of `<>()` glued to a preceding
+// word — MC2-01: `db<script.sql`, `db<(cat evil.sql)` are NOT split by the
+// shared tokenizer (no `<`/`(`/`)` break chars there). Scoped to the
+// KNOWN_MIXED pass only, not a shared tokenizer change (spec §5).
+function classifyMixedRedirectShape(verb, restValue, stage, i, cwd, gatedExts) {
+  if (restValue.startsWith("<<<")) return { finding: mixedFriction(verb, "here-string-stdin-source"), consumedExtra: 1 };
+  if (restValue.startsWith("<<")) return { finding: mixedFriction(verb, "heredoc-stdin-source"), consumedExtra: 1 };
+  if (restValue.startsWith("<(") || restValue.startsWith(">(")) {
+    return { finding: mixedFriction(verb, "process-substitution-stdin-source"), consumedExtra: 1 };
+  }
+  if (restValue === "<") {
+    const next = stage[i + 1];
+    if (!next) return { finding: mixedFriction(verb, "missing-redirect-target"), consumedExtra: 1 };
+    const check = classifyMixedFileArg(next.value);
+    if (!check.ok) return { finding: mixedFriction(verb, check.reason, next.value), consumedExtra: 2, fileRoleSatisfied: false };
+    return { finding: null, consumedExtra: 2, fileRoleSatisfied: true };
+  }
+  if (restValue.startsWith("<")) {
+    const fileVal = restValue.slice(1);
+    const check = classifyMixedFileArg(fileVal);
+    if (!check.ok) return { finding: mixedFriction(verb, check.reason, fileVal), consumedExtra: 1 };
+    return { finding: null, consumedExtra: 1, fileRoleSatisfied: true };
+  }
+  return { finding: mixedFriction(verb, "unexpected-redirect-or-grouping-token", restValue), consumedExtra: 1 };
+}
+
+// A bare (non-flag) token: CONNECTION/positional up to the CLI's
+// maxPositionals, FRICTION beyond it (MC-07/MC2-08), and — either way —
+// the SAME ambiguity/extension scan any other token gets (MC-17), now
+// extended to the `<>()` char class (MC2-01(b)).
+function classifyMixedBareToken(verb, table, rawValue, positionalIndex, cwd, gatedExts) {
+  if (positionalIndex >= table.maxPositionals) {
+    return mixedFriction(verb, "positional-beyond-declared-role", rawValue);
+  }
+  if (isAmbiguousToken(rawValue) || /[<>()]/.test(rawValue)) {
+    return mixedFriction(verb, "ambiguous-positional-token", rawValue);
+  }
+  const bn = rawValue.slice(Math.max(rawValue.lastIndexOf("/"), rawValue.lastIndexOf("\\")) + 1);
+  const cls = classifyExtension(bn, gatedExts);
+  if (cls.branch >= 3) return mixedFriction(verb, "positional-gated-extension", rawValue);
+  return null;
+}
+
+/**
+ * matchMixedFlag: normalizes (MC-03 `=`-split, MC-05 glued-short prefix,
+ * MC-06 quoted-bit-insensitive) and looks up ONE stage token against a
+ * CLI's table. Returns null if the token isn't flag-shaped or matches no
+ * entry (caller treats null + a leading "-" as UNKNOWN -> FRICTION).
+ * Case-sensitive throughout (MC2-05).
+ */
+function matchMixedFlag(table, stage, i) {
+  const tok = stage[i];
+  const raw = tok.value;
+  if (raw === "-" || !raw.startsWith("-")) return null;
+
+  let flagPart = raw;
+  let attachedValue = null;
+  let hasAttached = false;
+
+  if (raw.startsWith("--")) {
+    const eq = raw.indexOf("=");
+    if (eq !== -1) { flagPart = raw.slice(0, eq); attachedValue = raw.slice(eq + 1); hasAttached = true; }
+  }
+
+  let entry = table.entries.find((e) => e.long === flagPart || e.short === flagPart);
+
+  if (!entry && !raw.startsWith("--") && raw.length > 2) {
+    // MC-05: glued short flag (-cSELECT, -fpath.sql) — try every arity>=1
+    // short flag as a literal prefix (longest first, so "-init" isn't
+    // mis-split by a shorter "-i"-style entry that doesn't exist in these
+    // tables, but would in principle for a future CLI).
+    const candidates = table.entries
+      .filter((e) => e.short && (e.arity === 1 || e.arity === 2 || e.arity === "opt") && raw.startsWith(e.short) && raw.length > e.short.length)
+      .sort((a, b) => b.short.length - a.short.length);
+    if (candidates.length > 0) {
+      entry = candidates[0];
+      attachedValue = raw.slice(entry.short.length);
+      hasAttached = true;
+    }
+  }
+
+  if (!entry) return null;
+
+  const name = entry.long || entry.short;
+  if (entry.arity === 0) {
+    return { entry, name, consumed: 1, values: [] };
+  }
+  if (entry.arity === "opt") {
+    if (hasAttached) return { entry, name, consumed: 1, values: [attachedValue] };
+    return { entry, name, consumed: 1, values: [] };
+  }
+  if (entry.arity === 1) {
+    if (hasAttached) return { entry, name, consumed: 1, values: [attachedValue] };
+    const next = stage[i + 1];
+    if (!next) return { entry, name, consumed: 1, values: [undefined] };
+    return { entry, name, consumed: 2, values: [next.value] };
+  }
+  // arity === 2 (sqlite3 -lookaside/-pagecache SIZE N — table currently
+  // carries none, kept for a future CLI extension per spec §7.2).
+  if (hasAttached) {
+    const next = stage[i + 1];
+    return { entry, name, consumed: 2, values: [attachedValue, next ? next.value : undefined] };
+  }
+  const v1 = stage[i + 1], v2 = stage[i + 2];
+  return { entry, name, consumed: v2 ? 3 : (v1 ? 2 : 1), values: [v1 ? v1.value : undefined, v2 ? v2.value : undefined] };
+}
+
+function stageHasHeredocOrHereString(stage) {
+  return stage.some((t) => !t.quoted && (t.value.startsWith("<<<") || t.value.startsWith("<<")));
+}
+
+/**
+ * dispatchKnownMixed: per-token total classification for a KNOWN_MIXED
+ * verb (psql/sqlite3/mysql). `stage` is any {value,quoted}[] token array
+ * — the Bash `stage` array or the PowerShell-side tokenizeMixedFromRaw()
+ * output (MC2-03 mirror, §6.3). `precededByPipe` (Bash only; always false
+ * from the PS path) flags a stage fed by `cmd | verb` with no FILE/INLINE
+ * role of its own (§5's opaque-stdin-source row).
+ */
+function dispatchKnownMixed(stage, verbIdx, cwd, gatedExts, precededByPipe) {
+  const verb = stage[verbIdx].value;
+  const table = MIXED_TABLES[verb];
+  if (!table) return null;
+
+  let worst = null;
+  function consider(f) { if (f && (!worst || f.branch > worst.branch)) worst = f; }
+
+  let positionalIndex = 0;
+  let sawFileOrInline = false;
+
+  let i = verbIdx + 1;
+  while (i < stage.length) {
+    const tok = stage[i];
+    if (tok.sep || tok.redirect) { i++; continue; }
+
+    // §6.3: a PowerShell here-string is FRICTION unconditionally, before
+    // any role lookup, regardless of which role's argument it would be.
+    if (!tok.quoted && /^@["']/.test(tok.value)) {
+      consider(mixedFriction(verb, "powershell-here-string-argument", tok.value));
+      i++;
+      continue;
+    }
+
+    // MC2-01: split a glued redirect/grouping char off a preceding word
+    // before role lookup, scoped to this pass only (not the shared
+    // tokenizer).
+    if (!tok.quoted) {
+      const specialIdx = tok.value.search(/[<>()]/);
+      if (specialIdx > 0) {
+        const prefixVal = tok.value.slice(0, specialIdx);
+        const restVal = tok.value.slice(specialIdx);
+        consider(classifyMixedBareToken(verb, table, prefixVal, positionalIndex, cwd, gatedExts));
+        positionalIndex++;
+        const r = classifyMixedRedirectShape(verb, restVal, stage, i, cwd, gatedExts);
+        consider(r.finding);
+        sawFileOrInline = sawFileOrInline || r.fileRoleSatisfied;
+        i += r.consumedExtra || 1;
+        continue;
+      }
+      if (specialIdx === 0) {
+        const r = classifyMixedRedirectShape(verb, tok.value, stage, i, cwd, gatedExts);
+        consider(r.finding);
+        sawFileOrInline = sawFileOrInline || r.fileRoleSatisfied;
+        i += r.consumedExtra || 1;
+        continue;
+      }
+    }
+
+    // MC-11/RV-01: inert, not end-of-options — quoted-bit-insensitive (a
+    // quoted "--" is still the literal argv string "--" to the CLI, same
+    // as unquoted; MC-06's "match flag names regardless of quoted" applies
+    // here too, not just to recognized flags).
+    if (tok.value === "--") { i++; continue; }
+
+    const flagMatch = matchMixedFlag(table, stage, i);
+    if (flagMatch) {
+      const { entry, name, consumed, values } = flagMatch;
+      if (entry.role === "FILE") {
+        sawFileOrInline = true;
+        const check = classifyMixedFileArg(values[0]);
+        if (!check.ok) {
+          const altName = MIXED_FILE_FLAG_NAME[verb];
+          consider(mixedFriction(verb, `${check.reason} (use ${altName} <tempfile>)`, values[0]));
+        }
+        // ok -> extension-exempt, no finding (§3 invariant).
+      } else if (entry.role === "INLINE") {
+        sawFileOrInline = true; // satisfies the "explicit source" test for §5's pipe/heredoc row too
+        const altName = MIXED_FILE_FLAG_NAME[verb];
+        const altMsg = altName ? `use ${altName} <tempfile> instead` : "use a literal stdin redirect from a tempfile instead";
+        consider(mixedFriction(verb, `inline-sql-content-blind (${altMsg})`, name));
+      } else if (entry.role === "OUTPUT") {
+        const val = values[0];
+        if (val === undefined) consider(mixedFriction(verb, "missing-output-argument", name));
+        else consider(tagDetector(resolveTarget(val, cwd, gatedExts), `${verb} ${name}`));
+      } else {
+        // BENIGN (any arity, incl. OPTIONAL glued-only): declared arity is
+        // consumed; every present value still passes isAmbiguousToken
+        // (closes MC-15's -v injection and any other benign-flag vector
+        // without a flag-specific rule).
+        for (const v of values) {
+          if (v !== undefined && isAmbiguousToken(v)) {
+            consider(mixedFriction(verb, "ambiguous-benign-flag-value", v));
+            break;
+          }
+        }
+      }
+      i += consumed;
+      continue;
+    }
+
+    if (tok.value.startsWith("-") && tok.value !== "-") {
+      // MC-14/RV-01 (reviewer finding on PR #9): per-token fallthrough —
+      // an unrecognized flag is FRICTION by itself; it never re-opens an
+      // already-resolved token's role, and it never reaches
+      // catchAllUnknownVerb. Quoted-bit-insensitive per MC-06's own
+      // rationale: a quoted `"--unknown-flag"` is the literal argv string
+      // "--unknown-flag" to psql/sqlite3/mysql — shell quoting never
+      // changes what the CLI's own getopt sees, only word-splitting and
+      // expansion. Gating this check on `!tok.quoted` (as an earlier
+      // version of this file did) let a quoted flag-shaped unrecognized
+      // token fall through to classifyMixedBareToken and be silently
+      // allowed as a connection/positional slot — a real escape, not
+      // covered by matchMixedFlag's own already-quoted-insensitive
+      // lookup, since that function only recognizes TABLE entries; an
+      // UNRECOGNIZED flag-shaped token has nowhere else to be classified
+      // once quoting is (correctly) not disqualifying.
+      consider(mixedFriction(verb, "unknown-flag", tok.value));
+      i++;
+      continue;
+    }
+
+    // Bare word (incl. quoted strings, per MC-06 the `quoted` bit doesn't
+    // exempt a token from POSITIONAL classification either) -> CONNECTION/
+    // positional per MC-17/MC-07/MC2-08.
+    consider(classifyMixedBareToken(verb, table, tok.value, positionalIndex, cwd, gatedExts));
+    positionalIndex++;
+    i++;
+  }
+
+  if (!sawFileOrInline && precededByPipe) {
+    consider(mixedFriction(verb, "piped-stdin-source-opaque"));
+  }
+  if (!sawFileOrInline && stageHasHeredocOrHereString(stage.slice(verbIdx + 1))) {
+    consider(mixedFriction(verb, "heredoc-or-herestring-stdin-source"));
+  }
+
+  return worst;
+}
+
+// ── Wrapper unwrapping (spec §4, PowerShell mirror §6.3/MC2-03) ────────────
+// Shared by the Bash stage-token path (classifyVerbToken, called AFTER
+// findPrimaryVerbIndex's existing sudo/env/wsl walk — this function is a
+// second, additive layer for the wrappers that walk doesn't model) and the
+// PowerShell-native path (analyzePsStatement, called from index 0 on a
+// freshly-tokenized clause, where it also handles sudo/env/wsl since that
+// path has no prior wrapper-stripping step of its own).
+const WRAPPER_EXHAUSTED = "WRAPPER_EXHAUSTED";
+const MIXED_SIMPLE_ARG_WRAPPERS = {
+  sudo: new Set(["-u", "--user", "-g", "--group", "-h", "--host", "-r", "--role", "-t", "--type", "-C", "--close-from", "-p", "--prompt"]),
+  env: new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]),
+  wsl: new Set(["-d", "--distribution", "-u", "--user"]),
+  time: new Set(["-o", "--output"]),
+  xargs: new Set(["-I", "-n", "-P", "-a", "-d", "-E", "-L", "-s", "--arg-file"]),
+};
+const MIXED_CONTAINER_EXEC_WRAPPERS = new Set(["docker", "podman"]);
+const MIXED_CONTAINER_EXEC_FLAGS_WITH_ARG = new Set(["-u", "--user", "-w", "--workdir", "-e", "--env", "--env-file"]);
+const MIXED_SSH_FLAGS_WITH_ARG = new Set(["-p", "-i", "-l", "-o", "-F", "-L", "-R", "-D", "-J", "-c", "-e", "-B", "-b"]);
+const MIXED_KUBECTL_FLAGS_WITH_ARG = new Set(["-n", "--namespace", "-c", "--container"]);
+
+function resolveInnerVerb(tokens, startIdx) {
+  let j = startIdx;
+  let sawWrapper = false;
+  while (j < tokens.length) {
+    const t = tokens[j];
+    if (t.quoted) break;
+    const v = t.value;
+
+    if (v === "sudo" || v === "env" || v === "wsl") {
+      sawWrapper = true;
+      const flagSet = MIXED_SIMPLE_ARG_WRAPPERS[v];
+      j++;
+      while (j < tokens.length) {
+        const ft = tokens[j];
+        if (ft.quoted) break;
+        if (v === "env" && /^[A-Za-z_][A-Za-z0-9_]*=.*$/.test(ft.value)) { j++; continue; }
+        if (flagSet.has(ft.value) && j + 1 < tokens.length) { j += 2; continue; }
+        if (/^-/.test(ft.value)) { j++; continue; }
+        break;
+      }
+      continue;
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=.*$/.test(v)) { sawWrapper = true; j++; continue; }
+    if (v === "nohup") { sawWrapper = true; j++; continue; }
+    if (v === "time" || v === "xargs") {
+      sawWrapper = true;
+      const flagSet = MIXED_SIMPLE_ARG_WRAPPERS[v];
+      j++;
+      while (j < tokens.length && !tokens[j].quoted && /^-/.test(tokens[j].value)) {
+        if (flagSet.has(tokens[j].value) && j + 1 < tokens.length) j += 2; else j++;
+      }
+      continue;
+    }
+    if (MIXED_CONTAINER_EXEC_WRAPPERS.has(v)) {
+      const sub = tokens[j + 1];
+      if (!sub || sub.quoted || (sub.value !== "exec" && sub.value !== "run")) break;
+      sawWrapper = true;
+      j += 2;
+      while (j < tokens.length && !tokens[j].quoted && /^-/.test(tokens[j].value)) {
+        if (MIXED_CONTAINER_EXEC_FLAGS_WITH_ARG.has(tokens[j].value) && j + 1 < tokens.length) j += 2; else j++;
+      }
+      if (j < tokens.length && !tokens[j].quoted) j++; // one positional: container/image
+      continue;
+    }
+    if (v === "ssh") {
+      sawWrapper = true;
+      j++;
+      while (j < tokens.length && !tokens[j].quoted && /^-/.test(tokens[j].value)) {
+        if (MIXED_SSH_FLAGS_WITH_ARG.has(tokens[j].value) && j + 1 < tokens.length) j += 2; else j++;
+      }
+      if (j < tokens.length && !tokens[j].quoted) j++; // one positional: [user@]host
+      continue;
+    }
+    if (v === "kubectl") {
+      const sub = tokens[j + 1];
+      if (!sub || sub.quoted || sub.value !== "exec") break;
+      sawWrapper = true;
+      j += 2;
+      while (j < tokens.length && !tokens[j].quoted && /^-/.test(tokens[j].value) && tokens[j].value !== "--") {
+        if (MIXED_KUBECTL_FLAGS_WITH_ARG.has(tokens[j].value) && j + 1 < tokens.length) j += 2; else j++;
+      }
+      if (j < tokens.length && !tokens[j].quoted && tokens[j].value !== "--") j++; // pod positional, if present before "--"
+      if (j < tokens.length && !tokens[j].quoted && tokens[j].value === "--") j++; // command separator
+      continue;
+    }
+    if (v === "cmd" || v.toLowerCase() === "cmd.exe") {
+      const sub = tokens[j + 1];
+      if (!sub || sub.quoted || !/^\/[ck]$/i.test(sub.value)) break;
+      // Only unwrap when the inner verb is a BARE, unquoted token — a
+      // whole `cmd /c "..."` command given as one quoted blob is left to
+      // the existing declared blind spot (detectCmdCIndirection's coarse
+      // heuristic), not treated as a wrapper: the quoted blob is a full
+      // shell command line, not a single command name, and re-dispatching
+      // it AS a verb token would misclassify it (self-found regression
+      // against CMDC-02 while implementing this).
+      const innerCandidate = tokens[j + 2];
+      if (!innerCandidate || innerCandidate.quoted) break;
+      sawWrapper = true;
+      j += 2;
+      continue;
+    }
+    break;
+  }
+  if (j >= tokens.length) return sawWrapper ? WRAPPER_EXHAUSTED : -1;
+  return j;
+}
+
+// Quote-aware-ish PowerShell-side tokenizer for the KNOWN_MIXED mirror
+// (§6.3, MC2-03/MC-04): unlike psTokensForGhApiCheck's plain `\S+`
+// fallback, this special-cases `--flag="value with spaces"` /
+// `--flag='value'` as ONE flag token + one value token BEFORE generic
+// splitting, so `=`-joined-with-a-quoted-value survives intact instead of
+// being shredded into unrelated word fragments (MC-04's own reproduction).
+function tokenizeMixedFromRaw(rawText) {
+  const tokens = [];
+  const re = /(--[A-Za-z][\w-]*)=(?:"([^"]*)"|'([^']*)'|(\S+))|"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(rawText)) !== null) {
+    if (m[1] !== undefined) {
+      tokens.push({ value: m[1], quoted: false });
+      const val = m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : m[4]);
+      tokens.push({ value: val, quoted: m[2] !== undefined || m[3] !== undefined });
+      continue;
+    }
+    if (m[5] !== undefined) { tokens.push({ value: m[5], quoted: true }); continue; }
+    if (m[6] !== undefined) { tokens.push({ value: m[6], quoted: true }); continue; }
+    tokens.push({ value: m[7], quoted: false });
+  }
+  return tokens;
+}
+
 // E3: `find`'s -name/-iname pattern gating is a SECOND, independent branch-4
 // signal, but only when the SAME find invocation actually mutates anything —
 // a plain `find . -name '*.ps1'` (a pure search) must allow. Qualifying
@@ -1239,7 +1787,7 @@ function checkFindFprintFamily(stage, cwd, gatedExts) {
 // Total classification entry point for one verb-position token (primary
 // verb of a stage, or the token dispatched immediately after
 // xargs/-exec/-execdir). Replaces the old allow-list dispatchVerb.
-function classifyVerbToken(stage, verbIdx, cwd, gatedExts, depth) {
+function classifyVerbToken(stage, verbIdx, cwd, gatedExts, depth, precededByPipe) {
   const verbTok = stage[verbIdx];
   const verb = verbTok.value;
   // Gap 3: a QUOTED verb token whose dequoted value contains whitespace or a
@@ -1267,6 +1815,23 @@ function classifyVerbToken(stage, verbIdx, cwd, gatedExts, depth) {
     if (findings.length === 0) return null;
     return findings.reduce((a, b) => (b.branch > a.branch ? b : a));
   }
+  // §4/MC2-03: wrapper-unwrap layer for wrappers findPrimaryVerbIndex's own
+  // sudo/env/wsl walk doesn't model (docker/podman exec|run, ssh <host>,
+  // kubectl exec, cmd /c|/k, nohup, time, xargs). Additive: only fires when
+  // THIS verb token is itself one of those wrapper names; an ordinary verb
+  // (including "psql"/"sqlite3"/"mysql" directly) is untouched by it.
+  const wrapResult = resolveInnerVerb(stage, verbIdx);
+  if (wrapResult === WRAPPER_EXHAUSTED) {
+    return { branch: 4, detector: `wrapper "${verb}"`, reason: "wrapper-exhausted-no-inner-verb", target: null };
+  }
+  if (typeof wrapResult === "number" && wrapResult !== verbIdx) {
+    return classifyVerbToken(stage, wrapResult, cwd, gatedExts, depth, precededByPipe);
+  }
+
+  if (KNOWN_MIXED_VERBS.has(verb)) {
+    return dispatchKnownMixed(stage, verbIdx, cwd, gatedExts, !!precededByPipe);
+  }
+
   if (isKnownReadVerb(stage, verbIdx)) return null;
   const known = dispatchKnownWrite(stage, verbIdx, cwd, gatedExts, depth || 0);
   if (known.found) return known.result;
@@ -1312,12 +1877,15 @@ function detectStderrClobberRedirects(rawText, cwd, gatedExts) {
   return results;
 }
 
-function analyzeStage(stage, cwd, gatedExts, depth) {
+function analyzeStage(stage, cwd, gatedExts, depth, precededByPipe) {
   const findings = [];
   findings.push(...scanRedirects(stage, cwd, gatedExts));
   const verbIdx = findPrimaryVerbIndex(stage);
-  if (verbIdx !== -1) {
-    const f = classifyVerbToken(stage, verbIdx, cwd, gatedExts, depth);
+  if (verbIdx === "WRAPPER_EXHAUSTED") {
+    const wrapperName = stage[0] ? stage[0].value : "?";
+    findings.push({ branch: 4, detector: `wrapper "${wrapperName}"`, reason: "wrapper-exhausted-no-inner-verb", target: null });
+  } else if (verbIdx !== -1) {
+    const f = classifyVerbToken(stage, verbIdx, cwd, gatedExts, depth, precededByPipe);
     if (f) findings.push(f);
   }
   for (let k = 0; k < stage.length; k++) {
@@ -1443,9 +2011,30 @@ function analyzeBash(cmd, initialCwd, gatedExts, depth) {
     for (const f of detectStderrClobberRedirects(seg.text, seg.cwd, gatedExts)) consider(f);
     const tokens = tokenize(seg.text);
     const stages = splitSegments(tokens);
-    for (const stage of stages) {
-      for (const f of analyzeStage(stage, seg.cwd, gatedExts, depth)) consider(f);
+    // §5 (MC-01 "opaque stdin source" row): tag each stage with whether a
+    // `|` (not `;`/`&&`/`||`) immediately preceded it, so a KNOWN_MIXED
+    // verb with no FILE/INLINE role of its own can tell "cmd | psql db"
+    // (opaque SQL source) apart from "psql db; psql db2" (independent).
+    // splitSegments() itself discards separator identity, so this is
+    // recomputed locally from `tokens` rather than changing that shared
+    // function's return shape.
+    const pipePrecededFlags = [];
+    {
+      let sepBeforeNext = null;
+      let stageTokens = [];
+      for (const t of tokens) {
+        if (t.sep) {
+          if (stageTokens.length > 0) { pipePrecededFlags.push(sepBeforeNext === "|"); stageTokens = []; }
+          sepBeforeNext = t.value;
+        } else {
+          stageTokens.push(t);
+        }
+      }
+      if (stageTokens.length > 0) pipePrecededFlags.push(sepBeforeNext === "|");
     }
+    stages.forEach((stage, idx) => {
+      for (const f of analyzeStage(stage, seg.cwd, gatedExts, depth, pipePrecededFlags[idx])) consider(f);
+    });
   }
   if (!worst) return { allow: true, branch: 1 };
   return { allow: worst.branch <= 2, branch: worst.branch, detector: worst.detector, target: worst.target, reason: worst.reason, ext: worst.ext };
@@ -2164,6 +2753,26 @@ function analyzePsStatement(stmt, initialCwd, gatedExts) {
       continue;
     }
 
+    // MC2-03: PowerShell-native mirror of §4's wrapper-unwrap table — a
+    // native PowerShell tool call (`docker exec ... psql -c "..."`, not
+    // `pwsh -Command '...'`) has no Bash `stage` array and never reaches
+    // findPrimaryVerbIndex/classifyVerbToken at all, so this clause's own
+    // dispatch needs the SAME resolveInnerVerb/dispatchKnownMixed pair,
+    // fed by tokenizeMixedFromRaw (handles `--flag="value"` per MC-04,
+    // unlike psTokensForGhApiCheck's plain `\S+` fallback).
+    {
+      const mixedTokens = tokenizeMixedFromRaw(rawFromVerb);
+      const mixedVerbIdx = resolveInnerVerb(mixedTokens, 0);
+      if (mixedVerbIdx === WRAPPER_EXHAUSTED) {
+        consider({ branch: 4, detector: `wrapper "${verbName}"`, reason: "wrapper-exhausted-no-inner-verb", target: null });
+        continue;
+      }
+      if (typeof mixedVerbIdx === "number" && mixedTokens[mixedVerbIdx] && KNOWN_MIXED_VERBS.has(mixedTokens[mixedVerbIdx].value)) {
+        consider(dispatchKnownMixed(mixedTokens, mixedVerbIdx, initialCwd, gatedExts, false));
+        continue;
+      }
+    }
+
     consider(classifyPsClauseArguments(verbName, rawFromVerb, gatedExts));
   }
 
@@ -2228,8 +2837,21 @@ function stripPsComments(text) {
   return out;
 }
 
+// MC-10/MC2-09: a line-final unescaped backtick is PowerShell's real
+// line-continuation operator — "line-final" means the LAST NON-WHITESPACE
+// character before the line's `\n`, tolerating trailing spaces/tabs (real
+// PowerShell continuation semantics), not a strict last-character check.
+// Run BEFORE any statement/clause splitting so a legitimate multi-line
+// `-f` invocation isn't split into an orphaned-backtick fragment and a
+// dangling continuation. General PowerShell-tokenization fix (not
+// KNOWN_MIXED-specific), required for MIXED-36/70.
+function joinPsLineContinuations(cmd) {
+  return cmd.replace(/`[ \t]*\r?\n/g, " ");
+}
+
 function analyzePowerShell(cmd, initialCwd, gatedExts) {
   cmd = stripPsComments(cmd);
+  cmd = joinPsLineContinuations(cmd);
   const statements = splitPsStatements(cmd);
   let worst = null;
   for (const stmt of statements) {
