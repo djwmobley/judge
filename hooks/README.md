@@ -132,9 +132,11 @@ conservative default rather than throwing.
   `model-routing-guards.state.js`) — or a path segment-matching
   `hooks/state` anywhere else, a deliberate over-block. Closes the
   forgeable-state-file gap: without this guard, an agent has ordinary
-  Write/Edit access to forge `stop-stale-worktrees-guard.js`'s own
-  strike-counter accounting state directly and force a premature yield
-  (`docs/specs/stop-guard-bounded-reblock.md` §2 item 3 / §6 / §9 BR-01).
+  Write/Edit access to forge a guard's own accounting state directly
+  (originally motivated by `stop-stale-worktrees-guard.js`'s now-removed
+  strike-counter state — `docs/specs/stop-guard-bounded-reblock.md` §2
+  item 3 / §6 / §9 BR-01, SUPERSEDED; this layer itself stays in force for
+  every other guard's state under `STATE_DIR`).
 - **No override.** Unlike `shell-write-guard.js`'s gated-extension
   friction, there is no legitimate reason for an agent's own tool call to
   write inside the guard's own accounting state.
@@ -144,14 +146,15 @@ conservative default rather than throwing.
   `isProtectedStatePath` is in turn reused by `shell-write-guard.js`'s
   PROTECTED_PATH check above, so the two layers can never independently
   drift on what counts as "inside the protected state directory."
-- **Paired with `stop-stale-worktrees-guard.js`'s Layer 2:** an HMAC-SHA256
-  keyfile (`hooks/state/.hmac-key`, 32 bytes) signs each bounded-reblock
-  state file's `items`, bound to the session key. A missing/wrong-length
-  keyfile, missing `mac`, or mismatched `mac` is treated as tampered — the
-  state resets to absent for that invocation and a `{"event":"tamper",...}`
-  line is appended to the guard's existing yields log. See
-  `docs/specs/hook-state-write-guard.md` §3 and its §6 for the declared
-  blind spots this pair of layers does not close.
+- **Layer 2 (formerly paired with `stop-stale-worktrees-guard.js`'s HMAC
+  tamper evidence) is SUPERSEDED.** That guard's per-session strike state,
+  HMAC keyfile, and signing were deleted when it moved to
+  `session-end-worktree-guard.js` on `SessionEnd` (non-blocking, no
+  persisted state — see `docs/specs/session-end-worktree-guard.md`). This
+  file (Layer 1, above) is unaffected and still denies any Write/Edit/
+  NotebookEdit/MultiEdit into `STATE_DIR` for every other guard. See
+  `docs/specs/hook-state-write-guard.md` §3 (marked SUPERSEDED at its own
+  top) for the retired Layer 2 design.
 
 ### bash-powershell-guard.js
 - **Event:** `PreToolUse` (Bash)
@@ -364,166 +367,62 @@ removed rather than kept as an unexercised fallback:
   independence between author and approver/merger is structural, not a
   courtesy (see `docs/independence.md`).
 
-### stop-stale-worktrees-guard.js
-- **Event:** `Stop` (registered with an explicit **30-second timeout** —
-  see `scripts/install-guards.js`'s `GUARDS` entry — 10s of margin over
-  this guard's own internal 20s classification deadline).
-- **Blocks:** the session from ending while the repo containing the
-  resolved project directory has a stale linked worktree, a stale local
-  branch, or a stale remote-tracking ref on the base's own remote.
-  Resolves the target directory via `CLAUDE_PROJECT_DIR`, then stdin
-  `cwd`, then `process.cwd()` — never a raw, unvalidated `cwd` alone.
-- **Active-worktree override (spec §15/§16), evaluated before ANY branch
-  or worktree classification:** for every worktree (primary or linked)
-  with a checked-out branch, that branch is forced to `active` (never
-  reaching the stale rows below) if the worktree is dirty
-  (`git status --porcelain`), has a commit not yet integrated into base
-  (same ancestor/tree-equality/cherry detectors the branch table uses,
-  not a bare `rev-list --count`), or its `logs/HEAD` reflog /
-  `COMMIT_EDITMSG` was touched within a quiet window (default 30 min,
-  `JUDGE_STOP_GUARD_QUIET_MINUTES`, `0` disables the recency signal only).
-  Such worktrees surface one informational `systemMessage` line each
-  ("active worktree on merged branch `<name>`; clean up when done")
-  instead of blocking — a clean, quiet, behind/merged worktree still
-  blocks as before, primary worktrees still lead their fix with
-  `git checkout <base>`.
-- **Worktree classes:** `ok` (on the base branch, or not prunable/dir
-  exists/branch active), `stale` (prunable, missing directory, or a
-  `git worktree prune --dry-run` hit — fix leads with `git worktree
-  unlock` if locked, then `remove`/`prune`; or a linked worktree whose
-  checked-out branch itself classifies stale — combined fix, extended
-  with a grouped remote-ref fix when that branch also tracks a stale
-  base-remote ref), `unknown` (detached HEAD with no in-progress marker —
-  no fix offered), and `in-progress-operation` (primary worktree only,
-  detached HEAD with a
-  `rebase-merge`/`rebase-apply`/`MERGE_HEAD`/`CHERRY_PICK_HEAD`/
-  `BISECT_START`/`REVERT_HEAD` marker present — allows with a naming
-  `systemMessage` instead of blocking a mid-flight handoff).
-- **Branch classes (first match wins):** `ok` (is the base branch, or tip
-  equals base with no upstream — `empty-local`, never targeted for
-  deletion — or tip equals base with a live, non-gone upstream), `stale`
-  (gone upstream `[gone]`; local tip is an ancestor of base; local tip's
-  tree matches one of the base's last 500 commit trees; `git cherry`
-  reports every local commit already applied; or none of those fire on
-  the LOCAL tip but the branch's own UPSTREAM ref's cached tip
-  independently matches one of the same three detectors — catches a
-  branch reset to base after a squash-merge whose remote copy still holds
-  the pre-reset history), and `active` (none of the above). Ancestor-stale
-  branches get a `-d` fix (git can verify these itself); every other stale
-  row leads with `-D` plus an inline comment, and the upstream-tip row
-  adds an operator-confirmed `git push origin --delete` line on its own.
-  If the checked-out branch classifies stale, its fix leads with
-  `git checkout <base>` (§16 extends this to the primary worktree
-  specifically — a linked worktree's own combined fix already handles it).
-- **Remote-tracking classes (spec §3/§13, first match wins, same three
-  detectors as the branch table):** every `refs/remotes/*` ref except
-  `<remote>/HEAD` (a structural name-suffix match, regardless of symref
-  status) and the ref the base branch tracks classifies `stale-remote`
-  (merged into base, on the base's OWN remote — blocks; fix: `fetch
-  --prune`, re-verify, `push --delete`, then `branch -dr` as a fallback if
-  the delete is refused, then the local branch's own delete if one tracks
-  it and is itself stale), `stale-remote-foreign` (merged into base, on
-  any OTHER remote, or when no base remote is determinable — allows with
-  an informational `systemMessage`, never blocks: the operator has no
-  standing to delete another remote's branch), `unknown` (any git call
-  fails, including a ref pointing at a missing object), or `active-remote`
-  (none of the above). An atomically-failing batched enumeration (one bad
-  object blacks out the whole `for-each-ref refs/remotes` call) falls back
-  to a reduced-format `for-each-ref` (refname+objectname only) plus
-  per-ref `rev-parse --verify`, isolating the bad ref instead of hiding
-  every sibling. Never fetches; a server-side delete not yet locally
-  pruned still shows stale until `fetch --prune` runs.
-- **Deadline:** a 20-second internal wall-clock budget from hook start,
-  checked between steps and enforced again via a per-call `timeout` on
-  every individual git subprocess (sized to whatever budget remains when
-  that call is spawned) — either expiry is a block naming what was and
-  wasn't classified yet, never a silent allow. Git calls are batched
-  (`for-each-ref` once, the base's candidate tree set once) rather than
-  issued per branch; `merge-base --is-ancestor` and, only when still
-  unresolved, `git cherry` remain per-branch.
-- **Bypass:** `JUDGE_STOP_GUARD=off`, read from the hook process's own
-  inherited environment — allows with a `systemMessage` stating the
-  bypass is active. **Accepted blind spot:** an agent with write access to
-  `.claude/settings.json` could add this to its `env` block itself,
-  indistinguishable from a genuine operator-set variable once inherited;
-  closing that needs a separate guard restricting writes to that file,
-  out of scope here. Also skips the bounded-reblock layer below entirely
-  (no state read or written).
-- **Bounded re-block** (spec `docs/specs/stop-guard-bounded-reblock.md`,
-  reverses this guard's original "no state, no yield" design — see that
-  spec's §2 and `stop-stale-worktrees-guard.md` §4's reversal note): every
-  `block` outcome above is paired with a per-item breakdown (worktree path,
-  branch/ref name, or a fixed diagnostic label; every `deadline` block
-  collapses to one shared item regardless of which step timed out). Strikes
-  are counted per item, keyed by class + `normalizePathForCompare`-
-  normalized identity, in a per-`session_id` state file at
-  `hooks/state/stop-stale-worktrees-guard.<sanitized session_id>.json`
-  (atomic temp-file-then-rename writes; 7-day sweep on every run, reusing
-  `model-routing-guards.state.js`'s `cleanupOldStateFiles`). An item still
-  under 3 strikes keeps blocking normally; once every item present has
-  reached 3, the guard allows instead, with a `systemMessage` summary and
-  one durable JSON-line record per yielded item appended to
-  `hooks/state/stop-stale-worktrees-guard.yields.log` (the summary names
-  this path explicitly — `systemMessage` reaching the model is not assumed).
-  A fix line containing `git push <remote> --delete ...` is annotated
-  "(externally visible, run it or ask the operator)". Missing/malformed
-  `session_id` fails closed (blocks unconditionally, no state touched); a
-  state write failure also fails closed (blocks, naming the path and
-  error). Strikes never reset within a session and a yield never carries
-  into a different `session_id` — **accepted blind spot:** once an item
-  yields, it is silently omitted from every block reason for the rest of
-  that same session even if it recurs unchanged 50 more times; only a new
-  session resets it. **Tamper evidence** (`docs/specs/hook-state-write-guard.md`
-  §3, closes the previously-accepted "plain, unsigned JSON, forgeable" gap):
-  every write signs the state file's `items` with an HMAC-SHA256 keyfile
-  (`hooks/state/.hmac-key`, 32 bytes) bound to the session key, so a
-  byte-identical `items` blob copied into a *different* session's own
-  state filename no longer verifies (closes cross-session replay). On
-  read, a missing/wrong-length keyfile, a missing `mac`, or a mismatched
-  `mac` (including every pre-this-change state file, which has no `mac`
-  field at all) is treated identically to an absent state file — strikes
-  reset to 0 for that invocation, which can only *delay* a yield, never
-  grant one — and one `{"event":"tamper","session":...,"ts":...}` line is
-  appended to the yields log below. Layer 1
-  (`hooks/hook-state-write-guard.js`, plus this file's own
-  `shell-write-guard.js` PROTECTED_PATH extension) denies the forging
-  write outright before it reaches disk; this signing is the backstop for
-  whichever write path Layer 1 doesn't cover. **Remaining declared blind
-  spots** (spec §6, not closed by this pair of layers): same-session
-  self-replay/rollback (restoring an earlier, legitimately-signed state
-  file from the SAME session needs no key access); a junction/symlink
-  pointing into `STATE_DIR`; an agent that reads the keyfile directly
-  (`Read`/`cat`/`Get-Content` — out of scope for a write-denial layer) can
-  mint its own valid `mac`; and writes via any tool this repo's PreToolUse
-  hooks don't match (an MCP filesystem server, etc.).
-  `JUDGE_STOP_GUARD_STATE_DIR` overrides where this layer's state, keyfile,
-  and yields log live (used by this file's own test suite for isolation;
-  also usable to relocate state on a real install).
-- **Other declared blind spots** (see the guard's own header and
-  `docs/specs/stop-stale-worktrees-guard.md` §8 for the full list): a
-  squash-merge whose matching base commit falls outside the 500-commit
-  window misclassifies as active; one trivial extra commit on top of
-  already-squash-merged content defeats the tree-equality/cherry
-  detectors by design (this guard's threat model is a forgetful agent,
-  not an adversarial one); a repo with very many never-merged branches can
-  still exhaust the 20s deadline on every Stop call (only the global
-  bypass escapes that, disabling ALL staleness detection, not just the
-  expensive path); classification is entirely local-ref-based and never
-  runs `git fetch`; a resolved `main`/`master` (including via
-  `origin/HEAD`) is never verified against the team's actual live
-  integration branch, including the fork-workflow variant where `origin`
-  is the contributor's own fork; and a linked worktree that is itself
-  mid-rebase/mid-cherry-pick gets no special treatment (that allowance is
-  primary-worktree-only) and still falls to the ordinary
-  linked-detached-HEAD `unknown` row. Additionally (spec §8/§15): a
-  misidentified base remote now shapes the stale-remote/foreign split
-  rather than just a wrong base branch; `refs/heads`'s own atomically-
-  failing `for-each-ref` has no fallback (only `refs/remotes` got one); and
-  the active-worktree carve-out's own accepted gaps — a stray untracked
-  file keeps a worktree "active" forever (condition (a), no decay,
-  operator-named as expected), and a genuinely quiet, clean, behind/merged
-  worktree becoming stale-eligible after the quiet window elapses is this
-  feature's intended terminal behavior, not a defect.
+### session-end-worktree-guard.js
+*(renamed from `stop-stale-worktrees-guard.js`; moved from `Stop`
+(blocking, every turn) to `SessionEnd` (once per session, non-blocking) —
+owner decision, see `docs/specs/session-end-worktree-guard.md`.)*
+- **Event:** `SessionEnd` (registered with an explicit **30-second
+  timeout** — see `scripts/install-guards.js`'s `GUARDS` entry — 10s of
+  margin over this guard's own internal 20s heal-budget deadline). Runs
+  regardless of any `reason` field on the payload.
+- **Never blocks. Never prints a JSON decision. Exit code is always 0**,
+  including on any git failure. Instead of demanding cleanup before the
+  turn can end, it heals what it can prove is safe on its own and records
+  the rest to a yields log — see "Heal order" below.
+- Resolves the target directory via `CLAUDE_PROJECT_DIR`, then stdin
+  `cwd`, then `process.cwd()`, exactly like its Stop-guard predecessor.
+  Before classification, runs `git fetch origin <base>` with a 5s cap; a
+  failure sets `degraded = true` for the rest of that invocation (gates
+  the riskier heals below, never the safer ones).
+- **Attribution:** reads this session's own `agent-tier-ledger.*.jsonl`
+  file (never every session's) and collects every captured agent id. A
+  branch named `worktree-agent-<id>` — or a worktree checked out on one —
+  is "owned by this session" when `<id>` is in that set.
+- **Heal order**, bounded by a 20-second budget and a 10-heal cap, every
+  attempt logged to `hooks/state/session-end-worktree-guard.yields.log`
+  (`{event:"prune", kind, target, action, outcome}`, rotated to `.1` past
+  1 MB):
+  1. **Linked worktrees** — eligible if not primary, not the same
+     directory as (nor an ancestor/descendant of) the resolved cwd, no
+     in-progress-operation marker, not locked, no `index.lock`, clean
+     (`git status --porcelain`, checked immediately before removal), AND
+     (owned by this session OR idle ≥ 60 min by BOTH the worktree's own
+     git-dir mtime AND its `logs/HEAD` reflog's last timestamp — never
+     index mtime). `git worktree remove`, no `--force`. Skipped entirely
+     when degraded.
+  2. **Local branches with no attached worktree** — ancestor evidence
+     (`merge-base --is-ancestor`) deletes via `git branch -d`
+     unconditionally; tree-equality or `git cherry` evidence deletes via
+     `git branch -D`, gated on owned OR the tip commit being ≥ 30 min old,
+     and skipped when degraded; a `[gone]` upstream track ALONE never
+     deletes anything.
+  3. `git fetch --prune origin`, 5s cap, log-only on failure — never used
+     as evidence for 1 or 2.
+- **Unhealed items:** anything still present after the heal pass gets one
+  `{event:"session_end_unhealed", kind, target, evidence, fix}` yields-log
+  line plus a one-line stderr summary.
+- **Deleted from the Stop-era design** (see the spec's re-triage table for
+  the full disposition of every accepted gap this replaces): blocking
+  output, per-item strikes/yield/re-block state, the per-session state
+  file, HMAC tamper evidence, the v2 schema migration, `harness_managed`
+  reporting state, and all `refs/remotes/*` (stale-remote/foreign)
+  classification — this guard heals worktrees and local branches only.
+- **Declared blind spots** (full list in the spec's §"Accepted gaps"):
+  `yields.log` itself carries no tamper evidence; a crashed session fires
+  no `SessionEnd` at all and its worktrees are only healed by a LATER
+  session's own `SessionEnd` in that repo; a live worktree belonging to
+  ANOTHER session that happens to be clean, idle > 60 min, and not
+  attributable to this session's own ledger can still be removed.
 
 ### model-routing-guards.state.js / .unicode.js / .log.js / .exempt.js
 Shared plumbing used by the guards above, not hooks in their own right:

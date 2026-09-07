@@ -121,22 +121,43 @@ const GUARDS = [
     event: 'SubagentStart',
     matcher: null,
   },
-  // Explicit 30s timeout (10s of margin over this guard's own internal
-  // 20s classification deadline — see the guard's own header comment):
-  // Claude Code's documented platform default hook timeout is 600s, and a
-  // hook killed for exceeding ITS timeout has its output discarded (the
-  // harness then treats that the same as an ordinary no-output allow) —
-  // an explicit, much shorter registered timeout plus the guard's own
-  // internal deadline both exist so a stuck classification pass fails
-  // into this guard's own UNKNOWN-block path well before either timeout
-  // could turn "stuck" into a silent allow.
+  // SessionEnd, once per session, NEVER blocking (owner decision — see
+  // docs/specs/session-end-worktree-guard.md). Formerly registered on Stop
+  // (every turn, blocking) as `stop-stale-worktrees-guard` — see
+  // LEGACY_GUARD_FILES below, which prunes that old entry out of an
+  // existing settings.json on install. Explicit 30s timeout (10s of
+  // margin over this guard's own internal 20s heal-budget deadline — see
+  // the guard's own header comment): a hook killed for exceeding its
+  // registered timeout has its output discarded, which this guard doesn't
+  // rely on anyway (it never blocks and never prints a JSON decision), but
+  // the margin still keeps a stuck run from being killed mid-heal.
   {
-    id: 'stop-stale-worktrees-guard',
-    file: 'stop-stale-worktrees-guard.js',
-    event: 'Stop',
+    id: 'session-end-worktree-guard',
+    file: 'session-end-worktree-guard.js',
+    event: 'SessionEnd',
     matcher: null,
     timeout: 30,
   },
+];
+
+// ─── LEGACY PRUNE ────────────────────────────────────────────────────────
+//
+// Guard files that USED to be registered under an id in GUARDS above, now
+// renamed/removed. An entry naming one of these files no longer matches
+// any current GUARDS id (isOurs() only recognizes today's GUARDS array),
+// so scanEntries()/mergeGuardHooks()'s ordinary dedupe/repoint logic would
+// silently leave a stale entry sitting in settings.json forever — an
+// install-time hazard (a lingering blocking Stop hook, in this file's own
+// motivating case) that an ordinary reinstall can't fix. mergeGuardHooks()
+// below prunes any entry whose command matches one of these file suffixes
+// unconditionally, on every run (install AND uninstall), by the same
+// anchored "ends with hooks/<file>" identity NODE_COMMAND_RE/isOurs() use.
+const LEGACY_GUARD_FILES = [
+  // Superseded by session-end-worktree-guard.js on SessionEnd (owner
+  // decision, judge PR "session-end-worktree-guard") — was a blocking Stop
+  // hook; leaving it registered would keep blocking every turn against a
+  // deleted file.
+  'stop-stale-worktrees-guard.js',
 ];
 
 // Files copied into the destination hooks directory alongside the guards
@@ -287,6 +308,27 @@ function isOurs(rawCommand) {
   return null;
 }
 
+/**
+ * Same anchored-path identity `isOurs()` uses, against LEGACY_GUARD_FILES
+ * instead of the current GUARDS array. Returns `{ file }` or null.
+ * Exported for unit testing.
+ */
+function isLegacy(rawCommand) {
+  if (typeof rawCommand !== 'string') return null;
+  const cmd = normalizeCommand(rawCommand);
+  const m = cmd.match(NODE_COMMAND_RE);
+  if (!m) return null;
+  const pathToken = m[1] !== undefined ? m[1] : m[2];
+  if (typeof pathToken !== 'string' || pathToken.length === 0) return null;
+  for (const file of LEGACY_GUARD_FILES) {
+    const suffix = `hooks/${file}`;
+    if (pathToken === suffix || pathToken.endsWith(`/${suffix}`)) {
+      return { file };
+    }
+  }
+  return null;
+}
+
 // ─── VALIDATION (total classification) ───────────────────────────────────────
 
 function validateHooksSection(settings) {
@@ -387,13 +429,34 @@ function mergeGuardHooks(settings, opts) {
   }
   const hooks = settings.hooks;
 
-  const report = { added: [], repointed: [], moved: [], deduped: [], removed: [], unrecognizedShape: [] };
+  const report = { added: [], repointed: [], moved: [], deduped: [], removed: [], prunedLegacy: [], unrecognizedShape: [] };
   const { candidates, unrecognizedShape } = scanEntries(hooks);
   report.unrecognizedShape = unrecognizedShape;
 
   const innerToRemove = new Set();
   const groupsToCheckEmpty = new Set();
   const additions = []; // { event, matcher, command, timeout? }
+
+  // Legacy prune (see LEGACY_GUARD_FILES above): runs unconditionally, on
+  // every install AND uninstall — a stale entry naming a file no guard in
+  // GUARDS owns anymore isn't reachable through the isOurs()-keyed
+  // candidates map above, so it needs its own pass to ever be removed.
+  for (const event of Object.keys(hooks)) {
+    const arr = hooks[event];
+    if (!Array.isArray(arr)) continue;
+    for (const entry of arr) {
+      if (!entry || typeof entry !== 'object' || !Array.isArray(entry.hooks)) continue;
+      for (const inner of entry.hooks) {
+        if (!inner || typeof inner.command !== 'string') continue;
+        const legacy = isLegacy(inner.command);
+        if (legacy) {
+          innerToRemove.add(inner);
+          groupsToCheckEmpty.add(entry);
+          report.prunedLegacy.push({ event, file: legacy.file });
+        }
+      }
+    }
+  }
 
   for (const g of GUARDS) {
     const list = candidates[g.id];
@@ -757,6 +820,9 @@ function printReport(report) {
   console.log(`    moved:      ${report.moved.length}`);
   console.log(`    deduped:    ${report.deduped.length}`);
   console.log(`    removed:    ${report.removed.length}`);
+  if (report.prunedLegacy.length > 0) {
+    console.log(`    prunedLegacy: ${report.prunedLegacy.length}`);
+  }
   if (report.unrecognizedShape.length > 0) {
     console.log(`    unrecognized_shape: ${report.unrecognizedShape.length}`);
   }
@@ -898,8 +964,10 @@ if (require.main === module) {
 
 module.exports = {
   GUARDS,
+  LEGACY_GUARD_FILES,
   mergeGuardHooks,
   isOurs,
+  isLegacy,
   normalizeCommand,
   validateHooksSection,
   detectIndent,

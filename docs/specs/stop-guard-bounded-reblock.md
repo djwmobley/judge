@@ -1,3 +1,13 @@
+> **SUPERSEDED.** `stop-stale-worktrees-guard.js` moved from a blocking
+> `Stop` hook to a non-blocking, once-per-session `SessionEnd` hook
+> (`session-end-worktree-guard.js`) — owner decision, see
+> `docs/specs/session-end-worktree-guard.md`. There is no "block" outcome
+> left to re-block, so the entire strike/yield/per-session-state/HMAC
+> design this file specifies was deleted, not migrated. Kept here as a
+> historical record of the incidents that motivated it and the design
+> reasoning behind bounding a retry loop; none of it describes shipped
+> behavior anymore.
+
 # Spec: Bounded re-block for `stop-stale-worktrees-guard.js`
 
 *Revised after adversary round 2 on this spec itself

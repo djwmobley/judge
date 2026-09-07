@@ -16,8 +16,10 @@ const { execFileSync } = require("child_process");
 
 const {
   GUARDS,
+  LEGACY_GUARD_FILES,
   mergeGuardHooks,
   isOurs,
+  isLegacy,
   normalizeCommand,
   validateHooksSection,
   detectIndent,
@@ -608,6 +610,124 @@ test("CLI --force real run: backs up a differing hook file and leaves a byte-ide
     // The live file was actually overwritten with the new content.
     const realSwg = fs.readFileSync(path.join(__dirname, "..", "hooks", "shell-write-guard.js"), "utf8");
     assert.equal(fs.readFileSync(path.join(hooksDir, "shell-write-guard.js"), "utf8"), realSwg);
+  } finally {
+    rmTree(fakeHome);
+    rmTree(fakeProject);
+  }
+});
+
+// ── Legacy prune (session-end-worktree-guard.js's SessionEnd rename) ────────
+
+test("isLegacy: recognizes the retired stop-stale-worktrees-guard.js command path", () => {
+  const hit = isLegacy(`node ${FAKE_HOOKS_DIR}/stop-stale-worktrees-guard.js`);
+  assert.deepEqual(hit, { file: "stop-stale-worktrees-guard.js" });
+});
+
+test("isLegacy: rejects a command for a file that isn't retired", () => {
+  assert.equal(isLegacy(`node ${FAKE_HOOKS_DIR}/no-punt-guard.js`), null);
+});
+
+test("mergeGuardHooks: prunes a stale Stop entry for the retired guard and adds the new SessionEnd entry", () => {
+  const settings = {
+    hooks: {
+      Stop: [
+        {
+          hooks: [
+            { type: "command", command: `node ${FAKE_HOOKS_DIR}/stop-stale-worktrees-guard.js`, timeout: 30 },
+            { type: "command", command: `node ${FAKE_HOOKS_DIR}/no-punt-guard.js` },
+          ],
+        },
+      ],
+    },
+  };
+  const report = mergeGuardHooks(settings, { hooksDir: FAKE_HOOKS_DIR });
+
+  assert.equal(report.prunedLegacy.length, 1);
+  assert.equal(report.prunedLegacy[0].file, "stop-stale-worktrees-guard.js");
+
+  // The legacy Stop entry is gone; the sibling no-punt-guard entry (same
+  // group) survives untouched.
+  const stopGroup = settings.hooks.Stop.find((e) => !e.matcher);
+  assert.ok(stopGroup, "no-punt-guard's own Stop group must still exist");
+  assert.equal(
+    stopGroup.hooks.some((h) => isLegacy(h.command)),
+    false,
+    "no legacy command must remain anywhere in hooks.Stop"
+  );
+  assert.ok(
+    stopGroup.hooks.some((h) => isOurs(h.command) && isOurs(h.command).id === "no-punt-guard"),
+    "no-punt-guard's own entry must survive the prune"
+  );
+
+  // The new SessionEnd entry for session-end-worktree-guard was added.
+  assert.ok(Array.isArray(settings.hooks.SessionEnd), "hooks.SessionEnd must exist");
+  const segEntry = settings.hooks.SessionEnd.flatMap((e) => e.hooks).find(
+    (h) => isOurs(h.command) && isOurs(h.command).id === "session-end-worktree-guard"
+  );
+  assert.ok(segEntry, "session-end-worktree-guard must be registered on SessionEnd");
+  assert.equal(segEntry.timeout, 30);
+});
+
+test("mergeGuardHooks: legacy prune also runs on --uninstall", () => {
+  const settings = {
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: `node ${FAKE_HOOKS_DIR}/stop-stale-worktrees-guard.js` }] }],
+    },
+  };
+  const report = mergeGuardHooks(settings, { hooksDir: FAKE_HOOKS_DIR, uninstall: true });
+  assert.equal(report.prunedLegacy.length, 1);
+  const remaining = (settings.hooks.Stop || []).flatMap((e) => e.hooks || []);
+  assert.equal(remaining.some((h) => isLegacy(h.command)), false);
+});
+
+test("LEGACY_GUARD_FILES: no current GUARDS entry ships a file also listed as legacy", () => {
+  const legacySet = new Set(LEGACY_GUARD_FILES);
+  for (const g of GUARDS) {
+    assert.equal(legacySet.has(g.file), false, `${g.file} is both an active guard and marked legacy`);
+  }
+});
+
+test("CLI install prunes an existing settings.json's stale Stop entry for the retired guard and installs SessionEnd", () => {
+  const fakeHome = mkTmpDir("install-guards-home-");
+  const fakeProject = mkTmpDir("install-guards-project-");
+  try {
+    const settingsDir = path.join(fakeProject, ".claude");
+    fs.mkdirSync(settingsDir, { recursive: true });
+    const settingsPath = path.join(settingsDir, "settings.local.json");
+    const legacySettings = {
+      hooks: {
+        Stop: [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: `node ${path.join(fakeHome, ".claude", "hooks", "stop-stale-worktrees-guard.js").replace(/\\/g, "/")}`,
+                timeout: 30,
+              },
+            ],
+          },
+        ],
+      },
+    };
+    fs.writeFileSync(settingsPath, JSON.stringify(legacySettings, null, 2));
+
+    runCli(["--force", "--hooks-scope", "project"], { home: fakeHome, cwd: fakeProject });
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    const stopCommands = (after.hooks.Stop || []).flatMap((e) => e.hooks || []).map((h) => h.command);
+    assert.ok(
+      stopCommands.every((c) => !isLegacy(c)),
+      "no stop-stale-worktrees-guard.js command must remain on hooks.Stop"
+    );
+    const sessionEndCommands = (after.hooks.SessionEnd || []).flatMap((e) => e.hooks || []).map((h) => h.command);
+    assert.ok(
+      sessionEndCommands.some((c) => c.endsWith("session-end-worktree-guard.js")),
+      "session-end-worktree-guard.js must be registered on SessionEnd"
+    );
+    assert.ok(
+      fs.existsSync(path.join(fakeHome, ".claude", "hooks", "session-end-worktree-guard.js")),
+      "session-end-worktree-guard.js must be copied into the hooks dir"
+    );
   } finally {
     rmTree(fakeHome);
     rmTree(fakeProject);
