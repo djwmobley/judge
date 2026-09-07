@@ -197,6 +197,23 @@ function hashTarget(target) {
 }
 
 module.exports = {
+  // Re-exported (not duplicated) from model-routing-guards.state.js — the
+  // single source of truth this module already destructured STATE_DIR from
+  // above (line 25) to build ledgerPathForSessionIdRaw(). Consumers outside
+  // this guard family (scripts/routing-scorecard.js's own DEFAULT_STATE_DIR)
+  // read it from here rather than requiring model-routing-guards.state.js
+  // directly a second time, so there is exactly one place that decides
+  // "where does this guard family's state live" and every reader — the
+  // guards that write the ledger and the scorecard that reads it — is
+  // guaranteed to agree on it. Omitting this export left
+  // scripts/routing-scorecard.js's DEFAULT_STATE_DIR silently `undefined`
+  // (routing-scorecard.md §5.1's documented default), which
+  // fs.readdirSync(undefined) then fails on a fail-soft `catch` in
+  // listLedgerFiles(), reporting 0 files/0 decisions/NO-DATA even with a
+  // fully populated STATE_DIR on disk — see hooks/routing-scorecard.test.js's
+  // "default_state_dir_matches_decisions_module" and
+  // "default_state_dir_finds_production_shaped_fixtures" regression tests.
+  STATE_DIR,
   LEDGER_PREFIX,
   LEDGER_SUFFIX,
   SEVEN_DAYS_MS,

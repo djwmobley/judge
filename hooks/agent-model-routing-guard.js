@@ -165,10 +165,34 @@ function decisionRecord(fields) {
 // catch (previously blind to the raw request) can recover session_id.
 // Changes only WHEN the read happens, not what is read or how any
 // block/allow/fail_open outcome is decided.
+//
+// Called from main() itself (below), not from the `require.main === module`
+// block alone: this file has TWO installed entry points —
+// agent-model-routing-guard.js's own direct PreToolUse registration, and
+// agent-model-routing-guard-subagentstart.js's `require(...).main()` shim
+// for SubagentStart (owner decision D3) — and the shim's `module` object is
+// itself, not this file, so `require.main === module` is always false when
+// entered via the shim. A prior revision called captureStdin() only inside
+// that require.main block, which left rawStdinBuffer permanently
+// `undefined` on every SubagentStart dispatch: main() would then
+// JSON.parse(undefined) (stringifies to the non-JSON text "undefined"),
+// fail open with a bogus "json_parse_error" for every single subagent
+// spawn, and never reach handleSubagentStart() at all — silently breaking
+// the tier-ledger id capture this shim exists for, on 100% of dispatches,
+// with no test catching it (every existing end-to-end test in
+// agent-model-routing-guard.test.js spawns this file directly, never the
+// shim). Calling captureStdin() unconditionally at the top of main() — the
+// original, pre-regression shape — fixes both entry points at once and
+// needs no shim-side change. stdinCaptured guards against a second call
+// re-reading (or hanging on) an already-drained fd 0 if main() is ever
+// invoked twice in one process.
 let rawStdinBuffer;
 let stdinReadFailed = false;
+let stdinCaptured = false;
 
 function captureStdin() {
+  if (stdinCaptured) return;
+  stdinCaptured = true;
   try {
     rawStdinBuffer = fs.readFileSync(0, "utf8");
   } catch (_) {
@@ -569,6 +593,7 @@ function handleSubagentStart(parsed) {
 // ─── PreToolUse main() ────────────────────────────────────────────────────
 
 function main() {
+  captureStdin();
   if (stdinReadFailed) {
     failOpen("stdin_read_error");
     return;
@@ -693,7 +718,11 @@ function main() {
 }
 
 if (require.main === module) {
-  captureStdin();
+  // captureStdin() is no longer called here: main() calls it itself now
+  // (see the comment above its definition) so both installed entry points
+  // — this direct invocation and agent-model-routing-guard-subagentstart.js's
+  // require(...).main() shim — capture stdin exactly once, in the same
+  // place, regardless of which one runs.
   try {
     main();
   } catch (topErr) {
