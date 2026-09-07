@@ -96,6 +96,32 @@ function primaryGitDir(dir) {
   return path.join(dir, ".git");
 }
 
+// Round-4 (§16) activity-recency helpers: condition (c) reads logs/HEAD's
+// own recorded reflog timestamp (never a file mtime), so simulating a
+// "quiet" worktree means rewriting that timestamp field in place, not
+// touching the file's OS mtime.
+function worktreeGitDir(repoDir, worktreePath) {
+  return git(worktreePath, ["rev-parse", "--absolute-git-dir"]);
+}
+
+function backdateReflog(gitDir, secondsAgo) {
+  const reflogPath = path.join(gitDir, "logs", "HEAD");
+  const oldTs = Math.floor(Date.now() / 1000) - secondsAgo;
+  let content;
+  try {
+    content = fs.readFileSync(reflogPath, "utf8");
+  } catch (_) {
+    return; // no reflog -- nothing to backdate.
+  }
+  content = content.replace(/\d{10,}(?=\s[+-]\d{4}\t)/g, String(oldTs));
+  fs.writeFileSync(reflogPath, content);
+  const commitEditMsg = path.join(gitDir, "COMMIT_EDITMSG");
+  if (fs.existsSync(commitEditMsg)) {
+    const old = new Date(oldTs * 1000);
+    fs.utimesSync(commitEditMsg, old, old);
+  }
+}
+
 function plantMarker(dir, relPath, { isDir } = {}) {
   const p = path.join(primaryGitDir(dir), relPath);
   if (isDir) {
@@ -421,6 +447,10 @@ test("worktree_stale_branch_blocks: linked worktree on ancestor branch -> both f
     git(dir, ["branch", "oldfeature"]);
     git(dir, ["worktree", "add", "-q", linked, "oldfeature"]);
     writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    // Round-4/§16: `worktree add` itself wrote a fresh reflog entry --
+    // backdate it so this exercises the intended clean/quiet/stale steady
+    // state, not the "just created this millisecond" active instant.
+    backdateReflog(worktreeGitDir(dir, linked), 3600);
     const { exitCode, stdout } = runHookInRepo(dir);
     assert.equal(exitCode, 0);
     const decision = parseDecision(stdout);
@@ -441,6 +471,7 @@ test("worktree_locked_stale_fix_prepends_unlock", () => {
     git(dir, ["worktree", "add", "-q", linked, "oldfeature"]);
     writeAndCommit(dir, "b.txt", "b\n", "advance main");
     git(dir, ["worktree", "lock", linked, "--reason", "test"]);
+    backdateReflog(worktreeGitDir(dir, linked), 3600);
     const { exitCode, stdout } = runHookInRepo(dir);
     assert.equal(exitCode, 0);
     const decision = parseDecision(stdout);
@@ -708,7 +739,7 @@ test("branch_upstream_equals_base_tip_empty_local_not_stale: fresh branch tracki
   }
 });
 
-test("checked_out_branch_stale_suggests_checkout_first: current branch is a diverged ancestor", () => {
+test("checked_out_branch_stale_suggests_checkout_first: current branch is a diverged ancestor, clean and quiet", () => {
   const dir = initRepo("main");
   try {
     git(dir, ["checkout", "-q", "-b", "feature"]);
@@ -716,6 +747,12 @@ test("checked_out_branch_stale_suggests_checkout_first: current branch is a dive
     writeAndCommit(dir, "b.txt", "b\n", "advance main");
     git(dir, ["checkout", "-q", "feature"]);
     assert.equal(currentBranch(dir), "feature");
+    // Round-4/§16: the checkout above itself just wrote a fresh reflog
+    // entry -- backdate it so this test exercises the intended "clean,
+    // quiet, stale" steady state (§16 R4-04) rather than the artificial
+    // "just switched branches this millisecond" instant, which would
+    // otherwise read as active via condition (c) and never block.
+    backdateReflog(primaryGitDir(dir), 3600);
 
     const { exitCode, stdout } = runHookInRepo(dir);
     assert.equal(exitCode, 0);
@@ -767,7 +804,11 @@ test("base_branch_origin_head_dangling_falls_through_to_main", () => {
   }
 });
 
-test("uncommitted_changes_do_not_change_class: dirty stale worktree still stale, inspect-first text present", () => {
+test("dirty_linked_worktree_on_stale_branch_is_active_not_stale: supersedes the pre-round-3 uncommitted-changes rule (§15/§16)", () => {
+  // Live finding 2026-09-07 (§15), revised by adversary round 4 (§16):
+  // this is the guard's OWN real incident shape -- a dirty linked
+  // worktree whose branch has zero commits of its own while base
+  // advanced (a strict ancestor). It must now ALLOW, never block.
   const dir = initRepo("main");
   const linked = path.join(mkTmpDir("stop-guard-linked-parent-"), "wt");
   try {
@@ -779,10 +820,10 @@ test("uncommitted_changes_do_not_change_class: dirty stale worktree still stale,
     const { exitCode, stdout } = runHookInRepo(dir);
     assert.equal(exitCode, 0);
     const decision = parseDecision(stdout);
-    assert.ok(decision);
-    assert.match(decision.reason, /worktree remove/);
-    assert.match(decision.reason, /status --porcelain/);
-    assert.doesNotMatch(decision.reason, /--force/);
+    assert.ok(decision, "expected an allow-with-message, not silence");
+    assert.equal(decision.decision, undefined);
+    assert.match(decision.systemMessage, /active worktree on merged branch oldfeature/);
+    assert.match(decision.systemMessage, /uncommitted changes present/);
   } finally {
     rmTree(dir);
     rmTree(path.dirname(linked));
@@ -902,17 +943,20 @@ test("batched_git_calls_used_not_per_branch: exactly one for-each-ref and one tr
     }
     writeAndCommit(dir, "b.txt", "b\n", "advance main");
 
-    let forEachRefCalls = 0;
+    let forEachRefHeadsCalls = 0;
+    let forEachRefRemotesCalls = 0;
     let treeSetCalls = 0;
     const countingExecGit = (args, cwd, timeoutMs) => {
-      if (args[0] === "for-each-ref") forEachRefCalls++;
+      if (args[0] === "for-each-ref" && args[args.length - 1] === "refs/heads") forEachRefHeadsCalls++;
+      if (args[0] === "for-each-ref" && args[args.length - 1] === "refs/remotes") forEachRefRemotesCalls++;
       if (args[0] === "log" && args.includes("--max-count=500")) treeSetCalls++;
       return defaultExecGit(args, cwd, timeoutMs);
     };
 
     const result = evaluateStop(dir, { execGit: countingExecGit });
     assert.equal(result.action, "block"); // all 6 branches are ancestor-stale
-    assert.equal(forEachRefCalls, 1, "for-each-ref must be called exactly once regardless of branch count");
+    assert.equal(forEachRefHeadsCalls, 1, "for-each-ref refs/heads must be called exactly once regardless of branch count");
+    assert.equal(forEachRefRemotesCalls, 1, "for-each-ref refs/remotes (§3/§13) must be called exactly once, batched");
     assert.equal(treeSetCalls, 1, "the base tree-set call must be called exactly once regardless of branch count");
   } finally {
     rmTree(dir);
@@ -963,6 +1007,438 @@ test("reason_caps_at_40_items: 45 stale items -> first 40 listed, remainder coun
     assert.match(decision.reason, /\.\.\.and 5 more/);
     const lineCount = decision.reason.split("\n").filter((l) => l.startsWith("[branch]")).length;
     assert.equal(lineCount, 40);
+  } finally {
+    rmTree(dir);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Remote-tracking branch classification (spec §3/§13, adversary round 3 §14)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function addSecondRemote(dir, remoteName, branch) {
+  const bareDir = mkTmpDir("stop-guard-bare2-");
+  git(bareDir, ["init", "-q", "--bare"]);
+  git(dir, ["remote", "add", remoteName, bareDir]);
+  git(dir, ["push", "-q", remoteName, branch]);
+  return bareDir;
+}
+
+test("remote_stale_no_local_branch_blocks: merged ref on origin, no tracking local branch", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  try {
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    writeAndCommit(dir, "f.txt", "f\n", "feature work");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["merge", "-q", "--ff-only", "feature"]);
+    git(dir, ["push", "-q", "origin", "feature"]);
+    git(dir, ["branch", "-D", "feature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main past feature's tip");
+    git(dir, ["push", "-q", "origin", "main"]); // keep origin/main (and origin/HEAD) current -- base resolves via the cached remote-tracking ref.
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, "block");
+    assert.match(decision.reason, /\[remote\] origin\/feature — stale-remote/);
+    assert.match(decision.reason, /git fetch --prune origin/);
+    assert.match(decision.reason, /git rev-parse --verify -q refs\/remotes\/origin\/feature/);
+    assert.match(decision.reason, /git push origin --delete feature/);
+    assert.match(decision.reason, /git branch -dr origin\/feature/);
+    assert.doesNotMatch(decision.reason, /git branch -[dD] feature\b/);
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+  }
+});
+
+test("remote_stale_with_tracking_local_branch_grouped: local branch also stale -> single grouped item", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  try {
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    writeAndCommit(dir, "f.txt", "f\n", "feature work");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["merge", "-q", "--ff-only", "feature"]);
+    git(dir, ["push", "-q", "-u", "origin", "feature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main past feature's tip");
+    git(dir, ["push", "-q", "origin", "main"]);
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    const lines = decision.reason.split("\n");
+    const featureLines = lines.filter((l) => l.includes("feature"));
+    assert.equal(featureLines.length, 1, "must be exactly one combined item, not a separate branch + remote item");
+    assert.match(featureLines[0], /git fetch --prune origin/);
+    assert.match(featureLines[0], /git push origin --delete feature/);
+    assert.match(featureLines[0], /git branch -dr origin\/feature/);
+    assert.match(featureLines[0], /git branch -d feature\b/);
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+  }
+});
+
+test("remote_active_unmerged_allows: pushed branch genuinely ahead and unmerged", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  try {
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    writeAndCommit(dir, "f.txt", "f\n", "feature work");
+    git(dir, ["push", "-q", "-u", "origin", "feature"]);
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    assert.equal(stdout, "");
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+  }
+});
+
+test("remote_head_detached_excluded_by_name: detached (non-symbolic) origin/HEAD never flagged (R3-01)", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  try {
+    const oldTip = git(dir, ["rev-parse", "main"]);
+    git(dir, ["update-ref", "--no-deref", "refs/remotes/origin/HEAD", oldTip]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main past the now-detached origin/HEAD");
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    if (decision) assert.doesNotMatch(decision.reason || decision.systemMessage || "", /origin\/HEAD/);
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+  }
+});
+
+test("remote_base_own_tracked_ref_ignored: origin/main never flagged despite being an ancestor of the new local main", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  try {
+    writeAndCommit(dir, "b.txt", "b\n", "advance local main past origin/main");
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    assert.equal(stdout, "", "origin/main must be excluded as the base's own tracked ref, never reported stale-remote");
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+  }
+});
+
+test("remote_no_base_remote_all_foreign_allows: no upstream on local main -> every remote ref is at best foreign", () => {
+  const dir = initRepo("main");
+  const upstreamBare = mkTmpDir("stop-guard-bare-upstream-");
+  try {
+    git(upstreamBare, ["init", "-q", "--bare"]);
+    git(dir, ["checkout", "-q", "-b", "shared"]);
+    writeAndCommit(dir, "s.txt", "s\n", "shared work");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["merge", "-q", "--ff-only", "shared"]);
+    git(dir, ["remote", "add", "upstream", upstreamBare]);
+    git(dir, ["push", "-q", "upstream", "shared"]);
+    git(dir, ["branch", "-D", "shared"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main past shared's tip");
+    // No origin, no upstream configured on local main -- no base remote at all.
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision, "expected an allow-with-message");
+    assert.equal(decision.decision, undefined);
+    assert.match(decision.systemMessage, /stale-remote-foreign/);
+    assert.match(decision.systemMessage, /upstream\/shared/);
+  } finally {
+    rmTree(dir);
+    rmTree(upstreamBare);
+  }
+});
+
+test("remote_foreign_remote_merged_ref_allows_with_message: second remote's merged ref is foreign, not blocking", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  let upstreamBare = null;
+  try {
+    git(dir, ["checkout", "-q", "-b", "shared"]);
+    writeAndCommit(dir, "s.txt", "s\n", "shared work");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["merge", "-q", "--ff-only", "shared"]);
+    upstreamBare = addSecondRemote(dir, "upstream", "shared");
+    git(dir, ["branch", "-D", "shared"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main past shared's tip");
+    git(dir, ["push", "-q", "origin", "main"]);
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, undefined);
+    assert.match(decision.systemMessage, /upstream\/shared classifies stale-remote-foreign/);
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+    if (upstreamBare) rmTree(upstreamBare);
+  }
+});
+
+test("remote_foreign_message_suppressed_when_blocking_findings_exist: foreign note omitted from a block reason", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  let upstreamBare = null;
+  try {
+    git(dir, ["checkout", "-q", "-b", "shared"]);
+    writeAndCommit(dir, "s.txt", "s\n", "shared work");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["merge", "-q", "--ff-only", "shared"]);
+    upstreamBare = addSecondRemote(dir, "upstream", "shared");
+    git(dir, ["branch", "-D", "shared"]);
+    git(dir, ["branch", "oldfeature"]); // unrelated, never-pushed stale local branch -> forces a block.
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    git(dir, ["push", "-q", "origin", "main"]);
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, "block");
+    assert.match(decision.reason, /oldfeature/);
+    assert.doesNotMatch(decision.reason, /upstream\/shared/);
+    assert.doesNotMatch(decision.reason, /foreign/);
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+    if (upstreamBare) rmTree(upstreamBare);
+  }
+});
+
+test("remote_forremote_atomic_failure_falls_back_to_show_ref: one ref with a missing object does not black out its healthy sibling", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  try {
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    writeAndCommit(dir, "f.txt", "f\n", "feature work");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["merge", "-q", "--ff-only", "feature"]);
+    git(dir, ["push", "-q", "origin", "feature"]);
+    git(dir, ["branch", "-D", "feature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main past feature's tip");
+    git(dir, ["push", "-q", "origin", "main"]);
+
+    // A remote-tracking ref pointing at a nonexistent object -- git itself
+    // refuses `update-ref` to a missing object, so write the loose ref
+    // file directly, bypassing that check (this is exactly the scenario
+    // round-3 finding R3-02 is built against).
+    fs.writeFileSync(
+      path.join(dir, ".git", "refs", "remotes", "origin", "ghost"),
+      "0123456789abcdef0123456789abcdef01234567\n"
+    );
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, "block");
+    assert.match(decision.reason, /\[remote\] origin\/ghost — unknown/);
+    assert.match(decision.reason, /\[remote\] origin\/feature — stale-remote/);
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+  }
+});
+
+test("remote_tip_equals_base_not_flagged: a foreign remote's ref at exactly base's tip is never flagged", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  let mirrorBare = null;
+  try {
+    mirrorBare = addSecondRemote(dir, "mirror", "main"); // mirror/main == current main tip, no further advance.
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    assert.equal(stdout, "", "a remote ref whose tip equals base.tip must never be classified stale-remote(-foreign)");
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+    if (mirrorBare) rmTree(mirrorBare);
+  }
+});
+
+test("remote_refs_counted_in_deadline_reason: deadline forced right after remote-ref enumeration", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  try {
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    writeAndCommit(dir, "f.txt", "f\n", "feature work");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["merge", "-q", "--ff-only", "feature"]);
+    git(dir, ["push", "-q", "origin", "feature"]);
+    git(dir, ["branch", "-D", "feature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+
+    let remoteListSeen = false;
+    const wrappedExecGit = (args, cwd, timeoutMs) => {
+      const res = defaultExecGit(args, cwd, timeoutMs);
+      if (args[0] === "for-each-ref" && args[args.length - 1] === "refs/remotes") remoteListSeen = true;
+      return res;
+    };
+    const fakeNow = () => (remoteListSeen ? 1_000_000 : 0);
+
+    const result = evaluateStop(dir, { execGit: wrappedExecGit, now: fakeNow, deadlineMs: 20000 });
+    assert.equal(result.action, "block");
+    assert.match(result.reason, /remote-list=\d+ ref\(s\)/);
+    assert.match(result.reason, /remote-names/);
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+  }
+});
+
+test("remote_worktree_branch_remote_three_way_grouped: linked worktree + stale branch + stale-remote tracking ref, one item", () => {
+  const dir = initRepo("main");
+  const bareDir = addBareOrigin(dir, "main");
+  const linked = path.join(mkTmpDir("stop-guard-linked-parent-"), "wt");
+  try {
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    writeAndCommit(dir, "f.txt", "f\n", "feature work");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["merge", "-q", "--ff-only", "feature"]);
+    git(dir, ["push", "-q", "-u", "origin", "feature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main past feature's tip");
+    git(dir, ["push", "-q", "origin", "main"]);
+    git(dir, ["worktree", "add", "-q", linked, "feature"]);
+    backdateReflog(worktreeGitDir(dir, linked), 3600);
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, "block");
+    const lines = decision.reason.split("\n");
+    const featureLines = lines.filter((l) => l.includes("feature"));
+    assert.equal(featureLines.length, 1, "worktree + branch + remote must combine into exactly one item");
+    assert.match(featureLines[0], /worktree remove/);
+    assert.match(featureLines[0], /git branch -d feature\b/);
+    assert.match(featureLines[0], /git push origin --delete feature/);
+    assert.match(featureLines[0], /git branch -dr origin\/feature/);
+  } finally {
+    rmTree(dir);
+    rmTree(bareDir);
+    rmTree(path.dirname(linked));
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Active-worktree carve-out (spec §15/§16, live finding 2026-09-07 + round 4)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("worktree_active_clean_recent_on_behind_branch_allows: freshly-added worktree is recent by default", () => {
+  const dir = initRepo("main");
+  const linked = path.join(mkTmpDir("stop-guard-linked-parent-"), "wt");
+  try {
+    git(dir, ["branch", "oldfeature"]);
+    git(dir, ["worktree", "add", "-q", linked, "oldfeature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    // No backdating -- the worktree add above just wrote a fresh reflog
+    // entry, well within the default 30-minute quiet window.
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.match(decision.systemMessage, /active worktree on merged branch oldfeature/);
+    assert.match(decision.systemMessage, /recent worktree activity/);
+  } finally {
+    rmTree(dir);
+    rmTree(path.dirname(linked));
+  }
+});
+
+test("worktree_active_clean_quiet_on_merged_branch_blocks: clean, no own commits, backdated past the quiet window", () => {
+  const dir = initRepo("main");
+  const linked = path.join(mkTmpDir("stop-guard-linked-parent-"), "wt");
+  try {
+    git(dir, ["branch", "oldfeature"]);
+    git(dir, ["worktree", "add", "-q", linked, "oldfeature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    backdateReflog(worktreeGitDir(dir, linked), 3600);
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, "block");
+    assert.match(decision.reason, /oldfeature/);
+  } finally {
+    rmTree(dir);
+    rmTree(path.dirname(linked));
+  }
+});
+
+test("worktree_quiet_window_zero_disables_recency_signal_blocks: JUDGE_STOP_GUARD_QUIET_MINUTES=0", () => {
+  const dir = initRepo("main");
+  const linked = path.join(mkTmpDir("stop-guard-linked-parent-"), "wt");
+  try {
+    git(dir, ["branch", "oldfeature"]);
+    git(dir, ["worktree", "add", "-q", linked, "oldfeature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    // No backdating -- this worktree IS freshly touched; the env override
+    // must still disable the recency signal entirely.
+    const { exitCode, stdout } = runHookInRepo(dir, null, { JUDGE_STOP_GUARD_QUIET_MINUTES: "0" });
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, "block");
+    assert.match(decision.reason, /oldfeature/);
+  } finally {
+    rmTree(dir);
+    rmTree(path.dirname(linked));
+  }
+});
+
+test("worktree_active_own_commit_ahead_of_base_allows: unintegrated commit on the worktree's branch (the live-finding trigger shape)", () => {
+  // A genuinely unintegrated commit makes the branch table itself classify
+  // this branch `active` (row 9) directly -- ancestor/tree-equality/cherry
+  // all correctly fail to fire, so classifyBranch never even reaches
+  // "stale" for the override (§16) to act on. This is a plain allow with
+  // no output, not an allow-with-message: condition (b), once made
+  // content-aware (round-4 finding R4-03), is subsumed by the branch
+  // table's own natural determination for exactly this shape of input.
+  const dir = initRepo("main");
+  const linked = path.join(mkTmpDir("stop-guard-linked-parent-"), "wt");
+  try {
+    git(dir, ["branch", "oldfeature"]);
+    git(dir, ["worktree", "add", "-q", linked, "oldfeature"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    writeAndCommit(linked, "own.txt", "own work\n", "unintegrated work in the worktree");
+    backdateReflog(worktreeGitDir(dir, linked), 3600); // quiet on recency -- irrelevant here; content is what saves it.
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    assert.equal(stdout, "", "genuinely unintegrated content classifies active via the ordinary branch table, no override needed");
+  } finally {
+    rmTree(dir);
+    rmTree(path.dirname(linked));
+  }
+});
+
+test("primary_worktree_active_dirty_on_stale_branch_allows_with_message: R4-04 extends the carve-out to the primary worktree", () => {
+  const dir = initRepo("main");
+  try {
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    git(dir, ["checkout", "-q", "main"]);
+    writeAndCommit(dir, "b.txt", "b\n", "advance main");
+    git(dir, ["checkout", "-q", "feature"]);
+    fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+    const { exitCode, stdout } = runHookInRepo(dir);
+    assert.equal(exitCode, 0);
+    const decision = parseDecision(stdout);
+    assert.ok(decision);
+    assert.equal(decision.decision, undefined);
+    assert.match(decision.systemMessage, /active worktree on merged branch feature/);
   } finally {
     rmTree(dir);
   }

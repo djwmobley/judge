@@ -304,16 +304,33 @@ removed rather than kept as an unexercised fallback:
   see `scripts/install-guards.js`'s `GUARDS` entry — 10s of margin over
   this guard's own internal 20s classification deadline).
 - **Blocks:** the session from ending while the repo containing the
-  resolved project directory has a stale linked worktree or a stale local
-  branch. Resolves the target directory via `CLAUDE_PROJECT_DIR`, then
-  stdin `cwd`, then `process.cwd()` — never a raw, unvalidated `cwd` alone.
+  resolved project directory has a stale linked worktree, a stale local
+  branch, or a stale remote-tracking ref on the base's own remote.
+  Resolves the target directory via `CLAUDE_PROJECT_DIR`, then stdin
+  `cwd`, then `process.cwd()` — never a raw, unvalidated `cwd` alone.
+- **Active-worktree override (spec §15/§16), evaluated before ANY branch
+  or worktree classification:** for every worktree (primary or linked)
+  with a checked-out branch, that branch is forced to `active` (never
+  reaching the stale rows below) if the worktree is dirty
+  (`git status --porcelain`), has a commit not yet integrated into base
+  (same ancestor/tree-equality/cherry detectors the branch table uses,
+  not a bare `rev-list --count`), or its `logs/HEAD` reflog /
+  `COMMIT_EDITMSG` was touched within a quiet window (default 30 min,
+  `JUDGE_STOP_GUARD_QUIET_MINUTES`, `0` disables the recency signal only).
+  Such worktrees surface one informational `systemMessage` line each
+  ("active worktree on merged branch `<name>`; clean up when done")
+  instead of blocking — a clean, quiet, behind/merged worktree still
+  blocks as before, primary worktrees still lead their fix with
+  `git checkout <base>`.
 - **Worktree classes:** `ok` (on the base branch, or not prunable/dir
   exists/branch active), `stale` (prunable, missing directory, or a
   `git worktree prune --dry-run` hit — fix leads with `git worktree
   unlock` if locked, then `remove`/`prune`; or a linked worktree whose
-  checked-out branch itself classifies stale — combined fix), `unknown`
-  (detached HEAD with no in-progress marker — no fix offered), and
-  `in-progress-operation` (primary worktree only, detached HEAD with a
+  checked-out branch itself classifies stale — combined fix, extended
+  with a grouped remote-ref fix when that branch also tracks a stale
+  base-remote ref), `unknown` (detached HEAD with no in-progress marker —
+  no fix offered), and `in-progress-operation` (primary worktree only,
+  detached HEAD with a
   `rebase-merge`/`rebase-apply`/`MERGE_HEAD`/`CHERRY_PICK_HEAD`/
   `BISECT_START`/`REVERT_HEAD` marker present — allows with a naming
   `systemMessage` instead of blocking a mid-flight handoff).
@@ -330,8 +347,27 @@ removed rather than kept as an unexercised fallback:
   branches get a `-d` fix (git can verify these itself); every other stale
   row leads with `-D` plus an inline comment, and the upstream-tip row
   adds an operator-confirmed `git push origin --delete` line on its own.
-  If the checked-out branch (in the PRIMARY worktree only) classifies
-  stale, its fix leads with `git checkout <base>`.
+  If the checked-out branch classifies stale, its fix leads with
+  `git checkout <base>` (§16 extends this to the primary worktree
+  specifically — a linked worktree's own combined fix already handles it).
+- **Remote-tracking classes (spec §3/§13, first match wins, same three
+  detectors as the branch table):** every `refs/remotes/*` ref except
+  `<remote>/HEAD` (a structural name-suffix match, regardless of symref
+  status) and the ref the base branch tracks classifies `stale-remote`
+  (merged into base, on the base's OWN remote — blocks; fix: `fetch
+  --prune`, re-verify, `push --delete`, then `branch -dr` as a fallback if
+  the delete is refused, then the local branch's own delete if one tracks
+  it and is itself stale), `stale-remote-foreign` (merged into base, on
+  any OTHER remote, or when no base remote is determinable — allows with
+  an informational `systemMessage`, never blocks: the operator has no
+  standing to delete another remote's branch), `unknown` (any git call
+  fails, including a ref pointing at a missing object), or `active-remote`
+  (none of the above). An atomically-failing batched enumeration (one bad
+  object blacks out the whole `for-each-ref refs/remotes` call) falls back
+  to a reduced-format `for-each-ref` (refname+objectname only) plus
+  per-ref `rev-parse --verify`, isolating the bad ref instead of hiding
+  every sibling. Never fetches; a server-side delete not yet locally
+  pruned still shows stale until `fetch --prune` runs.
 - **Deadline:** a 20-second internal wall-clock budget from hook start,
   checked between steps and enforced again via a per-call `timeout` on
   every individual git subprocess (sized to whatever budget remains when
@@ -363,7 +399,15 @@ removed rather than kept as an unexercised fallback:
   is the contributor's own fork; and a linked worktree that is itself
   mid-rebase/mid-cherry-pick gets no special treatment (that allowance is
   primary-worktree-only) and still falls to the ordinary
-  linked-detached-HEAD `unknown` row.
+  linked-detached-HEAD `unknown` row. Additionally (spec §8/§15): a
+  misidentified base remote now shapes the stale-remote/foreign split
+  rather than just a wrong base branch; `refs/heads`'s own atomically-
+  failing `for-each-ref` has no fallback (only `refs/remotes` got one); and
+  the active-worktree carve-out's own accepted gaps — a stray untracked
+  file keeps a worktree "active" forever (condition (a), no decay,
+  operator-named as expected), and a genuinely quiet, clean, behind/merged
+  worktree becoming stale-eligible after the quiet window elapses is this
+  feature's intended terminal behavior, not a defect.
 
 ### model-routing-guards.state.js / .unicode.js / .log.js / .exempt.js
 Shared plumbing used by the guards above, not hooks in their own right:
