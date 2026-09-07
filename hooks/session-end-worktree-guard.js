@@ -54,10 +54,15 @@
 //         (i)   linked worktrees -- eligible if not primary, not
 //               ancestor/descendant/equal to cwd (realpath, case-folded),
 //               clean, no in-progress marker, not locked, no index.lock,
-//               AND (owned by this session OR idle >= 60 min by BOTH the
-//               gitdir entry's own mtime AND its logs/HEAD reflog's last
-//               timestamp -- never index mtime). `git worktree remove`,
-//               no --force. Skipped entirely when degraded.
+//               its own HEAD commit is reachable (an ancestor of base, or
+//               -- for a worktree on a branch, never a detached one --
+//               that branch's own tree-equality/cherry evidence, applied
+//               REGARDLESS of ownership; a data-loss defect this design
+//               originally shipped with -- see PR review), AND (owned by
+//               this session OR idle >= 60 min by BOTH the gitdir entry's
+//               own mtime AND its logs/HEAD reflog's last timestamp --
+//               never index mtime). `git worktree remove`, no --force.
+//               Skipped entirely when degraded.
 //         (ii)  local branches with no attached worktree: ancestor
 //               evidence -> `git branch -d` unconditionally; tree-equality
 //               or cherry evidence -> `git branch -D`, gated on owned OR
@@ -332,7 +337,16 @@ function parseReflogLastTimestampMs(content) {
   const lines = content.split(/\r?\n/).filter((l) => l.trim() !== "");
   if (lines.length === 0) return null;
   const last = lines[lines.length - 1];
-  const m = /\s(\d{10,})\s+[+-]\d{4}\t/.exec(last);
+  // The trailing `\t<message>` is OPTIONAL: a bare `git worktree add
+  // --detach` writes a single reflog line with no message at all (verified
+  // empirically -- "...T <a@b.c> 1788813443 -0500" with nothing after the
+  // timezone offset, no tab). Requiring a literal tab here (as this
+  // function originally did) silently treated every fresh detached
+  // worktree's reflog as unparseable, which fed straight into the D4(i)
+  // idle check reading "reflog absent" -- fail-toward-not-idle is still
+  // the safe direction there, but the fix belongs in the parser, not in
+  // papering over it at the call site.
+  const m = /\s(\d{10,})\s+[+-]\d{4}(?:\t|$)/.exec(last);
   if (!m) return null;
   return parseInt(m[1], 10) * 1000;
 }
@@ -393,6 +407,53 @@ function classifyBranchForHeal(branch, base, execGit, cwd, budget) {
 
   if (branch.trackRaw === "[gone]") return { evidence: "gone-upstream" };
   return { evidence: null };
+}
+
+/**
+ * D4(i) reachability gate (fixes a data-loss defect: the eligibility check
+ * previously never looked at a worktree's actual commit content at all --
+ * an owned-or-idle, clean, detached-HEAD worktree sitting on a unique,
+ * never-pushed commit was removable purely on cleanliness/idleness,
+ * silently dropping that commit). Applies to EVERY linked worktree,
+ * regardless of ownership -- ownership only ever substitutes for the
+ * idle-time requirement elsewhere in D4(i), never for this check.
+ *
+ * `rec.head` (the worktree's own checked-out commit, always present in
+ * `git worktree list --porcelain` output whether the worktree is on a
+ * branch or detached) is tested via `git merge-base --is-ancestor HEAD
+ * base.tip`. If that alone doesn't hold and the worktree IS on a branch,
+ * that branch's own tree-equality or cherry evidence (the exact same
+ * squash/rebase-merged detectors D4(ii) uses) may substitute -- content
+ * that's provably already integrated into base by a different commit is
+ * just as safe to discard as a direct ancestor. A DETACHED worktree gets
+ * no such substitute: with no branch to look up tree/cherry evidence
+ * against, only the direct ancestor check on its own HEAD commit
+ * qualifies.
+ *
+ * Returns `{ reachable: true }` or `{ reachable: false, evidence:
+ * "detached_unreachable" | "unreachable" }`. A git-call failure fails
+ * CLOSED (not reachable) -- an unresolvable commit is never treated as
+ * provably safe.
+ */
+function computeWorktreeReachability(rec, base, branches, execGit, cwd, budget) {
+  if (typeof rec.head !== "string" || rec.head === "") {
+    return { reachable: false, evidence: "detached_unreachable" };
+  }
+
+  const anc = isAncestor(execGit, cwd, budget, rec.head, base.tip);
+  if (!anc.failure && anc.result) return { reachable: true };
+
+  if (rec.branch) {
+    const name = shortBranchName(rec.branch);
+    const branchEntry = branches.find((b) => b.name === name);
+    if (branchEntry) {
+      const ev = classifyBranchForHeal(branchEntry, base, execGit, cwd, budget);
+      if (ev.evidence === "tree-equality" || ev.evidence === "cherry") return { reachable: true };
+    }
+    return { reachable: false, evidence: "unreachable" };
+  }
+
+  return { reachable: false, evidence: "detached_unreachable" };
 }
 
 // ─── Attribution (D3) ───────────────────────────────────────────────────
@@ -664,6 +725,21 @@ function evaluateSessionEnd(targetDir, deps) {
       }
     }
 
+    // Reachability gate: applies regardless of ownership (unlike the
+    // owned-or-idle check above, ownership never substitutes for this).
+    // A worktree whose own HEAD commit is not provably already integrated
+    // into base is never removed, whether it's on a branch with genuine
+    // unmerged work or sitting at a detached HEAD with no branch at all to
+    // even evaluate.
+    let reachabilityEvidence = null;
+    if (!skipReason) {
+      const reach = computeWorktreeReachability(rec, base, branches, execGit, targetDir, budget);
+      if (!reach.reachable) {
+        skipReason = reach.evidence;
+        reachabilityEvidence = reach.evidence;
+      }
+    }
+
     // Dirty check runs last, immediately before removal (see comment
     // above) -- this is the ONLY check that can still fire after every
     // other eligibility gate has already passed.
@@ -828,6 +904,7 @@ module.exports = {
   isAncestor,
   cherryAllApplied,
   classifyBranchForHeal,
+  computeWorktreeReachability,
   collectOwnedAgentIds,
   harnessAgentId,
   isOwnedByThisSession,

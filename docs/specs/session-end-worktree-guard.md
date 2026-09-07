@@ -137,6 +137,24 @@ skipping index 0 (primary). Eligible if ALL of:
   every linked candidate);
 - not `locked` (the porcelain `locked` line) and no `index.lock` file
   under its own git dir;
+- **reachable, checked REGARDLESS of ownership** (fixes a data-loss defect
+  found in PR review of the first version of this guard — ownership
+  substitutes for the idle-time requirement below, but never for this
+  check): its own `HEAD` commit (`git worktree list --porcelain`'s own
+  `HEAD` line — always present, on a branch or detached alike) is an
+  ancestor of `base.tip` (`git merge-base --is-ancestor`). If that alone
+  doesn't hold and the worktree is checked out ON A BRANCH (never a
+  detached one), that branch's own tree-equality or `git cherry` evidence
+  — the identical squash/rebase-merged detectors D4(ii) uses — may
+  substitute; content provably already integrated into base by a
+  different commit is exactly as safe to discard as a direct ancestor. A
+  **detached** worktree gets no such substitute — with no branch to look
+  up tree/cherry evidence against, only the direct ancestor check on its
+  own `HEAD` qualifies. Failing this check logs `skipped:unreachable`
+  (worktree on a branch) or `skipped:detached_unreachable` (detached, or
+  `HEAD` itself unresolvable) to `yields.log`, and a matching
+  `session_end_unhealed` line with that same `evidence` value — never
+  removed, no exception for ownership or idle time;
 - EITHER owned by this session (D3) OR idle ≥ 60 minutes by **both** the
   worktree's own git-dir directory's mtime AND its `logs/HEAD` reflog's
   last recorded timestamp — never index mtime (the same self-refresh trap
@@ -226,6 +244,40 @@ still protects `STATE_DIR` for every other guard's state.
   behavior, §5's block output contract, §6's Stop registration) are struck
   as no longer describing shipped behavior.
 
+### D9. Tests
+
+`hooks/session-end-worktree-guard.test.js`, real temp git repos, mirroring
+the predecessor's own test-infrastructure conventions:
+
+- Heal (D4(i)/(ii)/(iii)): owned worktree removed without an age gate;
+  unowned fresh worktree skipped; unowned idle-61-min worktree removed;
+  dirty worktree skipped even when owned; worktree containing cwd skipped
+  and never reported unhealed; ancestor branch deleted via `-d`
+  unconditionally; tree-equality branch deleted via `-D` when owned, no
+  age gate; tree-equality branch skipped when unowned and the tip is too
+  recent; a `[gone]` upstream track alone never deletes; degraded (base
+  fetch fails) runs only the `-d` ancestor path, both `-D` and worktree
+  removal skipped; heal cap enforced (`skipped:cap`); budget exhaustion
+  enforced (`skipped:budget`); `yields.log` rotation at 1 MB; exit 0 in
+  every case including a git failure.
+- Reachability gate (added after PR review — see §5's accepted-gaps
+  bullet): a detached worktree with a unique, never-pushed commit —
+  clean, idle 65 minutes, unowned — is skipped and logged
+  `session_end_unhealed` with evidence `detached_unreachable`, never
+  removed (the exact reviewer repro this rule closes); a detached
+  worktree whose `HEAD` equals `base.tip`, clean, idle, IS removed (the
+  trivial self-ancestor case); an OWNED detached worktree with an
+  unreachable commit is still skipped — ownership never substitutes for
+  this check.
+- Ported/adapted classifier unit tests: `resolveTargetDir`,
+  `normalizePathForCompare`, `pathsRelated`, `classifyScope`,
+  `resolveBaseBranch`, `parseWorktreePorcelain`, `findInProgressMarker`,
+  `classifyBranchForHeal`, `harnessAgentId`/`isOwnedByThisSession`.
+- `test/install-guards.test.js`: `isLegacy` recognition, `mergeGuardHooks`
+  prunes the old `stop-stale-worktrees-guard.js` Stop entry on both
+  install and `--uninstall`, no `GUARDS`/`LEGACY_GUARD_FILES` name
+  collision, and a full CLI round-trip against a temp settings.json.
+
 ## 4. Re-triage: every §8 gap of `stop-stale-worktrees-guard.md`
 
 Categories: **block-risk-only** (existed because the old guard could
@@ -285,6 +337,28 @@ unchanged since the underlying classifier logic is unchanged).
   as accepted, not closed — the same "no git-visible in-use signal"
   limitation the predecessor spec's §8 B4 already carried, now with real
   teeth (this guard can act on it) instead of merely blocking.
+- **A detached-HEAD linked worktree is never auto-removed unless its own
+  commit is reachable.** The predecessor guard's classifier had its own
+  answer for this shape — `unknown → block`, no fix offered, forcing a
+  human/agent to look at it — because blocking was cheap: the worst case
+  was an annoying re-block, never data loss. This guard cannot fall back
+  on blocking, so D4(i)'s reachability check (added after PR review found
+  the first version of this design removed a detached worktree sitting on
+  a unique, never-pushed commit purely because it was clean and idle)
+  logs `session_end_unhealed` with evidence `detached_unreachable` instead
+  and leaves the worktree in place. This is a strictly safer outcome than
+  the predecessor's block (nothing is lost either way), but it also means
+  a genuinely abandoned detached worktree with no reachable content sits
+  forever, accumulating no automatic remediation beyond the log line —
+  the predecessor's block at least forced a human decision point every
+  turn; this guard's log line is easy to never read.
+- **This guard honors `MODEL_ROUTING_STATE_DIR`.** `STATE_DIR` (and
+  therefore `YIELDS_LOG_PATH`'s default, and `agent-tier-ledger.js`'s own
+  ledger file paths D3 reads) is imported from
+  `model-routing-guards.state.js`, whose own `STATE_DIR` constant already
+  honors this env var when set (test-only override, see that module's own
+  header comment) — this guard adds no separate override of its own,
+  it simply inherits the one that module already provides.
 
 ## 6. Blind spots
 

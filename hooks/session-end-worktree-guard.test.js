@@ -17,10 +17,36 @@ const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
+// MODEL_ROUTING_STATE_DIR (model-routing-guards.state.js's own test-only
+// override, spec docs/specs/routing-scorecard.md §2.1 "Test isolation")
+// MUST be set before that module (or anything requiring it -- the hook
+// itself, agent-tier-ledger.js) is first required: STATE_DIR is a
+// module-level constant computed once at require time. Redirecting it to
+// a fresh temp dir here means every ledger file this test file's
+// in-process `evaluateSessionEnd()` calls read/write (D3 attribution) --
+// and the hook's own yields.log default, though every test below also
+// passes its own explicit `yieldsLogPath` -- lands under an isolated
+// directory instead of this repo's own real `hooks/state`, with no manual
+// per-test ledger cleanup required.
+const STATE_DIR_OVERRIDE = fs.mkdtempSync(path.join(os.tmpdir(), "seg-state-dir-"));
+process.env.MODEL_ROUTING_STATE_DIR = STATE_DIR_OVERRIDE;
+process.on("exit", () => {
+  try {
+    fs.rmSync(STATE_DIR_OVERRIDE, { recursive: true, force: true });
+  } catch (_) {
+    // best-effort
+  }
+});
+
 const HOOK_PATH = path.join(__dirname, "session-end-worktree-guard.js");
 const guard = require(HOOK_PATH);
 const ledger = require(path.join(__dirname, "agent-tier-ledger.js"));
 const state = require(path.join(__dirname, "model-routing-guards.state.js"));
+
+// Sanity check: the override above must actually have taken effect on
+// every module that reads STATE_DIR, or D3 attribution tests below would
+// silently read/write the real hooks/state directory instead.
+assert.equal(state.STATE_DIR, STATE_DIR_OVERRIDE, "MODEL_ROUTING_STATE_DIR override did not take effect on model-routing-guards.state.js");
 
 const {
   evaluateSessionEnd,
@@ -31,6 +57,7 @@ const {
   resolveBaseBranch,
   parseWorktreePorcelain,
   classifyBranchForHeal,
+  computeWorktreeReachability,
   findInProgressMarker,
   isOwnedByThisSession,
   harnessAgentId,
@@ -119,7 +146,17 @@ function backdateReflog(gitDir, secondsAgo) {
   } catch (_) {
     return;
   }
-  content = content.replace(/\d{10,}(?=\s[+-]\d{4}\t)/g, String(oldTs));
+  // The trailing `\t<message>` is OPTIONAL -- a bare `git worktree add
+  // --detach` writes a reflog line with no message at all (no tab), unlike
+  // a branched checkout's two-line reflog whose second entry always has
+  // one (see parseReflogLastTimestampMs's own matching fix in the hook
+  // itself). Requiring a lookahead tab here silently no-ops on a detached
+  // worktree's reflog, leaving its timestamp fresh instead of backdated.
+  // This regex has no `/m` flag, so a bare `$` only matches the end of the
+  // WHOLE (multi-line, trailing-newline-terminated) file content, never
+  // the end of an individual line -- `\r?\n` must be spelled out
+  // explicitly in the lookahead alongside it.
+  content = content.replace(/\d{10,}(?=\s[+-]\d{4}(?:\t|\r?\n|$))/g, String(oldTs));
   fs.writeFileSync(reflogPath, content);
 }
 
@@ -245,6 +282,91 @@ test("unowned idle 61 min worktree removed", () => {
 
   assert.equal(summary.healed, 1);
   assert.equal(fs.existsSync(wtPath), false);
+});
+
+// ─── Reachability gate (PR review fix: eligibility never looked at a
+// worktree's actual commit content -- an owned-or-idle, clean, detached-
+// HEAD worktree sitting on a unique, never-pushed commit was removable
+// purely on cleanliness/idleness, silently dropping that commit) ────────
+
+test("reviewer repro: detached worktree, unique never-pushed commit, clean, idle 65min, unowned -> skipped, logged detached_unreachable", () => {
+  const { dir } = initRepoWithOrigin("main");
+  registerCleanupDir(dir);
+  const sessionId = uniqueSession("detached-unreachable");
+
+  const wtPath = path.join(dir, "..", `seg-wt-${Date.now()}`);
+  git(dir, ["worktree", "add", "--detach", wtPath, "main"]);
+  registerCleanupDir(wtPath);
+  writeAndCommit(wtPath, "unique.txt", "unique, never-pushed content\n", "unique unpushed commit");
+
+  const gitDir = worktreeGitDir(wtPath);
+  backdateReflog(gitDir, 65 * 60);
+  backdateDirMtime(gitDir, 65 * 60);
+
+  const yieldsLogPath = freshYieldsLogPath();
+  const summary = evaluateSessionEnd(dir, { sessionIdRaw: sessionId, yieldsLogPath });
+
+  assert.equal(summary.healed, 0);
+  assert.equal(fs.existsSync(wtPath), true, "the worktree -- and its unreachable commit -- must survive");
+  const lines = readYieldsLog(yieldsLogPath);
+  assert.ok(lines.some((l) => l.event === "prune" && l.target === toGitPath(wtPath) && l.outcome === "skipped:detached_unreachable"));
+  assert.ok(
+    lines.some((l) => l.event === "session_end_unhealed" && l.target === toGitPath(wtPath) && l.evidence === "detached_unreachable")
+  );
+});
+
+test("detached worktree whose HEAD equals base tip, clean, idle -> removed", () => {
+  const { dir } = initRepoWithOrigin("main");
+  registerCleanupDir(dir);
+  const sessionId = uniqueSession("detached-at-base-tip");
+
+  const wtPath = path.join(dir, "..", `seg-wt-${Date.now()}`);
+  git(dir, ["worktree", "add", "--detach", wtPath, "main"]);
+  registerCleanupDir(wtPath);
+  // No new commit -- HEAD is exactly base's own tip (the trivial
+  // self-ancestor case: `merge-base --is-ancestor X X` always succeeds).
+
+  const gitDir = worktreeGitDir(wtPath);
+  backdateReflog(gitDir, 65 * 60);
+  backdateDirMtime(gitDir, 65 * 60);
+
+  const yieldsLogPath = freshYieldsLogPath();
+  const summary = evaluateSessionEnd(dir, { sessionIdRaw: sessionId, yieldsLogPath });
+
+  assert.equal(summary.healed, 1);
+  assert.equal(fs.existsSync(wtPath), false);
+});
+
+test("ownership never substitutes for reachability: an OWNED worktree on a branch with unreachable content is still skipped", () => {
+  // Ownership (D3) is strictly branch-name-based -- a worktree checked
+  // out on `worktree-agent-<id>` where `<id>` is in this session's own
+  // ledger. A literally DETACHED worktree can therefore never be "owned"
+  // under this design at all (rec.branch is null, so the ownership
+  // lookup is never even attempted -- see session-end-worktree-guard.js's
+  // D4(i) loop). This test instead exercises the realistic edge case that
+  // actually matters: an OWNED, BRANCHED worktree whose content is
+  // genuinely unreachable (active, unmerged work) must still never be
+  // removed just because it's owned -- the reachability gate in
+  // computeWorktreeReachability() applies unconditionally, before the
+  // owned-or-idle check ever gets a say.
+  const { dir } = initRepoWithOrigin("main");
+  registerCleanupDir(dir);
+  const sessionId = uniqueSession("owned-unreachable");
+  registerOwnedAgent(sessionId, "ab12ef");
+
+  const wtPath = path.join(dir, "..", `seg-wt-${Date.now()}`);
+  git(dir, ["worktree", "add", "-b", "worktree-agent-ab12ef", wtPath, "main"]);
+  registerCleanupDir(wtPath);
+  writeAndCommit(wtPath, "unrelated-active.txt", "genuinely unmerged, unrelated content\n", "active unmerged commit");
+
+  const yieldsLogPath = freshYieldsLogPath();
+  const summary = evaluateSessionEnd(dir, { sessionIdRaw: sessionId, yieldsLogPath });
+
+  assert.equal(summary.healed, 0);
+  assert.equal(fs.existsSync(wtPath), true, "owned but unreachable content must survive");
+  const lines = readYieldsLog(yieldsLogPath);
+  assert.ok(lines.some((l) => l.event === "prune" && l.target === toGitPath(wtPath) && l.outcome === "skipped:unreachable"));
+  assert.ok(lines.some((l) => l.event === "session_end_unhealed" && l.target === toGitPath(wtPath) && l.evidence === "unreachable"));
 });
 
 test("dirty worktree skipped even when owned", () => {
@@ -639,4 +761,53 @@ test("resolveBaseBranch: falls back to local main with no remote configured", ()
   const result = resolveBaseBranch(dir, guard.defaultExecGit, budget);
   assert.equal(result.ok, true);
   assert.equal(result.base.name, "main");
+});
+
+test("computeWorktreeReachability: detached HEAD with no commits ahead of base is reachable (self-ancestor)", () => {
+  const dir = initRepo("main");
+  registerCleanupDir(dir);
+  const baseTip = git(dir, ["rev-parse", "HEAD"]);
+  const base = { name: "main", tip: baseTip, treeSet: new Set() };
+  const budget = guard.makeBudget(() => 0, 20000);
+  const rec = { worktree: dir, head: baseTip, branch: null };
+  const result = computeWorktreeReachability(rec, base, [], guard.defaultExecGit, dir, budget);
+  assert.equal(result.reachable, true);
+});
+
+test("computeWorktreeReachability: detached HEAD ahead of base with no branch to substitute is detached_unreachable", () => {
+  const dir = initRepo("main");
+  registerCleanupDir(dir);
+  const baseTip = git(dir, ["rev-parse", "HEAD"]);
+  const aheadTip = writeAndCommit(dir, "ahead.txt", "ahead\n", "ahead of base");
+  const base = { name: "main", tip: baseTip, treeSet: new Set() };
+  const budget = guard.makeBudget(() => 0, 20000);
+  const rec = { worktree: dir, head: aheadTip, branch: null };
+  const result = computeWorktreeReachability(rec, base, [], guard.defaultExecGit, dir, budget);
+  assert.equal(result.reachable, false);
+  assert.equal(result.evidence, "detached_unreachable");
+});
+
+test("computeWorktreeReachability: branched HEAD not itself an ancestor, but tree-equality evidence substitutes", () => {
+  const dir = initRepo("main");
+  registerCleanupDir(dir);
+  git(dir, ["checkout", "-q", "-b", "feature-tree-eq"]);
+  const featureTip = writeAndCommit(dir, "feature.txt", "feature content\n", "feature commit");
+  git(dir, ["checkout", "-q", "main"]);
+  git(dir, ["merge", "-q", "--squash", "feature-tree-eq"]);
+  const baseTip = git(dir, ["commit", "-q", "-m", "squash merge feature"]) || git(dir, ["rev-parse", "HEAD"]);
+  const resolvedBaseTip = git(dir, ["rev-parse", "HEAD"]);
+  const treeSetRaw = git(dir, ["log", "--max-count=500", "--format=%T", resolvedBaseTip]);
+  const base = { name: "main", tip: resolvedBaseTip, treeSet: new Set(treeSetRaw.split(/\r?\n/).filter(Boolean)) };
+  const budget = guard.makeBudget(() => 0, 20000);
+  const branches = [
+    {
+      name: "feature-tree-eq",
+      tip: featureTip,
+      tree: git(dir, ["rev-parse", `${featureTip}^{tree}`]),
+      trackRaw: "",
+    },
+  ];
+  const rec = { worktree: dir, head: featureTip, branch: "refs/heads/feature-tree-eq" };
+  const result = computeWorktreeReachability(rec, base, branches, guard.defaultExecGit, dir, budget);
+  assert.equal(result.reachable, true);
 });
