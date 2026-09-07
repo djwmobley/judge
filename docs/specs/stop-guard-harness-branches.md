@@ -1,3 +1,15 @@
+> **SUPERSEDED.** `stop-stale-worktrees-guard.js` moved from a blocking
+> `Stop` hook to a non-blocking, once-per-session `SessionEnd` hook
+> (`session-end-worktree-guard.js`) — owner decision, see
+> `docs/specs/session-end-worktree-guard.md`. The `harness_managed`
+> classification, its once-per-session reporting state, and its (never-
+> enabled) self-heal proposal are all deleted; the new guard heals
+> worktree-agent branches directly under its own ownership/idle rules
+> (`docs/specs/session-end-worktree-guard.md` D3/D4) rather than exempting
+> them from blocking. Only the `^worktree-agent-[0-9a-f]+$` branch-name
+> regex this file introduced survives, repurposed for ownership rather
+> than exemption. Kept here as a historical record.
+
 # Spec: `harness_managed` branch classification for `stop-stale-worktrees-guard.js`
 
 *Owner-approved design (D1-D3 below). Follows the conventions of

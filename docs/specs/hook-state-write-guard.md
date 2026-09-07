@@ -250,6 +250,17 @@ token.
 
 ## 3. Layer 2 — tamper evidence (`stop-stale-worktrees-guard.js`)
 
+> **SUPERSEDED.** `stop-stale-worktrees-guard.js` moved from a blocking
+> `Stop` hook to a non-blocking `SessionEnd` hook
+> (`session-end-worktree-guard.js`), deleting the per-session strike state
+> this layer signed entirely — see `docs/specs/session-end-worktree-guard.md`.
+> Nothing in this section describes shipped behavior anymore. Layer 1 (§2
+> above) is UNCHANGED and still in force, protecting every other guard's
+> state under `STATE_DIR` — including `session-end-worktree-guard.js`'s own
+> plain, unsigned `yields.log` (see the new spec's accepted gaps: that log
+> carries no tamper evidence of its own, by design, since nothing reads it
+> back to make a decision).
+
 Layer 1 covers every write path this repo's hook framework can observe.
 Layer 2 assumes Layer 1 was bypassed or doesn't apply (§6) and makes the
 resulting forgery detectable rather than silently authoritative.

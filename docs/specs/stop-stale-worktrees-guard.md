@@ -1,11 +1,32 @@
-# judge — `stop-stale-worktrees-guard.js`
+# judge — stale-worktree/branch classifier (retitled; see event-change note)
+
+> **RETITLED, EVENT CHANGED.** This file originally specified
+> `stop-stale-worktrees-guard.js`, a blocking `Stop` hook. That guard was
+> renamed to `session-end-worktree-guard.js` and moved to a non-blocking,
+> once-per-session `SessionEnd` hook — owner decision, see
+> `docs/specs/session-end-worktree-guard.md`, which is now the
+> authoritative behavior spec (registration, I/O contract, heal/no-block
+> design). **This file now documents ONLY the underlying classifier** —
+> the ancestor/tree-equality/cherry/gone-upstream evidence kinds, worktree
+> porcelain parsing, `resolveTargetDir`'s waterfall, `resolveBaseBranch`'s
+> waterfall, and the 20-second budget mechanism — all of which the new
+> guard ported and still uses. **§4 (bypass and loop behavior), §5's
+> block/allow output contract, and §6's `Stop` registration are STRUCK
+> below** — none of them describe shipped behavior; they're kept, marked,
+> for the historical record of the two adversary rounds' worth of
+> reasoning that shaped the classifier itself. §13's remote-tracking-ref
+> classification (`stale-remote`/`stale-remote-foreign`) was DELETED
+> outright in the new guard, not carried forward — see the new spec's
+> re-triage table for why.
 
 **Audience:** a fresh Claude Code session in this repo, authoring from this
 spec. Follows the numbering/conventions of
 `docs/specs/pr2-agent-model-routing-guard.md`. Read `hooks/no-punt-guard.js`
 first — the only other `Stop`-event guard here, and the direct template for
 this guard's stdin-parse / stdout-decision shape (its 3-strike loop pattern
-is explicitly NOT followed here — see §4).
+is explicitly NOT followed here — see §4). **(Historical: `no-punt-guard.js`
+is still a real `Stop` guard; this file's OWN subject is not, anymore —
+see the event-change note above.)**
 
 *Revised after adversary round 1 (`.git/tmp/pr3-adversary-r1.md`, 17
 findings — see §10), adversary round 2 (`.git/tmp/pr3-adversary-r2.md`,
@@ -358,7 +379,7 @@ the exact fix-command sequence, the `stale-remote-foreign` reporting
 mechanics, the no-network consequence, and three-way grouping with a
 linked worktree are specified in full in §13.
 
-## 4. Bypass and loop behavior
+## 4. Bypass and loop behavior — **STRUCK, does not describe shipped behavior (see event-change note at top)**
 
 **Reversed by owner ruling, PR "stop guard bounded re-block."** Two live
 incidents (19 identical blocks in one session; 10 blocks across 3 clusters
@@ -415,7 +436,7 @@ permanently disabling the only escape valve — there is no escape valve to
 disable). **C3** (`stop_hook_active` gating ambiguity) is also resolved:
 §5 states explicitly that the field is logged, never branched on.
 
-## 5. I/O contract
+## 5. I/O contract — **STRUCK, does not describe shipped behavior (see event-change note at top)**
 
 **Stdin:** `session_id` (informational/diagnostic only — not used for any
 loop key, since there is no loop state), `stop_hook_active` (informational
@@ -479,7 +500,7 @@ watcher, not a session-start snapshot — an edit to
 invocation without restarting the session (relevant to anyone iterating on
 this guard's implementation).
 
-## 6. Install and files touched
+## 6. Install and files touched — **STRUCK, does not describe shipped behavior; see `docs/specs/session-end-worktree-guard.md` D1 for the current registration**
 
 - `hooks/stop-stale-worktrees-guard.js` + `.test.js` (new).
 - `scripts/install-guards.js`: one new `GUARDS` entry, including the
