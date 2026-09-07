@@ -68,4 +68,7 @@ modules carry no owner paths (roots come from `os.tmpdir()` /
 `os.homedir()` / `hooks/lib/local-policy.js`) and no model names (tier
 language only). Only `agent-model-routing-guard.js` — the Agent-dispatch
 tier-routing guard itself — waits for PR 2, where it becomes policy-driven
-instead of hardcoded. PR 3 adds the judge docket protocol.
+instead of hardcoded. PR 3 adds the judge docket protocol. A later PR adds
+`stop-stale-worktrees-guard.js`, a `Stop`-event guard that blocks the
+session from ending while the repo has a stale linked worktree or a stale
+local branch (see `hooks/README.md`'s section on it).
