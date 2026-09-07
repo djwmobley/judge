@@ -69,7 +69,30 @@ const { resolveExemptTypes } = require("./model-routing-guards.exempt.js");
 const { createLogger } = require("./model-routing-guards.log.js");
 const { loadLocalPolicy, foldModelTierToken } = require("./lib/local-policy.js");
 const ledger = require("./agent-tier-ledger.js");
-const decisions = require("./model-routing-guards.decisions.js");
+
+// docs/specs/routing-scorecard.md §2.1 — the decisions module is loaded
+// defensively: install drift, a syntax error, or any other throw during
+// require() must never crash this guard before its own top-level catch can
+// run. On failure, fall back to no-op stand-ins with the same call shape
+// used throughout this file, so every appendDecision/appendCrashRecord/
+// hashTarget call site below needs no extra guarding for THIS failure mode
+// (a missing or corrupted module) — only the top-level catch's own
+// appendCrashRecord call additionally wraps itself, for the separate
+// failure mode of a loaded-but-still-throwing appendCrashRecord (see that
+// call site below). A decisions-module failure can never change this
+// guard's exit code or stdout/stderr on any path, crash path included.
+let decisions;
+try {
+  decisions = require("./model-routing-guards.decisions.js");
+} catch (_) {
+  decisions = {
+    appendDecision: function () {},
+    appendCrashRecord: function () {},
+    hashTarget: function () {
+      return null;
+    },
+  };
+}
 
 const appendDebug = createLogger("agent-model-routing-guard");
 
@@ -642,8 +665,19 @@ if (require.main === module) {
       process.stderr.write("agent-model-routing-guard: BLOCKED — internal error during classification — treat as block.\n");
     } catch (_) {}
     // §2.1 R1 — best-effort session recovery from the raw stdin captured
-    // before main() ran.
-    decisions.appendCrashRecord(rawStdinBuffer, "agent-model-routing-guard", GUARD_VERSION);
+    // before main() ran. The real appendCrashRecord already swallows its
+    // own errors, but this call site wraps it again anyway: a corrupted/
+    // replaced decisions module (install drift) might not honor that
+    // contract, and this is the last line of defense before process.exit —
+    // nothing downstream can catch a throw here. Either way the guard's
+    // own exit code (2, unchanged from before this spec) is decided
+    // independently below, never by whether this call throws.
+    try {
+      decisions.appendCrashRecord(rawStdinBuffer, "agent-model-routing-guard", GUARD_VERSION);
+    } catch (_) {
+      // See comment above — a decisions-module failure here must never
+      // change this guard's exit code or output.
+    }
     process.exit(2);
   }
 }
