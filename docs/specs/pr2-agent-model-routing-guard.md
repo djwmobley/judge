@@ -274,16 +274,22 @@ item (§2).
   `tool_response`: the spawned agent's id and display name. From top
   level: `session_id`. The resolved tier (via `model_tiers`) is stored
   alongside the raw model literal, never in place of it.
-- **REQUIRED VERIFICATION STEP for the author.** The exact field path of
-  the agent id inside the `Agent` tool's `PostToolUse` `tool_response` is
-  unverified as of this spec. Before wiring capture, the author must
-  register the hook, run one real dispatch, capture the raw payload to the
-  debug log, and document the confirmed field path in this spec and in
-  `hooks/README.md`. If the id field is absent from the observed payload,
-  capture logs a warning once per process and records nothing for that
-  dispatch; a `SendMessage` naming that recipient then falls to the
-  "unknown recipient" branch below, same as if no `Agent` dispatch had
-  ever been captured.
+- **REQUIRED VERIFICATION STEP for the author — DONE (2026-09-06).** The
+  exact field path of the agent id was unverified as of this spec; PR 2
+  shipped both a `PostToolUse` `tool_response`-based fallback chain and a
+  `SubagentStart` top-level-field path pending that verification. A live
+  session with the ledger shims installed at user scope ran 6 `Agent`
+  dispatches: the state file received exactly 6 "id" records (one per
+  dispatch, `tool_use_id` + `agent_id` populated), the debug log showed
+  the `SubagentStart` handler's payload-keys line once and zero
+  `ledger_capture_unresolved` lines. Since `appendIdRecord` never dedupes
+  (every call unconditionally appends), a 6-not-12 record count proves the
+  `PostToolUse` fallback chain never fired its append branch. Confirmed
+  field path: `SubagentStart`'s top-level `agent_id` + `tool_use_id` —
+  no `tool_response` involved. The `PostToolUse` registration and its
+  fallback chain were removed as dead weight rather than kept as an
+  unexercised fallback; see `hooks/README.md`'s "Capture verified"
+  section for the removed pieces.
 - **Record shape — metadata only (amended by the coordinator after D3).** A
   ledger record carries exactly: agent id, display name, raw model
   literal, resolved tier, `subagent_type`, `description`, `session_id`, an
@@ -611,7 +617,9 @@ wording as-is.
       new key with placeholder (non-real) values only.
 - [ ] `scripts/install-guards.js` `GUARDS` array has 11 entries; the guard
       port wired `PreToolUse` / `Agent|SendMessage`, the ledger capture
-      wired `PostToolUse` / `Agent` (owner decision D3).
+      wired `PostToolUse` / `Agent` (owner decision D3). **Superseded
+      2026-09-06:** the `PostToolUse` / `Agent` registration was verified
+      unused and removed (see §4) — the array now has 10 entries.
 - [ ] `hooks/README.md` has a new guard section (and a ledger subsection
       or section, per where capture ends up living).
 - [ ] `npm test` reports the expected new total (692 + 52 + 14 + 8 = 766,
@@ -626,9 +634,10 @@ wording as-is.
 - [ ] REPORT CAP / PLAN-ONLY exactly-once bare-standalone-line rule (D2,
       fence- and blockquote-aware) covered by tests, including the
       ambiguous-match finding codes.
-- [ ] Per-agent tier ledger (D3, amended) implemented: capture, storage,
-      lookup, the confirmed `tool_response` agent-id field path
-      documented, the record shape holds only metadata (no prompt/message
+- [x] Per-agent tier ledger (D3, amended) implemented: capture, storage,
+      lookup, the confirmed agent-id field path documented (2026-09-06:
+      `SubagentStart` top-level `agent_id` + `tool_use_id`, not
+      `tool_response` — see §4), the record shape holds only metadata (no prompt/message
       bodies), and all 14 ledger test names (§4, §5) passing.
 - [ ] Adversary pass ran and is cited (findings + spec fix, or "none
       found") before any code was written.
@@ -665,6 +674,13 @@ wording as-is.
 - This revision does not verify the exact `tool_response` field path for
   the spawned agent id — §4's ledger subsection states this as a REQUIRED
   VERIFICATION STEP for the author, not something this spec confirms.
+  **Resolved 2026-09-06** (see §4): the verified path is `SubagentStart`'s
+  top-level `agent_id` + `tool_use_id`, not `tool_response` at all; the
+  `PostToolUse` fallback chain this bullet originally flagged was removed.
+  Unverified by that follow-up work: `PostToolUse` behavior for a
+  foreground/synchronous dispatch (the 6-dispatch session that verified
+  this used whatever dispatch mode was in effect there, not an exhaustive
+  sweep of dispatch modes) and behavior under other harness versions.
 - The ledger's `rules_version` tag is recorded but never re-checked
   against the *current* `model_tiers` at lookup time: if the operator
   edits `local-policy.json` to remap a model literal to a different tier

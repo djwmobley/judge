@@ -80,20 +80,19 @@ const GUARDS = [
     event: 'PreToolUse',
     matcher: 'Agent|SendMessage',
   },
-  // Second and third registrations of the SAME guard logic, at different
-  // hook events, for the per-agent tier ledger (owner decision D3). Each
-  // gets its own on-disk filename (thin shims requiring the shared
-  // agent-model-routing-guard.js module) rather than a second/third GUARDS
-  // entry pointed at the identical file — isOurs() below identifies an
-  // installed entry purely by which guard *file* its command runs, so two
+  // Second registration of the SAME guard logic, at a different hook
+  // event, for the per-agent tier ledger (owner decision D3). Gets its own
+  // on-disk filename (a thin shim requiring the shared
+  // agent-model-routing-guard.js module) rather than a second GUARDS entry
+  // pointed at the identical file — isOurs() below identifies an installed
+  // entry purely by which guard *file* its command runs, so two
   // registrations sharing one filename could never be told apart on
-  // re-install (see the shim files' own header comments).
-  {
-    id: 'agent-model-routing-guard-ledger',
-    file: 'agent-model-routing-guard-posttooluse.js',
-    event: 'PostToolUse',
-    matcher: 'Agent',
-  },
+  // re-install (see the shim file's own header comment). A third
+  // registration, `agent-model-routing-guard-posttooluse.js` on
+  // PostToolUse/Agent, existed through PR 2 as an unverified id-capture
+  // fallback; live verification on 2026-09-06 showed it never contributed
+  // a captured id (see hooks/README.md's "Capture verified" section), so
+  // it was removed rather than kept as dead weight.
   {
     id: 'agent-model-routing-guard-subagent-start',
     file: 'agent-model-routing-guard-subagentstart.js',

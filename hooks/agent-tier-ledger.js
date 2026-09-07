@@ -14,15 +14,28 @@
 //     everything the guard already validated from `tool_input`: the raw
 //     model literal, the resolved tier, subagent_type, description, and
 //     the top-level session_id.
-//   - An "id" record is appended at PostToolUse (or, best-effort, from a
-//     SubagentStart handler — see agent-model-routing-guard.js), once the
-//     spawned agent's id (and, if available, display name) is known from
-//     `tool_response`. `rules_version` is computed here too — the guard's
-//     own version constant plus a hash of the local-policy file's bytes AT
-//     THIS MOMENT (PostToolUse), a distinct read from whatever PreToolUse
-//     read enforced the dispatch itself (owner decision A3; the narrow gap
-//     this opens is documented in the PR description and hooks/README.md,
-//     not closed by this file).
+//   - An "id" record is appended from the SubagentStart handler (see
+//     agent-model-routing-guard.js's handleSubagentStart), once the
+//     spawned agent's id is known from the event's top-level `agent_id`
+//     field. `rules_version` is computed here too — the guard's own
+//     version constant plus a hash of the local-policy file's bytes AT
+//     THIS MOMENT (SubagentStart), a distinct read from whatever
+//     PreToolUse read enforced the dispatch itself (owner decision A3;
+//     the narrow gap this opens is documented in the PR description and
+//     hooks/README.md, not closed by this file).
+//   - A PostToolUse (Agent) registration also existed through PR 2,
+//     carrying a `tool_response`-based fallback id-resolution chain for
+//     the case where the field path above turned out not to work. Live
+//     verification on 2026-09-06 (6/6 dispatches in one session) showed
+//     SubagentStart's top-level `agent_id` + `tool_use_id` resolving
+//     every single dispatch, with zero PostToolUse-sourced "id" records
+//     and zero `ledger_capture_unresolved` debug lines — proof (given
+//     `appendIdRecord` below never dedupes; see its own comment) that the
+//     PostToolUse path never fired the append branch in that session.
+//     Since resolving the spawned agent's id was the PostToolUse
+//     registration's only job, it was removed as dead weight rather than
+//     kept as an unused fallback — see hooks/README.md's "Capture
+//     verified" section for the removed pieces.
 // A reader joins the two record kinds on tool_use_id into the 9-field
 // metadata-only shape the spec requires (agent id, display name, raw model
 // literal, resolved tier, subagent_type, description, session_id,
@@ -57,8 +70,6 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 // narrower than this window is an accepted, documented limitation, not
 // something this file closes.
 const SWEEP_MIN_AGE_MS = 60 * 1000;
-
-const AGENT_ID_FROM_TEXT_RE = /\bagentId:\s*([a-z0-9]{8,})/i;
 
 // ─── Session key / path helpers ──────────────────────────────────────────
 
@@ -141,8 +152,14 @@ function appendPendingRecord(sessionKey, fields) {
 }
 
 /**
- * PostToolUse (or SubagentStart, best-effort) capture — joins onto the
- * pending record with the same tool_use_id once the reader runs.
+ * SubagentStart (best-effort) capture — joins onto the pending record
+ * with the same tool_use_id once the reader runs. Always appends
+ * unconditionally (no read-before-write, no skip-if-a-record-for-this-
+ * tool_use_id-already-exists check) — a second call for the same
+ * tool_use_id adds a second line rather than being suppressed; the
+ * reader's last-line-wins reduction (buildJoinedRecordsByAgentId, below)
+ * is what makes a later append for the same id supersede an earlier one,
+ * not this function refusing to write.
  */
 function appendIdRecord(sessionKey, fields) {
   sweepStaleLedgers();
@@ -156,40 +173,12 @@ function appendIdRecord(sessionKey, fields) {
   });
 }
 
-// ─── Resolving the agent id / display name from an unverified payload ────
-// The exact field path of the spawned agent's id inside the Agent tool's
-// PostToolUse `tool_response` is UNVERIFIED as of this PR (see
-// hooks/README.md's "Capture verification pending" section). Tried, in
-// order: `tool_response.agentId`, `.agent_id`, `.id`, then — for a string
-// response, or any `content`/`text`/`result` string field — the regex
-// /\bagentId:\s*([a-z0-9]{8,})/i.
-
-function resolveAgentIdFromToolResponse(toolResponse) {
-  if (toolResponse && typeof toolResponse === "object" && !Array.isArray(toolResponse)) {
-    if (typeof toolResponse.agentId === "string" && toolResponse.agentId !== "") {
-      return { agentId: toolResponse.agentId, source: "agentId" };
-    }
-    if (typeof toolResponse.agent_id === "string" && toolResponse.agent_id !== "") {
-      return { agentId: toolResponse.agent_id, source: "agent_id" };
-    }
-    if (typeof toolResponse.id === "string" && toolResponse.id !== "") {
-      return { agentId: toolResponse.id, source: "id" };
-    }
-    for (const field of ["content", "text", "result"]) {
-      const val = toolResponse[field];
-      if (typeof val === "string") {
-        const m = AGENT_ID_FROM_TEXT_RE.exec(val);
-        if (m) return { agentId: m[1], source: `regex:${field}` };
-      }
-    }
-    return null;
-  }
-  if (typeof toolResponse === "string") {
-    const m = AGENT_ID_FROM_TEXT_RE.exec(toolResponse);
-    if (m) return { agentId: m[1], source: "regex:string" };
-  }
-  return null;
-}
+// ─── Resolving the display name from a SubagentStart payload ─────────────
+// The spawned agent's id comes from the SubagentStart event's top-level
+// `agent_id` field (verified 2026-09-06 — see hooks/README.md's "Capture
+// verified" section); this helper covers the separate, still-optional
+// display-name lookup used to resolve a SendMessage `to` against a name
+// rather than a raw id.
 
 function resolveDisplayNameFromToolResponse(toolResponse) {
   if (!toolResponse || typeof toolResponse !== "object" || Array.isArray(toolResponse)) return null;
@@ -197,21 +186,6 @@ function resolveDisplayNameFromToolResponse(toolResponse) {
     if (typeof toolResponse[field] === "string" && toolResponse[field] !== "") return toolResponse[field];
   }
   return null;
-}
-
-/** Top-level keys of `value`, for the "record nothing, log once" debug line. */
-function topLevelKeys(value) {
-  if (value && typeof value === "object" && !Array.isArray(value)) return Object.keys(value);
-  if (Array.isArray(value)) return ["(array)"];
-  return [];
-}
-
-function summarizeUnresolved(toolResponse) {
-  const asString = typeof toolResponse === "string" ? toolResponse : JSON.stringify(toolResponse);
-  return {
-    top_level_keys: topLevelKeys(toolResponse),
-    first_300_chars: typeof asString === "string" ? asString.slice(0, 300) : null,
-  };
 }
 
 // ─── "Once per session" markers (capture debug logging) ───────────────────
@@ -378,9 +352,7 @@ module.exports = {
   computeRulesVersion,
   appendPendingRecord,
   appendIdRecord,
-  resolveAgentIdFromToolResponse,
   resolveDisplayNameFromToolResponse,
-  summarizeUnresolved,
   markOnceAndCheck,
   readAllRecords,
   buildJoinedRecordsByAgentId,

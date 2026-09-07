@@ -114,9 +114,33 @@ function cleanupLedgerSession(sessionId) {
   }
 }
 
+/** A SubagentStart payload shaped like the one confirmed live on
+ * 2026-09-06 (hooks/README.md's "Capture verified" section): the observed
+ * top-level keys, plus `tool_use_id` — necessarily present in the real
+ * payload too, since capture (which needs it) succeeded 6/6 times that
+ * session — and an optional `name` for tests that look a recipient up by
+ * display name. Deliberately carries no `tool_response` field: the
+ * verified path never looks at one. */
+function subagentStartPayload(sessionId, toolUseId, agentId, extra) {
+  return Object.assign(
+    {
+      hook_event_name: "SubagentStart",
+      session_id: sessionId,
+      transcript_path: "C:\\fake\\transcript.jsonl",
+      cwd: "C:\\fake\\cwd",
+      scratchpad_dir: "C:\\fake\\scratchpad",
+      prompt_id: `prompt-${Math.random().toString(36).slice(2)}`,
+      agent_id: agentId,
+      agent_type: "general-purpose",
+      tool_use_id: toolUseId,
+    },
+    extra || {}
+  );
+}
+
 /** Allowed Agent dispatch (drafting tier, cap line only) that captures a
- * pending ledger record, then a matching PostToolUse capture — returns the
- * agentId used so the caller can look it up / SendMessage to it. */
+ * pending ledger record, then a matching SubagentStart capture — returns
+ * the agentId used so the caller can look it up / SendMessage to it. */
 function captureAgent(sessionId, { tier, toolUseId, name, subagentType } = {}) {
   const modelByTier = { planning: PLANNING_MODEL, drafting: DRAFTING_MODEL, mechanical: MECHANICAL_MODEL };
   const model = modelByTier[tier || "drafting"];
@@ -131,15 +155,8 @@ function captureAgent(sessionId, { tier, toolUseId, name, subagentType } = {}) {
   );
   assert.equal(pre.code, 0, `expected capture setup dispatch to allow; stderr: ${pre.stderr}`);
 
-  const post = runHook({
-    hook_event_name: "PostToolUse",
-    tool_name: "Agent",
-    tool_input: preInput,
-    tool_response: { agentId, name: name || null },
-    session_id: sessionId,
-    tool_use_id: tu,
-  });
-  assert.equal(post.code, 0, "PostToolUse capture must never block");
+  const post = runHook(subagentStartPayload(sessionId, tu, agentId, { name: name || null }));
+  assert.equal(post.code, 0, "SubagentStart capture must never block");
   return { agentId, toolUseId: tu, tier: tier || "drafting", model };
 }
 
@@ -736,7 +753,7 @@ test("capture_records_agent_id_and_tier", () => {
   }
 });
 
-test("capture_missing_tool_response_id_records_nothing", () => {
+test("capture_missing_agent_id_records_nothing", () => {
   const session = uniqueSession("ledger-noid");
   try {
     const tu = `tu-${Math.random().toString(36).slice(2)}`;
@@ -744,17 +761,64 @@ test("capture_missing_tool_response_id_records_nothing", () => {
       agentPayload({ model: DRAFTING_MODEL, prompt: "Do it.\nREPORT CAP: 50 words" }, { session_id: session, tool_use_id: tu, hook_event_name: "PreToolUse" })
     );
     assert.equal(pre.code, 0);
-    const post = runHook({
-      hook_event_name: "PostToolUse",
-      tool_name: "Agent",
-      tool_input: {},
-      tool_response: { unrelated_field: "no id here" },
-      session_id: session,
-      tool_use_id: tu,
-    });
+    // SubagentStart payload missing agent_id entirely — capture must not
+    // block and must not synthesize a recipient from nothing.
+    const post = runHook(
+      subagentStartPayload(session, tu, undefined, { agent_id: undefined, unrelated_field: "no id here" })
+    );
     assert.equal(post.code, 0);
     const c = ledger.classifyRecipient("some-name-nobody-used");
     assert.equal(c.kind, "unknown");
+  } finally {
+    cleanupLedgerSession(session);
+  }
+});
+
+test("capture_missing_tool_use_id_records_nothing", () => {
+  const session = uniqueSession("ledger-notoolid");
+  try {
+    // SubagentStart payload missing tool_use_id — agent_id alone is not
+    // enough to join to the pending record, so capture must record
+    // nothing (never guesses at a join key).
+    const post = runHook(
+      subagentStartPayload(session, undefined, `agent-${Math.random().toString(36).slice(2)}`, { tool_use_id: undefined })
+    );
+    assert.equal(post.code, 0);
+    const c = ledger.classifyRecipient("some-other-name-nobody-used");
+    assert.equal(c.kind, "unknown");
+  } finally {
+    cleanupLedgerSession(session);
+  }
+});
+
+test("subagentstart_capture_verified_shape: top-level agent_id + tool_use_id, no tool_response involved", () => {
+  // Regression guard for the 2026-09-06 live verification (hooks/README.md
+  // "Capture verified"): a payload shaped exactly like the confirmed real
+  // one — the observed top-level keys plus tool_use_id, and NO
+  // tool_response field at all — must still resolve a recipient. This
+  // pins the verified field path so a future change can't silently
+  // reintroduce a dependency on a tool_response wrapper.
+  const session = uniqueSession("ledger-verified-shape");
+  const tu = `tu-${Math.random().toString(36).slice(2)}`;
+  const agentId = `agent-${Math.random().toString(36).slice(2)}`;
+  try {
+    const pre = runHook(
+      agentPayload(
+        { model: DRAFTING_MODEL, prompt: "Do it.\nREPORT CAP: 50 words" },
+        { session_id: session, tool_use_id: tu, hook_event_name: "PreToolUse" }
+      )
+    );
+    assert.equal(pre.code, 0);
+
+    const payload = subagentStartPayload(session, tu, agentId);
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, "tool_response"), false);
+
+    const post = runHook(payload);
+    assert.equal(post.code, 0, "SubagentStart capture must never block");
+
+    const c = ledger.classifyRecipient(agentId);
+    assert.equal(c.kind, "resolved");
+    assert.equal(c.tier, "drafting");
   } finally {
     cleanupLedgerSession(session);
   }
