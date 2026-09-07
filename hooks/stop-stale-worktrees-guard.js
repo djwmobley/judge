@@ -89,6 +89,14 @@ const RULES_VERSION = "stop-stale-worktrees-guard:1";
 const INTERNAL_DEADLINE_MS = 20000;
 const REASON_ITEM_CAP = 40;
 
+// `harness_managed` branch classification (spec docs/specs/stop-guard-
+// harness-branches.md §2). Exact-matched against today's Agent tool
+// worktree-isolation naming convention only -- see that spec's §6 "Regex
+// may miss future harness naming" blind spot for why this is deliberately
+// narrow rather than a looser pattern.
+const HARNESS_BRANCH_RE = /^worktree-agent-[0-9a-f]+$/;
+const HARNESS_MANAGED_DISPLAY_CAP = 20;
+
 // Field separator for `for-each-ref`/`log` format strings -- a control
 // character that can never legitimately appear in a ref name, commit hash,
 // or tree hash, so splitting on it is always unambiguous (safer than a
@@ -955,7 +963,7 @@ function classifyWorktrees(records, branchResultsByName, execGit, targetDir, bud
 
       findings.push({
         kind: "worktree", role: "linked", path: rec.worktree, class: "stale",
-        evidence: `branch-${evidence}`, fixLines, coveredBranch: name,
+        evidence: `branch-${evidence}`, fixLines, coveredBranch: name, tip: branchRes.tip,
       });
       return;
     }
@@ -1058,6 +1066,13 @@ function itemsForFindings(findings) {
     kind: f.class === "unknown" ? "unknown" : f.kind,
     rawIdentity: f.path || f.name || f.refname || "",
     line: formatFinding(f),
+    // Content discriminator (spec docs/specs/stop-guard-harness-branches.md
+    // §4's table): only ever set on a `branch` finding, a `worktree` finding
+    // covering a branch (same tip as that branch), or a `remote` finding --
+    // left `undefined` (and therefore absent once state is JSON-serialized)
+    // for every other kind, per that table's "none -- name-only identity"
+    // rows.
+    tip: f.tip,
   }));
 }
 
@@ -1079,6 +1094,19 @@ function blockUnknown(label, detail) {
 
 function blockDeadline(classified, notReached) {
   return { action: "block", reason: buildDeadlineReason(classified, notReached), items: itemsForDeadline(classified, notReached) };
+}
+
+/**
+ * Attaches this invocation's observed `harness_managed` branch names (spec
+ * docs/specs/stop-guard-harness-branches.md §2/§3) to a result object built
+ * by one of the block* helpers or an inline allow/allow-message literal.
+ * Mutates and returns `result` -- every call site passes a freshly built
+ * object, never a shared one. `harnessManagedSet`: a `Set` of short branch
+ * names; stored sorted for a stable, deterministic display/log order.
+ */
+function withHarnessManaged(result, harnessManagedSet) {
+  result.harnessManaged = Array.from(harnessManagedSet).sort();
+  return result;
 }
 
 // ─── Top-level evaluation (spec §2-§4, single entry point) ────────────────
@@ -1162,6 +1190,15 @@ function evaluateStop(targetDir, deps) {
     if (activity.active) activeInfoByBranchName.set(shortBranchName(rec.branch), activity.reason);
   }
 
+  // `harness_managed` row 0.5 (spec docs/specs/stop-guard-harness-branches.md
+  // §2): the branch currently checked out in the PRIMARY worktree is exempt
+  // from this override (R1) regardless of its own classification -- a bare
+  // primary or a detached-HEAD primary has no checked-out branch at all, so
+  // nothing is exempted by this rule in either of those cases.
+  const primaryRec = records[0];
+  const primaryBranchName = primaryRec && !primaryRec.bare && primaryRec.branch ? shortBranchName(primaryRec.branch) : null;
+  const harnessManagedSet = new Set();
+
   const branchResultsByName = new Map();
   for (const br of branches) {
     if (budget.remaining() <= 0) {
@@ -1170,13 +1207,24 @@ function evaluateStop(targetDir, deps) {
     }
     let result = classifyBranch(br, base, execGit, targetDir, budget);
     if (result.class === "stale" && activeInfoByBranchName.has(br.name)) {
+      // Row 0: active-worktree override wins even over a harness-managed
+      // name -- checked first, before the harness-managed test below.
       result = { class: "active", row: 9, viaWorktreeActivity: true, wouldHaveBeenEvidence: result.evidence, activityReason: activeInfoByBranchName.get(br.name) };
+    } else if (result.class === "stale" && br.name !== primaryBranchName && HARNESS_BRANCH_RE.test(br.name)) {
+      // Row 0.5: only reclassifies a branch that would otherwise BLOCK
+      // (result.class === "stale", R2) and that is not the primary
+      // worktree's current HEAD (R1). Never blocks, never accrues strikes
+      // (excluded from itemsForFindings below the same way active/
+      // active-remote/stale-remote-foreign/excluded already are).
+      harnessManagedSet.add(br.name);
+      result = { class: "harness_managed", row: "0.5" };
     }
+    result.tip = br.tip;
     branchResultsByName.set(br.name, result);
     classified.push({ kind: "branch", id: br.name, class: result.class });
   }
   if (notReached.length > 0) {
-    return blockDeadline(classified, notReached);
+    return withHarnessManaged(blockDeadline(classified, notReached), harnessManagedSet);
   }
 
   // ── Remote-tracking refs (spec §3 "Remote-tracking branches", §13) ──
@@ -1187,9 +1235,12 @@ function evaluateStop(targetDir, deps) {
 
   const remoteEnumRes = listRemoteRefs(execGit, targetDir, budget);
   if (!remoteEnumRes.ok) {
-    return remoteEnumRes.deadlineExpired
-      ? blockDeadline(classified, [{ kind: "step", id: "remote-list" }])
-      : blockUnknown("remote-list-failed", remoteEnumRes.message || "git for-each-ref refs/remotes and its reduced-format for-each-ref fallback both failed");
+    return withHarnessManaged(
+      remoteEnumRes.deadlineExpired
+        ? blockDeadline(classified, [{ kind: "step", id: "remote-list" }])
+        : blockUnknown("remote-list-failed", remoteEnumRes.message || "git for-each-ref refs/remotes and its reduced-format for-each-ref fallback both failed"),
+      harnessManagedSet
+    );
   }
   classified.push({ kind: "step", id: "remote-list", class: `${remoteEnumRes.refs.length} ref(s)${remoteEnumRes.usedFallback ? " (via fallback)" : ""}` });
 
@@ -1205,9 +1256,12 @@ function evaluateStop(targetDir, deps) {
 
     const remotesListRes = gitCall(execGit, ["remote"], targetDir, budget);
     if (!remotesListRes.ok) {
-      return callFailed(remotesListRes)
-        ? blockDeadline(classified, [{ kind: "step", id: "remote-names" }])
-        : blockUnknown("remote-names-failed", remotesListRes.message || "git remote failed");
+      return withHarnessManaged(
+        callFailed(remotesListRes)
+          ? blockDeadline(classified, [{ kind: "step", id: "remote-names" }])
+          : blockUnknown("remote-names-failed", remotesListRes.message || "git remote failed"),
+        harnessManagedSet
+      );
     }
     const remoteNames = remotesListRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
     classified.push({ kind: "step", id: "remote-names", class: `${remoteNames.length} remote(s)` });
@@ -1219,7 +1273,7 @@ function evaluateStop(targetDir, deps) {
         continue;
       }
       const result = classifyRemoteRef(ref, base, baseRemoteName, remoteNames, excludedRefName, execGit, targetDir, budget);
-      remoteResults.push(Object.assign({ refname: ref.refname, shortName: ref.shortName }, result));
+      remoteResults.push(Object.assign({ refname: ref.refname, shortName: ref.shortName, tip: ref.tip }, result));
       classified.push({ kind: "remote", id: ref.shortName, class: result.class });
     }
     for (const u of remoteUnknownFromEnum) {
@@ -1228,7 +1282,7 @@ function evaluateStop(targetDir, deps) {
       classified.push({ kind: "remote", id: shortName, class: "unknown" });
     }
     if (remoteNotReached.length > 0) {
-      return blockDeadline(classified, remoteNotReached);
+      return withHarnessManaged(blockDeadline(classified, remoteNotReached), harnessManagedSet);
     }
   }
 
@@ -1245,7 +1299,7 @@ function evaluateStop(targetDir, deps) {
   }
 
   if (budget.remaining() <= 0) {
-    return blockDeadline(classified, [{ kind: "step", id: "worktree-classification" }]);
+    return withHarnessManaged(blockDeadline(classified, [{ kind: "step", id: "worktree-classification" }]), harnessManagedSet);
   }
 
   const wtOutcome = classifyWorktrees(records, branchResultsByName, execGit, targetDir, budget, fsx, remoteByTrackingBranchName, baseRemoteName);
@@ -1285,7 +1339,7 @@ function evaluateStop(targetDir, deps) {
     }
     parts.push(...branchFix);
 
-    branchFindings.push({ kind: "branch", name, class: "stale", evidence, fixLines: parts });
+    branchFindings.push({ kind: "branch", name, class: "stale", evidence, fixLines: parts, tip: res.tip });
   }
 
   // ── Standalone remote-tracking-ref findings and foreign-remote messages
@@ -1323,7 +1377,7 @@ function evaluateStop(targetDir, deps) {
     if (trackingResult && trackingResult.class === "active") {
       note = `tracking local branch ${trackingBranchName} is active and untouched (§9 open question 2 lean)`;
     }
-    remoteFindings.push({ kind: "remote", refname: r.shortName, class: "stale-remote", evidence: r.evidence, fixLines, note });
+    remoteFindings.push({ kind: "remote", refname: r.shortName, class: "stale-remote", evidence: r.evidence, fixLines, note, tip: r.tip });
   }
 
   const allFindings = [...wtOutcome.findings, ...branchFindings, ...remoteFindings];
@@ -1333,11 +1387,11 @@ function evaluateStop(targetDir, deps) {
     if (wtOutcome.inProgressMessage) messages.push(wtOutcome.inProgressMessage);
     if (wtOutcome.activeMessages && wtOutcome.activeMessages.length) messages.push(...wtOutcome.activeMessages);
     if (foreignMessages.length) messages.push(...foreignMessages);
-    if (messages.length) return { action: "allow-message", message: messages.join("\n") };
-    return { action: "allow" };
+    if (messages.length) return withHarnessManaged({ action: "allow-message", message: messages.join("\n") }, harnessManagedSet);
+    return withHarnessManaged({ action: "allow" }, harnessManagedSet);
   }
 
-  return blockFindings(allFindings);
+  return withHarnessManaged(blockFindings(allFindings), harnessManagedSet);
 }
 
 // ─── Bounded re-block (spec docs/specs/stop-guard-bounded-reblock.md) ─────
@@ -1465,12 +1519,44 @@ function canonicalizeItems(items) {
 }
 
 /**
- * HMAC-SHA256 over `sessionKey + "\n" + canonical(items)` (spec §3.2/A5).
- * Binding the session key closes cross-session replay of a legitimately-
- * produced `items` blob copied into a different session's state filename.
+ * Canonical JSON of the `harness_managed_reported` array (spec
+ * docs/specs/stop-guard-harness-branches.md §3's "HMAC coverage,
+ * versioned"): sort then `JSON.stringify`. Non-array input is treated as
+ * `[]`, keeping this function total.
+ */
+function canonicalizeHarnessManaged(names) {
+  const arr = Array.isArray(names) ? names.slice() : [];
+  arr.sort();
+  return JSON.stringify(arr);
+}
+
+/**
+ * HMAC-SHA256 over `sessionKey + "\n" + canonical(items)` -- the LEGACY
+ * (pre-v2, no `v` field) MAC input, spec `hook-state-write-guard.md` §3.2/A5
+ * unchanged. Binding the session key closes cross-session replay of a
+ * legitimately-produced `items` blob copied into a different session's
+ * state filename. Retained verbatim (name and signature) so a pre-this-
+ * revision state file's `mac` can still be verified during migration (spec
+ * docs/specs/stop-guard-harness-branches.md §3, R4).
  */
 function computeMac(keyBytes, sessionKey, items) {
   const macInput = String(sessionKey) + "\n" + canonicalizeItems(items);
+  return crypto.createHmac("sha256", keyBytes).update(macInput, "utf8").digest("hex");
+}
+
+/**
+ * HMAC-SHA256 over `"2" + "\n" + sessionKey + "\n" + canonical(items) +
+ * "\n" + canonical(harness_managed_reported)` -- the v2 MAC input (spec
+ * docs/specs/stop-guard-harness-branches.md §3, R4). The leading version
+ * literal keeps a v2 input from ever colliding with the legacy 2-part input
+ * for the same `items`/`sessionKey` pair.
+ */
+function computeMacV2(keyBytes, sessionKey, items, harnessManagedReported) {
+  const macInput =
+    "2" + "\n" +
+    String(sessionKey) + "\n" +
+    canonicalizeItems(items) + "\n" +
+    canonicalizeHarnessManaged(harnessManagedReported);
   return crypto.createHmac("sha256", keyBytes).update(macInput, "utf8").digest("hex");
 }
 
@@ -1485,13 +1571,27 @@ function computeMac(keyBytes, sessionKey, items) {
  * `verifyCtx` (optional -- when omitted, no MAC verification runs, kept
  * for callers that only need the raw shape-checked object): `{ keyBytes,
  * sessionKey, sessionIdRaw, yieldLogPath, now, fs }`. When supplied and the
- * file parses/shape-checks, the state is additionally required to carry a
- * `mac` field that verifies against `computeMac(keyBytes, sessionKey,
- * items)` -- spec §3.3. A missing `mac` field (pre-this-change state
- * files, spec §3.3's explicit backward-compat case), a mismatched `mac`,
- * or an unavailable `keyBytes` (spec §3.1's fail-closed case) are all
- * treated identically: reset to `{ items: {} }` and one
- * `{"event":"tamper",...}` line appended to `yieldLogPath`.
+ * file parses/shape-checks, this is a TOTAL classification of every state
+ * file on disk (spec docs/specs/stop-guard-harness-branches.md §3, R4):
+ *
+ *   - No `v` field at all (every state file written before that spec):
+ *     LEGACY. Verified against `computeMac` (the original two-part input).
+ *     A verifying legacy file migrates SILENTLY in memory -- `v: 2` is set,
+ *     `harness_managed_reported` defaults to `[]` if absent -- with no
+ *     tamper line appended (a verifying legacy file is a normal format
+ *     transition, not tampering). A non-verifying legacy file is tamper,
+ *     exactly like a non-verifying v2 file (legacy status only changes
+ *     which input is checked, never whether a failure counts as tamper).
+ *   - `v: 2`: verified against `computeMacV2` (the four-part input,
+ *     covering `items` AND `harness_managed_reported` together).
+ *   - Any other declared `v` (a schema version this code doesn't know how
+ *     to read): tamper-equivalent reset, `reason: "unknown_schema_version"`
+ *     recorded in the appended log line alongside the declared `v`.
+ *
+ * Every tamper path (missing/mismatched `mac`, unavailable `keyBytes`, or
+ * an unrecognized `v`) resets to `{ items: {} }` (implicitly clearing
+ * `harness_managed_reported` and every item's `yielded`/`yielded_tip` too)
+ * and appends one `{"event":"tamper",...}` line to `yieldLogPath`.
  */
 function readReblockState(fsx, statePath, verifyCtx) {
   let obj;
@@ -1510,22 +1610,50 @@ function readReblockState(fsx, statePath, verifyCtx) {
   if (!verifyCtx) return obj;
 
   const { keyBytes, sessionKey, sessionIdRaw, yieldLogPath, now, fs: logFs } = verifyCtx;
-  let macOk = false;
-  if (keyBytes) {
-    const expected = computeMac(keyBytes, sessionKey, obj.items);
-    macOk = typeof obj.mac === "string" && obj.mac === expected;
-  }
-  if (macOk) return obj;
 
-  if (yieldLogPath) {
-    const nowMs = typeof now === "function" ? now() : Date.now();
-    appendYieldLogLine(logFs || fsx, yieldLogPath, {
-      event: "tamper",
-      session: sessionIdRaw !== undefined && sessionIdRaw !== null ? sessionIdRaw : sessionKey,
-      ts: new Date(nowMs).toISOString(),
-    });
+  function tamper(reason, declaredV) {
+    if (yieldLogPath) {
+      const nowMs = typeof now === "function" ? now() : Date.now();
+      const line = {
+        event: "tamper",
+        session: sessionIdRaw !== undefined && sessionIdRaw !== null ? sessionIdRaw : sessionKey,
+        ts: new Date(nowMs).toISOString(),
+      };
+      if (reason) line.reason = reason;
+      if (declaredV !== undefined) line.v = declaredV;
+      appendYieldLogLine(logFs || fsx, yieldLogPath, line);
+    }
+    return { items: {} };
   }
-  return { items: {} };
+
+  const declaredV = obj.v;
+
+  if (declaredV === undefined) {
+    // Legacy (pre-v2): verify against the original two-part input.
+    let macOk = false;
+    if (keyBytes) {
+      const expected = computeMac(keyBytes, sessionKey, obj.items);
+      macOk = typeof obj.mac === "string" && obj.mac === expected;
+    }
+    if (!macOk) return tamper();
+    const migrated = Object.assign({}, obj, { v: 2 });
+    if (!Array.isArray(migrated.harness_managed_reported)) migrated.harness_managed_reported = [];
+    return migrated;
+  }
+
+  if (declaredV === 2) {
+    let macOk = false;
+    if (keyBytes) {
+      const expected = computeMacV2(keyBytes, sessionKey, obj.items, obj.harness_managed_reported);
+      macOk = typeof obj.mac === "string" && obj.mac === expected;
+    }
+    if (!macOk) return tamper();
+    if (!Array.isArray(obj.harness_managed_reported)) obj.harness_managed_reported = [];
+    return obj;
+  }
+
+  // Unrecognized version -- tamper-equivalent reset (spec R4, item 5).
+  return tamper("unknown_schema_version", declaredV);
 }
 
 /**
@@ -1581,14 +1709,50 @@ function defaultReblockFs() {
 }
 
 /**
- * Single entry point for the bounded-reblock layer (spec §3's decision
- * procedure, verbatim). `baseResult` is exactly what `evaluateStop`
- * returned. `stdinInfo` = `{ session_id, stop_hook_active }` as read from
- * the Stop hook's own stdin JSON. `deps` (all optional, for test
- * injection): `{ stateDir, yieldLogPath, now, fs }`.
+ * Formats the §3 informational line for the current invocation's observed
+ * `harness_managed` branches (spec docs/specs/stop-guard-harness-branches.md
+ * §3). `names`: this invocation's own observed set (not the session's full
+ * historical union) -- displayed in full up to the 20-name display cap; the
+ * durable yields.log record (§3, R5) separately carries the FULL, uncapped,
+ * ever-reported union regardless of what this function displays.
+ */
+function formatHarnessManagedLine(names) {
+  const capped = names.slice(0, HARNESS_MANAGED_DISPLAY_CAP);
+  let list = capped.join(", ");
+  if (names.length > HARNESS_MANAGED_DISPLAY_CAP) {
+    list += `, ...and ${names.length - HARNESS_MANAGED_DISPLAY_CAP} more`;
+  }
+  return `harness-managed branches present (${names.length}, informational only, never blocked): ${list}`;
+}
+
+/**
+ * Single entry point for the bounded-reblock layer (spec `stop-guard-
+ * bounded-reblock.md` §3's decision procedure) AND, additively, the
+ * `harness_managed` once-per-session-then-growth-only reporting layer (spec
+ * `stop-guard-harness-branches.md` §3) and the yield-once/tip-drift rules
+ * (§4) -- these are two independent axes sharing one state file (§4's
+ * "Interaction with §3's harness-managed reporting").
+ *
+ * `baseResult` is exactly what `evaluateStop` returned -- `action`, and for
+ * a "block" outcome, `reason`/`items`; every outcome may also carry
+ * `harnessManaged` (a possibly-empty array of this invocation's observed
+ * `harness_managed` branch short names). `stdinInfo` = `{ session_id,
+ * stop_hook_active }` as read from the Stop hook's own stdin JSON. `deps`
+ * (all optional, for test injection): `{ stateDir, yieldLogPath, now, fs }`.
+ *
+ * This layer only engages at all when there is something for it to do: a
+ * "block" outcome (strike accounting always applies) OR a non-"block"
+ * outcome that observed at least one harness-managed branch this
+ * invocation. Otherwise `baseResult` passes straight through untouched --
+ * the identical fast path this function has always had for a clean allow.
  */
 function applyBoundedReblock(baseResult, stdinInfo, deps) {
-  if (!baseResult || baseResult.action !== "block") return baseResult;
+  if (!baseResult) return baseResult;
+  const harnessManagedNames = Array.isArray(baseResult.harnessManaged)
+    ? Array.from(new Set(baseResult.harnessManaged)).sort()
+    : [];
+  const isBlockAction = baseResult.action === "block";
+  if (!isBlockAction && harnessManagedNames.length === 0) return baseResult;
 
   deps = deps || {};
   const stateDir = deps.stateDir || STATE_DIR;
@@ -1637,14 +1801,22 @@ function applyBoundedReblock(baseResult, stdinInfo, deps) {
 
   const sessionIdRaw = stdinInfo && stdinInfo.session_id;
   if (isBlankSessionId(sessionIdRaw)) {
-    return {
-      action: "block",
-      reason:
-        baseResult.reason +
-        "\n\n[stop-guard-bounded-reblock] session_id missing or malformed on stdin: bounded re-block " +
-        "tracking disabled for this invocation (fail-closed). Every block behaves as an unconditional " +
-        "block until a valid session_id is present.",
-    };
+    if (isBlockAction) {
+      return {
+        action: "block",
+        reason:
+          baseResult.reason +
+          "\n\n[stop-guard-bounded-reblock] session_id missing or malformed on stdin: bounded re-block " +
+          "tracking disabled for this invocation (fail-closed). Every block behaves as an unconditional " +
+          "block until a valid session_id is present.",
+      };
+    }
+    // Harness-managed-only invocation: nothing to session-scope the
+    // "reported" set against, so the informational line is skipped this
+    // invocation rather than either firing unconditionally (which would
+    // defeat the once-per-session/growth-only rule) or forcing a block
+    // (which would violate "harness_managed never blocks", spec §2).
+    return baseResult;
   }
 
   const sessionKey = sanitizeForFilename(sessionIdRaw);
@@ -1673,95 +1845,210 @@ function applyBoundedReblock(baseResult, stdinInfo, deps) {
   state.stop_hook_active_last = stdinInfo.stop_hook_active === true;
   if (!state.created_at) state.created_at = nowIso;
   state.updated_at = nowIso;
+  state.v = 2;
   if (!state.items || typeof state.items !== "object") state.items = {};
+  if (!Array.isArray(state.harness_managed_reported)) state.harness_managed_reported = [];
 
-  // Partition on the PRE-increment strike count -- this is what makes "3
-  // identical blocks then a yield" land exactly on the 4th invocation: an
-  // item already at the cap (from a PRIOR invocation) is high-strike and
-  // gets no further increment (it's already exhausted, nothing more to
-  // count); an item still under the cap is low-strike, blocks THIS
-  // invocation too, and is the one that gets incremented -- even when that
-  // increment lands it exactly on the cap (its 3rd block), since the cap
-  // check that turns it into a yield only applies starting the NEXT time
-  // it's seen.
   const lowStrike = [];
-  const highStrike = [];
-  for (const item of baseResult.items) {
-    const key = computeItemKey(item.kind, item.rawIdentity);
-    const existing = state.items[key];
-    const existingStrikes = existing && typeof existing.strikes === "number" ? existing.strikes : 0;
-    if (existingStrikes >= REBLOCK_STRIKE_CAP) {
-      highStrike.push({ item, key, strikes: existingStrikes });
-      continue; // already exhausted from a prior invocation -- no further increment.
+  let newlyYielded = [];
+  let alreadyYielded = [];
+  let highStrikeCount = 0;
+
+  if (isBlockAction) {
+    // Tip-drift reset (spec `stop-guard-harness-branches.md` §4, R3), run
+    // BEFORE the strike partition below, for every item whose stored entry
+    // already carries `yielded: true` and a non-null `yielded_tip`: if this
+    // invocation's own content discriminator (`item.tip`, present for
+    // branch/covered-worktree/remote items only) differs from the stored
+    // value, the item's entire history is discarded -- it re-enters the
+    // partition below as if brand new.
+    for (const item of baseResult.items) {
+      const key = computeItemKey(item.kind, item.rawIdentity);
+      const existing = state.items[key];
+      if (
+        existing &&
+        existing.yielded === true &&
+        existing.yielded_tip !== undefined &&
+        existing.yielded_tip !== null &&
+        item.tip !== undefined &&
+        item.tip !== existing.yielded_tip
+      ) {
+        delete state.items[key];
+      }
     }
-    const strikes = existingStrikes + 1;
-    state.items[key] = {
-      kind: item.kind,
-      identity: normalizePathForCompare(item.rawIdentity) || "",
-      strikes,
-      first_block_at: (existing && existing.first_block_at) || nowIso,
-      last_block_at: nowIso,
-    };
-    lowStrike.push({ item, key, strikes });
+
+    // Partition on the PRE-increment strike count -- this is what makes "3
+    // identical blocks then a yield" land exactly on the 4th invocation: an
+    // item already at the cap (from a PRIOR invocation) is high-strike and
+    // gets no further increment (it's already exhausted, nothing more to
+    // count); an item still under the cap is low-strike, blocks THIS
+    // invocation too, and is the one that gets incremented -- even when
+    // that increment lands it exactly on the cap (its 3rd block), since the
+    // cap check that turns it into a yield only applies starting the NEXT
+    // time it's seen.
+    const highStrike = [];
+    for (const item of baseResult.items) {
+      const key = computeItemKey(item.kind, item.rawIdentity);
+      const existing = state.items[key];
+      const existingStrikes = existing && typeof existing.strikes === "number" ? existing.strikes : 0;
+      if (existingStrikes >= REBLOCK_STRIKE_CAP) {
+        highStrike.push({ item, key, strikes: existingStrikes, existing });
+        continue; // already exhausted from a prior invocation -- no further increment.
+      }
+      const strikes = existingStrikes + 1;
+      state.items[key] = {
+        kind: item.kind,
+        identity: normalizePathForCompare(item.rawIdentity) || "",
+        strikes,
+        first_block_at: (existing && existing.first_block_at) || nowIso,
+        last_block_at: nowIso,
+      };
+      lowStrike.push({ item, key, strikes });
+    }
+    highStrikeCount = highStrike.length;
+
+    // Yield-once (spec `stop-guard-harness-branches.md` §4, D2): the
+    // newlyYielded/alreadyYielded split -- and the `yielded`/`yielded_tip`
+    // state mutation that goes with it -- is only computed when this
+    // invocation's strike layer is ACTUALLY about to yield (lowStrike
+    // empty, i.e. every current item is at or above the cap). While
+    // lowStrike is still non-empty, a highStrike item here is merely
+    // omitted from `reason` this call (the existing omission-count
+    // trailer, `highStrikeCount` above) -- it is not yet formally
+    // "yielded": that only happens on the invocation whose OWN decision is
+    // an actual allow/yield for the full current item set, exactly
+    // mirroring the pre-this-spec `highStrike` semantics this replaces.
+    if (lowStrike.length === 0) {
+      for (const e of highStrike) {
+        if (e.existing && e.existing.yielded === true) {
+          alreadyYielded.push(e);
+        } else {
+          newlyYielded.push(e);
+          state.items[e.key] = Object.assign({}, e.existing, { yielded: true, yielded_tip: e.item.tip });
+        }
+      }
+    }
   }
 
-  // Sign this write's own post-increment `items` (spec §3.2/A5). When the
-  // keyfile is unavailable, no `mac` can be computed -- write without one
-  // rather than a stale/incorrect value; the next read of this file will
-  // then correctly treat the missing `mac` as tampered (fail closed,
-  // consistent with every other keyfile-unavailable path here).
+  const willBlockOnStrikes = isBlockAction && lowStrike.length > 0;
+
+  // Harness-managed growth (spec `stop-guard-harness-branches.md` §3) is
+  // folded into this SAME write only when this invocation's own outcome
+  // will not be a strike-driven block -- the informational line only fires
+  // when it can actually be shown; a call that blocks for an unrelated
+  // reason defers the report to a later, non-blocking call rather than
+  // silently marking it "reported" without ever having displayed it.
+  let harnessGrew = false;
+  let harnessUnion = state.harness_managed_reported;
+  if (!willBlockOnStrikes && harnessManagedNames.length > 0) {
+    const existingReported = new Set(state.harness_managed_reported);
+    harnessGrew = harnessManagedNames.some((n) => !existingReported.has(n));
+    if (harnessGrew) {
+      const unionSet = new Set(state.harness_managed_reported);
+      for (const n of harnessManagedNames) unionSet.add(n);
+      harnessUnion = Array.from(unionSet).sort();
+      state.harness_managed_reported = harnessUnion;
+    }
+  }
+
+  // Sign this write's own post-mutation `items`/`harness_managed_reported`
+  // (spec `hook-state-write-guard.md` §3.2/A5, versioned per `stop-guard-
+  // harness-branches.md` §3/R4). When the keyfile is unavailable, no `mac`
+  // can be computed -- write without one rather than a stale/incorrect
+  // value; the next read of this file will then correctly treat the
+  // missing `mac` as tampered (fail closed, consistent with every other
+  // keyfile-unavailable path here).
   if (keyBytes) {
-    state.mac = computeMac(keyBytes, sessionKey, state.items);
+    state.mac = computeMacV2(keyBytes, sessionKey, state.items, state.harness_managed_reported);
   } else {
     delete state.mac;
   }
 
   const writeResult = writeReblockStateAtomic(fsx, stateDir, statePath, state);
   if (!writeResult.ok) {
-    return {
-      action: "block",
-      reason:
-        baseResult.reason +
-        `\n\n[stop-guard-bounded-reblock] state write failed at ${statePath}: ${writeResult.error} -- ` +
-        "blocking to avoid a silent premature yield (classification succeeded; persistence failed).",
-    };
+    if (isBlockAction) {
+      return {
+        action: "block",
+        reason:
+          baseResult.reason +
+          `\n\n[stop-guard-bounded-reblock] state write failed at ${statePath}: ${writeResult.error} -- ` +
+          "blocking to avoid a silent premature yield (classification succeeded; persistence failed).",
+      };
+    }
+    // Harness-managed-only invocation: fail soft, no report this call
+    // (nothing was safely persisted to mark it "reported").
+    return baseResult;
   }
 
-  if (lowStrike.length > 0) {
+  if (willBlockOnStrikes) {
     const capped = lowStrike.slice(0, REASON_ITEM_CAP);
     const lines = capped.map((e) => e.item.line);
     if (lowStrike.length > REASON_ITEM_CAP) {
       lines.push(`...and ${lowStrike.length - REASON_ITEM_CAP} more`);
     }
     let reason = lines.join("\n");
-    if (highStrike.length > 0) {
+    if (highStrikeCount > 0) {
       reason +=
-        `\n(${highStrike.length} item(s) omitted here after reaching the ${REBLOCK_STRIKE_CAP}-block cap; ` +
+        `\n(${highStrikeCount} item(s) omitted here after reaching the ${REBLOCK_STRIKE_CAP}-block cap; ` +
         `see the eventual yield summary or ${yieldLogPath}.)`;
     }
     return { action: "block", reason };
   }
 
-  // Every item this invocation is blocking on has reached the cap -- allow,
-  // summarize, and log (spec §3 step 6).
-  const summaryLines = highStrike.map((e) => `- ${e.item.line} (strikes: ${e.strikes})`);
-  const message =
-    `STALE ITEMS REMAIN (stop-guard-bounded-reblock: yielded after ${REBLOCK_STRIKE_CAP} identical blocks ` +
-    "per item; this will not be re-blocked again this session -- resolve manually if it still matters):\n" +
-    summaryLines.join("\n") +
-    `\nDurable record: ${yieldLogPath}`;
-
-  for (const e of highStrike) {
-    appendYieldLogLine(fsx, yieldLogPath, {
-      ts: nowIso,
-      session_id: sessionIdRaw,
-      item: e.key,
-      strikes: e.strikes,
-      summary: e.item.line,
-    });
+  // Non-blocking outcome on the strike layer: either this wasn't a block
+  // action at all (harness-managed-only invocation), or every current
+  // strike-tracked item has already reached the cap.
+  let result;
+  if (isBlockAction && newlyYielded.length > 0) {
+    const summaryLines = newlyYielded.map((e) => `- ${e.item.line} (strikes: ${e.strikes})`);
+    const message =
+      `STALE ITEMS REMAIN (stop-guard-bounded-reblock: yielded after ${REBLOCK_STRIKE_CAP} identical blocks ` +
+      "per item; this will not be re-blocked again this session -- resolve manually if it still matters):\n" +
+      summaryLines.join("\n") +
+      `\nDurable record: ${yieldLogPath}`;
+    for (const e of newlyYielded) {
+      appendYieldLogLine(fsx, yieldLogPath, {
+        ts: nowIso,
+        session_id: sessionIdRaw,
+        item: e.key,
+        strikes: e.strikes,
+        summary: e.item.line,
+      });
+    }
+    result = { action: "allow-message", message };
+  } else if (isBlockAction) {
+    // lowStrike empty and newlyYielded empty: every current item was
+    // already yielded on a prior invocation (and none drifted) -- silent
+    // allow (spec §4: "exit 0, no systemMessage, no yields.log write").
+    result = { action: "allow" };
+  } else {
+    // Not a block action at all -- pass the original allow/allow-message
+    // outcome through unchanged (harness reporting, below, may still amend
+    // its message).
+    result = { action: baseResult.action };
+    if (baseResult.message !== undefined) result.message = baseResult.message;
   }
 
-  return { action: "allow-message", message };
+  if (harnessGrew) {
+    appendYieldLogLine(fsx, yieldLogPath, {
+      event: "harness_managed",
+      session_id: sessionIdRaw,
+      ts: nowIso,
+      count: harnessUnion.length,
+      names: harnessUnion,
+    });
+    const line = formatHarnessManagedLine(harnessManagedNames);
+    if (result.action === "allow") {
+      result = { action: "allow-message", message: line };
+    } else if (result.action === "allow-message") {
+      result = { action: "allow-message", message: result.message + "\n" + line };
+    }
+    // result.action === "block" cannot reach here: harnessGrew is only ever
+    // computed when !willBlockOnStrikes, and the strike-block branch above
+    // already returned before this point.
+  }
+
+  return result;
 }
 
 // Export pure functions for unit-test isolation.
@@ -1826,6 +2113,12 @@ module.exports = {
   readOrCreateHmacKey,
   canonicalizeItems,
   computeMac,
+  // harness_managed branches (docs/specs/stop-guard-harness-branches.md).
+  HARNESS_BRANCH_RE,
+  HARNESS_MANAGED_DISPLAY_CAP,
+  formatHarnessManagedLine,
+  canonicalizeHarnessManaged,
+  computeMacV2,
 };
 
 // ─── Main ───────────────────────────────────────────────────────────────────
