@@ -313,17 +313,24 @@ before this log write is attempted.
   stop being blocked on, jumping straight to a premature yield without
   ever having attempted a fix. Accepted per this guard's established
   forgetful-agent threat model (§2 item 3); not closed by this revision.
-- **Session-scoped silent pass, concretely.** Once an item reaches 3
-  strikes, it is silently absent from every subsequent block `reason` and
-  every subsequent yield summary **for the rest of that session** (§2 item
-  5), even if the exact same Stop chain repeats 50 more times. **A
-  concrete input that passes this guard but shouldn't:** a forgetful agent
-  leaves one stale linked worktree in place for an entire long session; it
-  gets blocked, yields after the 3rd identical block, and from that point
-  the agent can end its turn as many times as it likes for the rest of the
-  session with that exact worktree still sitting there, unmentioned, even
-  though nothing about it ever changed or was addressed. Only a brand-new
-  `session_id` clears this.
+- **Session-scoped non-blocking pass, concretely.** Once an item reaches 3
+  strikes, this guard never `block`s on it again **for the rest of that
+  session** (§3 step 6), even if the exact same Stop chain repeats 50 more
+  times. The item is not silent, though: every later invocation where it
+  is still the (or an) item being yielded on re-emits the full
+  `systemMessage` "STALE ITEMS REMAIN" summary naming it and its strike
+  count (§3 step 6), and appends a fresh line to the durable yields log
+  (§5) each time — only the `block` `reason` text stops naming it (§3 step
+  5's `highStrike` items are collapsed to a one-line omitted-count
+  footer there, not dropped from the record entirely). **A concrete input
+  that passes this guard but shouldn't:** a forgetful agent leaves one
+  stale linked worktree in place for an entire long session; it gets
+  blocked, yields after the 3rd identical block, and from that point the
+  agent can end its turn as many times as it likes for the rest of the
+  session with that exact worktree still sitting there — repeatedly
+  re-surfaced in the allow-side summary and the yields log, but never
+  again forcing a `block`, so nothing compels the agent to act on it.
+  Only a brand-new `session_id` clears this.
 - **`stop_hook_active`-driven cycle amplification (BR-07/round-1 finding
   #9), not specifically bounded.** A *different* Stop hook's own block/
   retry cadence can burn through this guard's 3-strike budget on a
