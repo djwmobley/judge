@@ -62,6 +62,18 @@ const os   = require('node:os');
 const GUARDS = [
   { id: 'no-punt-guard', file: 'no-punt-guard.js', event: 'Stop', matcher: null },
   { id: 'shell-write-guard', file: 'shell-write-guard.js', event: 'PreToolUse', matcher: 'Bash|PowerShell' },
+  // Layer 1 of docs/specs/hook-state-write-guard.md — denies Write/Edit/
+  // NotebookEdit/MultiEdit writes into the guard framework's own STATE_DIR
+  // (closes the forgeable-state-file gap in
+  // docs/specs/stop-guard-bounded-reblock.md §2 item 3 / §6 / §9 BR-01,
+  // together with shell-write-guard.js's PROTECTED_PATH extension above,
+  // which covers the same directory for Bash/PowerShell writes).
+  {
+    id: 'hook-state-write-guard',
+    file: 'hook-state-write-guard.js',
+    event: 'PreToolUse',
+    matcher: 'Write|Edit|NotebookEdit|MultiEdit',
+  },
   { id: 'bash-powershell-guard', file: 'bash-powershell-guard.js', event: 'PreToolUse', matcher: 'Bash' },
   { id: 'worktree-isolation-guard', file: 'worktree-isolation-guard.js', event: 'PreToolUse', matcher: 'Bash' },
   { id: 'bash-classifier-bait-guard', file: 'bash-classifier-bait-guard.js', event: 'PreToolUse', matcher: 'Bash' },

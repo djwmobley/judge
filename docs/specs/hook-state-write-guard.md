@@ -89,16 +89,41 @@ case-insensitive end-to-end, same rationale that function's own header
 already states) — reused directly, not reimplemented, per this repo's
 existing reuse-provenance convention (`shell-write-guard.js`'s own header
 comment models this exact pattern for its own reused functions).
-`path.resolve` already collapses `..` segments lexically before
-normalization runs, so `hooks/state/../state/x.json` normalizes identically
-to `hooks/state/x.json` — no `fs.realpathSync` needed for the traversal
-case specifically (a symlink-based escape is a separate, declared blind
-spot — §6).
+`path.resolve` already collapses `..` segments and repeated `/` and `/./`
+segments lexically before normalization runs, so
+`hooks/state/../state/x.json` normalizes identically to `hooks/state/x.json`
+— no `fs.realpathSync` needed for the traversal case specifically (a
+symlink/junction-based escape is a separate, declared blind spot — §6, item
+(b)).
 
-**Containment check:** normalized target `===` normalized `STATE_DIR`, OR
-normalized target starts with normalized `STATE_DIR + "/"` (the trailing
-separator is required in the comparison so `hooks/state-backup/x.json`
-cannot false-positive against a bare-prefix match on `hooks/state`).
+After `normalizeForCompare` runs, strip a leading extended-length/device
+UNC prefix — `//?/` or `//./` (the backslash-to-forward-slash rewrite
+already turned `\\?\` and `\\.\` into this form) — before any comparison
+below. This is defensive normalization, not a parser: it collapses
+`\\?\C:\...\hooks\state\...` down to the same string shape as an ordinary
+`C:\...\hooks\state\...` path so the containment check below doesn't have
+to special-case the extended-prefix spelling separately.
+
+**Containment check — DENY if EITHER of the following holds** (both checks
+run against the post-strip normalized string):
+
+1. normalized target `===` normalized `STATE_DIR`, OR normalized target
+   starts with normalized `STATE_DIR + "/"` (the trailing separator is
+   required in the comparison so `hooks/state-backup/x.json` cannot
+   false-positive against a bare-prefix match on `hooks/state`); OR
+2. normalized target contains the segment sequence `/hooks/state/`
+   anywhere, or ends with the segment sequence `/hooks/state` — a
+   segment-bounded substring match (bounded by `/` on both sides, or by
+   end-of-string on the right), not a bare substring match, so
+   `hooks/statement/x.json` does not match. This second rule is
+   deliberately broader than rule 1: it fires even when the resolved path
+   does not literally equal this install's own computed `STATE_DIR` (e.g.
+   a UNC spelling `normalizeForCompare` doesn't fully canonicalize to a
+   drive-letter form, or another project's own `hooks/state` directory
+   entirely). Over-blocking an unrelated `hooks/state` directory is
+   accepted friction; the alternative — trusting `STATE_DIR` equality alone
+   — risks a silent escape for any path shape that resolves to the right
+   bytes without resolving to the exact same string. Friction over escape.
 
 **Total classification** (every PreToolUse call this hook's matcher can
 ever receive lands in exactly one branch):
@@ -106,9 +131,10 @@ ever receive lands in exactly one branch):
 | # | Condition | Branch |
 |---|---|---|
 | 1 | `tool_name` not one of the four gated tools (defensive — the matcher already excludes this in practice; kept as an explicit branch for a standalone/manual invocation) | allow |
-| 2 | Path param present, non-empty string, resolves outside `STATE_DIR` | allow |
-| 3 | Path param present, non-empty string, resolves inside `STATE_DIR` | **DENY** — message names the protected directory literally |
+| 2 | Path param present, non-empty string, resolves outside `STATE_DIR` and does not match either containment rule above | allow |
+| 3 | Path param present, non-empty string, resolves inside `STATE_DIR` OR matches the `/hooks/state/`-segment rule | **DENY** — message names the protected directory literally |
 | 4 | Path param missing, not a string, empty after trim, or resolution throws (malformed absolute/relative shape) | **DENY** — friction-over-escape default; an agent cannot make this hook fall through to allow by supplying a param shape the extractor can't parse |
+| 5 | Path param present, non-empty string, **relative** (not `path.isAbsolute`), AND the hook's own stdin `cwd` field is missing, not a string, or empty after trim | **DENY** — a relative path cannot be soundly resolved without a `cwd` to resolve it against, so it is never given the benefit of the doubt as "resolves outside `STATE_DIR`"; this is checked before attempting `path.resolve(cwd, raw)` at all, not left to that call to throw |
 
 Deny output matches this repo's existing PreToolUse-deny convention
 (`worktree-isolation-guard.js:1129-1137`, `shell-write-guard.js:2969-2978`):
@@ -174,20 +200,34 @@ changes, both load-bearing:
 2. **Raw-text fallback for unresolvable targets.** If classification's own
    result is exactly branch 4 (the existing "write-shaped but the target is
    ambiguous/dynamic and cannot be resolved to a literal path" bucket —
-   e.g. a variable-assembled destination) **and** the raw, unmodified `cmd`
-   string contains a case-insensitive `hooks/state` or `hooks\state`
-   substring, upgrade the result to branch 5 before the override check in
-   (1) runs. This catches the shape the task spec calls out explicitly: a
+   e.g. a variable-assembled destination), normalize the raw, unmodified
+   `cmd` string before testing it: strip every `'` and `"` character
+   (quote-delimited targets must still match), rewrite backslash to forward
+   slash, collapse repeated `/` and `/./` segments, then lowercase the
+   whole string. If the normalized text contains the substring
+   `hooks/state`, upgrade the result to branch 5 before the override check
+   in (1) runs. This catches the shape the task spec calls out explicitly: a
    command whose target `resolveTarget` cannot pin down as a literal path,
    but whose *source text* still names the protected directory verbatim
    (`STATEDIR=hooks/state; cp forged.json "$STATEDIR/x.json"` — the
    interpolated target is unresolvable to `resolveTarget`, but the literal
-   substring `hooks/state` is present in the command text itself). A
-   dynamic target assembled with **no** literal substring anywhere in the
-   command text (e.g. built entirely from `$(dirname "$0")`-style
-   indirection with no `hooks/state` text at all) is **not** caught by
-   this fallback and remains branch 4, ordinary friction, override-eligible
-   — declared blind spot, §6.
+   substring `hooks/state` is present in the command text itself, and
+   survives the quote-strip since quotes are stripped, not treated as
+   boundaries). A dynamic target assembled with **no** literal substring
+   anywhere in the command text (e.g. built entirely from
+   `$(dirname "$0")`-style indirection with no `hooks/state` text at all,
+   or from split-variable assembly such as `H1=hooks; H2=state; cp x
+   "$H1/$H2/y.json"` where neither half spells the joined literal) is
+   **not** caught by this fallback and remains branch 4, ordinary friction,
+   override-eligible — declared blind spot, §6, items (d) and (e). Comment
+   text containing the literal `hooks/state` (e.g. `# do not write to
+   hooks/state` followed by an unrelated write) is **not** stripped before
+   the substring test — this fallback only runs on raw command text, has no
+   shell-comment parser, and deliberately does not add one; a comment
+   mentioning the literal upgrades an otherwise-branch-4 command to branch 5
+   even though nothing in the command actually targets the directory. This
+   is accepted FRICTION (a false block, never a false allow), not a bug —
+   declared blind spot, §6, item (d).
 
 **Total classification, this layer, combined with §2.3's existing branches
 1-4** (every Bash/PowerShell command lands in exactly one row):
@@ -240,11 +280,37 @@ spec already applies throughout `docs/specs/stop-guard-bounded-reblock.md`
 §3 step 2: any failure to positively verify prior progress can only *delay*
 a yield, never accelerate one.
 
+**Key length validation, on every read.** After reading the keyfile bytes,
+the key MUST be exactly 32 bytes. Any other length — 0 bytes (empty file,
+e.g. a truncated write), fewer than 32, or more than 32 (a hand-edited or
+concatenated file) — is treated as "keyfile unavailable": the guard does
+**not** attempt to use a wrong-length key with `crypto.createHmac`
+(Node accepts non-32-byte HMAC keys without error, which would silently
+produce a mac that verifies against itself but was never the module's own
+`crypto.randomBytes(32)` output — a length check catches a corrupted or
+attacker-truncated/-padded keyfile that would otherwise pass through
+unnoticed). A wrong-length keyfile falls back to the same fail-closed path
+as a read/create failure — state treated as absent for this invocation —
+and does **not** trigger regeneration of a fresh key on its own (silently
+overwriting a keyfile that may simply be mid-write by a concurrent process
+is a separate hazard this spec does not additionally introduce); it is
+read again, at its current length, on the next invocation.
+
 ### 3.2 Canonical serialization and MAC
 
-`mac` is computed over the state object's `items` field only (not the
-whole state object — `session_id`/timestamps are metadata, not accounting
-state an agent gains anything by forging independently of `items`).
+`mac` is computed over the sanitized session key (the same session-id
+string, after sanitization, already used to derive this state file's own
+filename — see the base spec §3 / `stop-stale-worktrees-guard.js`'s
+existing session-key sanitization) concatenated with the state object's
+canonicalized `items` field: `sessionKey + "\n" + canonicalItemsJson`.
+Binding the MAC to `sessionKey` closes cross-session replay: an `items`
+blob that verified for session A no longer verifies unmodified under
+session B's own state filename, because the MAC input now differs between
+the two even when `items` is byte-identical. (An earlier draft of this
+spec computed the MAC over `items` alone, which left cross-session replay
+of a legitimately-produced `items` blob open — see the "Fixed decisions"
+note at the top of §6; that gap is closed by this session-bound MAC input,
+not merely flagged.)
 
 **Canonical form**, precisely:
 
@@ -264,14 +330,19 @@ state an agent gains anything by forging independently of `items`).
 3. `JSON.stringify(canonicalObj)` — `JSON.stringify`'s own default output
    already contains no inter-token whitespace, so no separate
    whitespace-stripping step is needed once the key order is canonical.
-4. `mac = crypto.createHmac("sha256", keyBytes).update(canonicalJson,
+4. `macInput = sessionKey + "\n" + canonicalJson` (UTF-8 string
+   concatenation; `sessionKey` is the same sanitized session-id string this
+   state file's own filename is already derived from — no re-sanitization
+   needed, the value is already in hand at every call site that reads or
+   writes this state file).
+5. `mac = crypto.createHmac("sha256", keyBytes).update(macInput,
    "utf8").digest("hex")`.
 
 This `mac` value is added to the state object (alongside the existing
 `session_id`/`stop_hook_active_last`/`created_at`/`updated_at`/`items`
 fields) immediately before `writeReblockStateAtomic` serializes and writes
 it — computed fresh on every write, over that write's own post-increment
-`items`.
+`items` and the current `sessionKey`.
 
 ### 3.3 Verification on read
 
@@ -285,7 +356,8 @@ object `items`) and before the parsed object is returned as "present":
   already treats as safe-direction absence, and logging every first run as
   a "tamper" would make the tamper log noise, not signal.
 - **File parses, shapes correctly, but `mac` is missing, OR the mac
-  recomputed from its own `items` (per §3.2) using the current keyfile does
+  recomputed from its own `items` and the `sessionKey` this state file's
+  own filename is derived from (per §3.2) using the current keyfile does
   not equal the stored `mac`:** treat identically to "absent"
   (`{ items: {} }`, so every item's strikes restart at 0 for this
   invocation — this can only *delay* a yield, per the same principle
@@ -333,6 +405,12 @@ no new test infrastructure needed.
 | `write_outside_state_dir_allowed` | ordinary project-file `file_path` | allow |
 | `write_missing_file_path_param_denied` | `tool_input: {}` | deny (branch 4, friction default) |
 | `write_empty_file_path_denied` | `file_path: ""` | deny |
+| `write_relative_path_missing_cwd_denied` | `file_path: "state/x.json"` (relative), stdin `cwd` missing entirely | deny (branch 5, A2) |
+| `write_relative_path_empty_cwd_denied` | relative `file_path`, `cwd: ""` | deny (branch 5, A2) |
+| `write_extended_length_unc_prefix_into_state_dir_denied` | `file_path: "\\\\?\\C:\\...\\hooks\\state\\x.json"` | deny (UNC-prefix strip, A1) |
+| `write_device_namespace_prefix_into_state_dir_denied` | `file_path: "\\\\.\\C:\\...\\hooks\\state\\x.json"` | deny (UNC-prefix strip, A1) |
+| `write_other_project_hooks_state_segment_denied` | `file_path` resolving outside this repo's `STATE_DIR` but containing the literal segment sequence `/hooks/state/` (e.g. a sibling checkout's own `hooks/state` dir) | deny (segment rule ii, A1 — deliberate over-block) |
+| `write_hooks_statement_sibling_allowed` | `file_path` inside a directory literally named `hooks/statement/` | allow (segment-bounded match does not fire on a prefix-only name match) |
 | `read_tool_never_matched` | `Read` tool call (not in this hook's matcher at all) | not invoked / allow — hook framework never dispatches |
 
 **Layer 1 — `shell-write-guard.js` PROTECTED_PATH extension:**
@@ -353,6 +431,9 @@ no new test infrastructure needed.
 | `dotdot_traversal_into_state_dir_denied` | `cp forged.json hooks/state/../state/x.json` | branch 5 deny |
 | `unresolvable_target_with_literal_hooks_state_text_denied` | `STATEDIR=hooks/state; cp forged.json "$STATEDIR/x.json"` | branch 5 deny (raw-text fallback, §2.3(b)(2)) |
 | `unresolvable_target_no_literal_text_stays_branch4` | fully variable-assembled target with **no** `hooks/state` substring anywhere in the command | branch 4, ordinary friction (declared blind spot, not this test's concern to close) |
+| `split_variable_target_stays_branch4` | `H1=hooks; H2=state; cp forged.json "$H1/$H2/x.json"` (blind spot §6 item (e)) | branch 4, ordinary friction (declared blind spot, not this test's concern to close) |
+| `unresolvable_target_quoted_literal_hooks_state_denied` | `STATEDIR="hooks/state"; cp forged.json "$STATEDIR/x.json"` (quote-strip, A3) | branch 5 deny |
+| `unresolvable_target_comment_text_literal_denied` | multi-line command: a `#`-comment line mentioning `hooks/state` (comment text runs to end-of-line in bash, so it cannot share a line with a real write verb) followed on a later line by `cp forged.json "$D/x.json"` where `$D` is unresolvable and has no `hooks/state` connection at all | branch 5 deny (accepted friction — the raw-text fallback has no comment parser, blind spot §6 item (d)) |
 | `cat_state_dir_file_allowed` | `cat hooks/state/stop-stale-worktrees-guard.abc.json` | allow (branch 1, read verb, never reaches `resolveTarget`) |
 | `grep_state_dir_allowed` | `grep strikes hooks/state/*.json` | allow |
 | `sibling_dir_name_prefix_allowed` | `cp x.txt hooks/state-backup/y.txt` | allow (prefix boundary, not containment) |
@@ -362,8 +443,10 @@ no new test infrastructure needed.
 
 | Test | Input | Expected |
 |---|---|---|
-| `mac_written_on_every_state_write` | one ordinary block-then-write cycle | written state file's `mac` field present and equals the recomputed HMAC over its own `items` |
+| `mac_written_on_every_state_write` | one ordinary block-then-write cycle | written state file's `mac` field present and equals the recomputed HMAC over `sessionKey + "\n" + canonical(items)` |
 | `mac_verifies_on_normal_read` | write, then read via the same key | state returned as-is, no tamper log line |
+| `cross_session_replay_of_valid_items_denied` | copy a byte-identical, fully-valid `{items, mac}` body from session A's state file into session B's state filename (same keyfile, different `session_id`/filename) | `readReblockState` for session B returns `{ items: {} }`; one tamper log line appended (A5 — MAC bound to `sessionKey`, closes the previously-flagged cross-session replay gap) |
+| `valid_round_trip_honored` | write, read back immediately, no tampering | state returned as-is; strikes/items match what was written; zero tamper log lines |
 | `forged_state_missing_mac_treated_as_absent` | a hand-written state file with `items: {"worktree:x": {"strikes": 3, ...}}` and no `mac` field | `readReblockState` returns `{ items: {} }`; one tamper log line appended |
 | `forged_state_wrong_mac_treated_as_absent` | a hand-written state file with a `mac` value that doesn't match its own `items` | same as above |
 | `pre_change_state_file_no_mac_field_treated_as_tampered` | a state file shaped exactly like the pre-this-spec format (no `mac` key at all) | same as above — explicit backward-compat case |
@@ -371,6 +454,10 @@ no new test infrastructure needed.
 | `keyfile_created_on_first_run` | fresh state dir, no `.hmac-key` | keyfile created, 32 bytes, present on disk after the run |
 | `keyfile_reused_across_runs` | keyfile already present | second run's `mac` verifies against the first run's keyfile (same key, not regenerated) |
 | `keyfile_unreadable_fails_closed` | injected `fs.readFileSync`/creation throwing for the keyfile path | state treated as absent for this invocation (fails closed, not open) |
+| `keyfile_zero_bytes_fails_closed` | keyfile exists but is 0 bytes | treated as unavailable, state treated as absent (A4) |
+| `keyfile_truncated_fails_closed` | keyfile exists with fewer than 32 bytes | treated as unavailable, state treated as absent (A4) |
+| `keyfile_oversized_fails_closed` | keyfile exists with more than 32 bytes | treated as unavailable, state treated as absent (A4) |
+| `forged_strikes_without_mac_reset_and_logged` | hand-written state file with `items: {"worktree:x": {"strikes": 3, ...}}`, no `mac` field | `readReblockState` returns `{ items: {} }` (strikes effectively 0 for this invocation); exactly one `{"event":"tamper",...}` line appended |
 | `tamper_log_line_well_formed` | one forged-state read | exactly one JSON line appended with `event`, `session`, `ts` fields |
 | `ordinary_first_run_not_logged_as_tamper` | no state file exists at all yet | zero tamper log lines appended (missing-file is not a tamper signal) |
 
@@ -416,20 +503,80 @@ file already does.
 
 ## 6. Blind spots
 
+**Fixed-decisions note (this revision):** an earlier draft of §3.2 computed
+`mac` over `items` alone and listed cross-session replay of a
+legitimately-produced `items` blob as an accepted, unclosed gap. That gap
+is **closed** in this revision — the MAC input is now `sessionKey + "\n" +
+canonicalItemsJson` (§3.2), so a byte-identical `items` blob copied into a
+different session's state filename no longer verifies (item (a) below is
+the narrower, genuinely-still-open relative of that old gap: replay *within
+the same session*, which needs no key access at all).
+
 What this spec's two layers, together, **cannot** detect or prevent:
 
+- **(a) Same-session self-replay/rollback.** The MAC (§3.2) is bound to
+  `sessionKey`, not to a monotonic counter, timestamp, or any other
+  per-write nonce. An agent that saves a copy of its own session's
+  earlier, legitimately-written, lower-strikes state file (or a copy from
+  before a strike was recorded at all) and restores it later produces a
+  state file whose `mac` still verifies — the signature proves "the
+  current holder of this session's key produced these bytes at some point,"
+  not "these are the most recent bytes." This needs no cryptography at all,
+  only an ordinary file copy made ahead of time, and is not closed by any
+  mechanism in this spec.
+- **(b) Junction/symlink/reparse point pointing at `STATE_DIR`.** A
+  filesystem reparse point (Windows junction/symlink, POSIX symlink)
+  created in a directory Layer 1 does **not** protect, whose target
+  resolves into `STATE_DIR`, is not detected: `normalizeForCompare`
+  performs lexical resolution only (`path.resolve` + string rewriting), it
+  never calls `fs.realpathSync` to follow a reparse point, so a tool call
+  writing through `some/allowed/dir/link.json` where `link.json` is a
+  reparse point into `STATE_DIR` normalizes to a string that does not match
+  either containment rule in §2.2, even though the write physically lands
+  inside `STATE_DIR`. (This is the blind spot §2.2's own resolution
+  paragraph refers to as "declared blind spot — §6, item (b)".)
+- **(c) Deleting the keyfile to force regeneration.** An agent can delete
+  `<state dir>/.hmac-key` directly (a delete, not a gated write — see item
+  (f) below for the parallel case on the state file itself). The next
+  invocation that needs a key finds it missing and generates a fresh one
+  (§3.1's create-if-absent behavior). Because the keyfile lives inside
+  `STATE_DIR`, an agent with ordinary read access to that directory can
+  then read the newly-generated key exactly as it could have read the old
+  one — deleting the key does not raise the bar over the "reading the
+  keyfile" bullet below at all, it only forces one extra regeneration
+  cycle and, as a side effect, invalidates every other session's
+  in-flight `mac` values computed under the old key until they are
+  rewritten (their next write recomputes `mac` under the new key; their
+  next read before that rewrite is treated as tampered per §3.3, which is
+  itself only ever a safe-direction, delay-not-grant outcome).
+- **(d) Comment-text substring friction (§2.3(b)(2)).** The raw-text
+  fallback's normalization strips quote characters but has no shell-comment
+  parser; a `#`-prefixed (or PowerShell `#`) comment containing the literal
+  text `hooks/state` upgrades an otherwise-branch-4 command to branch 5
+  even when nothing in the command actually targets the directory. Declared
+  accepted friction (a false block, never a false allow), not fixed by this
+  spec.
+- **(e) Split-variable path assembly.** `STATEDIR1=hooks; STATEDIR2=state;
+  cp forged.json "$STATEDIR1/$STATEDIR2/x.json"` (or any other spelling
+  split across two or more variables/tokens so that no single contiguous
+  substring of the raw command text ever reads `hooks/state`) defeats
+  §2.3(b)(2)'s raw-text fallback the same way full indirection does (see
+  the dynamic-target bullet below) — remains branch 4, ordinary,
+  override-eligible friction. Declared blind spot, not closed by this
+  spec's raw-text check, which operates on literal substrings only.
 - **Reading the keyfile and minting a valid MAC.** An agent with ordinary
   file-read access to `<state dir>/.hmac-key` (via the `Read` tool, `cat`,
   `Get-Content` — none of which Layer 1 gates, since reads are explicitly
   out of scope for a *write*-denial layer) can read the 32-byte key,
-  compute a correctly-shaped `mac` over any `items` payload it wants using
-  the exact algorithm in §3.2, and write a fully self-consistent forged
-  state file that verifies cleanly. Layer 2 raises the bar from "edit a
-  plaintext counter" to "read a keyfile and run an HMAC," it does not
-  remove the forgery surface entirely — closing that fully would require
-  keeping the key outside the agent's read surface too, which this repo's
-  hook framework (a same-user, same-filesystem-permissions child process)
-  has no mechanism to provide.
+  compute a correctly-shaped `mac` over any `sessionKey + items` payload it
+  wants using the exact algorithm in §3.2 (including its own session's
+  `sessionKey`, which it already knows), and write a fully self-consistent
+  forged state file that verifies cleanly. Layer 2 raises the bar from
+  "edit a plaintext counter" to "read a keyfile and run an HMAC," it does
+  not remove the forgery surface entirely — closing that fully would
+  require keeping the key outside the agent's read surface too, which this
+  repo's hook framework (a same-user, same-filesystem-permissions child
+  process) has no mechanism to provide.
 - **Writes via a tool this repo's PreToolUse hooks don't match.** Any MCP
   server exposing its own filesystem-write tool (an MCP filesystem server,
   a database blob write, etc.) is invisible to Layer 1 — its matcher only
@@ -447,15 +594,16 @@ What this spec's two layers, together, **cannot** detect or prevent:
 - **A dynamic target with no literal `hooks/state` substring anywhere in
   the command text.** §2.3(b)(2)'s raw-text fallback only catches an
   unresolvable target when the protected directory's name still appears
-  literally in the command. A fully indirect construction —
-  `D=$(cat /tmp/target-dir-name); cp forged.json "$D/x.json"` where
-  `/tmp/target-dir-name` contains the text `hooks/state` but the *command
-  itself* never spells it out — resolves to branch 4 (ordinary,
-  override-eligible friction), not branch 5. This is the one case in this
-  spec's own design where the task's explicit instruction accepts friction
-  falling short of denial as the declared, accepted limit rather than a bug
-  to close.
-- **Deleting the state file entirely (safe direction, not closed on
+  literally (contiguously, post-normalization) in the command. A fully
+  indirect construction — `D=$(cat /tmp/target-dir-name); cp forged.json
+  "$D/x.json"` where `/tmp/target-dir-name` contains the text `hooks/state`
+  but the *command itself* never spells it out — resolves to branch 4
+  (ordinary, override-eligible friction), not branch 5. Item (e) above is
+  the same limit applied to a split-variable spelling rather than full
+  indirection. This is the one case in this spec's own design where the
+  task's explicit instruction accepts friction falling short of denial as
+  the declared, accepted limit rather than a bug to close.
+- **(f) Deleting the state file entirely (safe direction, not closed on
   purpose).** An agent can `rm`/`Remove-Item` the state file itself — that
   operation is a delete, not a write to a gated path Layer 1 or Layer 2
   reasons about, and is not blocked by this spec. Deleting it only resets
@@ -464,24 +612,12 @@ What this spec's two layers, together, **cannot** detect or prevent:
   yield, never grant one — consistent with every other safe-direction
   fallback this spec and the base spec both already rely on, so it is
   intentionally left open rather than separately gated.
-- **Cross-session replay of a legitimately-produced `items` blob.** The MAC
-  (§3.2) is computed over `items` alone, not `items` bound to `session_id`.
-  An agent that copies the *byte-identical* `items` object from one
-  session's own legitimately-written (fully strike-exhausted) state file
-  into a **different** session's state filename produces a state file whose
-  `mac` still verifies — the signature proves "these bytes were produced by
-  someone holding the key," not "these bytes belong to this session." This
-  is a genuine gap beyond what the task's fixed design explicitly asked to
-  close (which specifies the MAC scope as `items` only) — flagged here per
-  this project's canon on disclosing a gap found during authoring rather
-  than silently shipping past it, not fixed unilaterally since it would
-  mean re-litigating the task's stated MAC scope.
 - **`fs.writeFileSync(..., { mode: 0o600 })` on the keyfile is best-effort
   only on Windows.** POSIX file modes don't map cleanly onto NTFS ACLs; the
   call is harmless but not expected to meaningfully restrict read access to
   the keyfile on this repo's stated target platform (Windows), which is
-  also why the previous bullet (reading the keyfile) is listed as an
-  accepted gap rather than something this mode bit closes.
+  also why the "reading the keyfile" bullet above is listed as an accepted
+  gap rather than something this mode bit closes.
 - **Whether the installer step (§5) actually gets run.** This spec adds a
   required `GUARDS` registry entry and edits to two already-registered
   files; nothing in this spec verifies at runtime that an already-installed
