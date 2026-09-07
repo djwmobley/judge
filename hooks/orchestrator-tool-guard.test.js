@@ -12,6 +12,32 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
+// Redirect every state/ledger file this file's own in-process `state`
+// require AND every subprocess it spawns (runHook/runHookAsync below never
+// pass an explicit `env`, so both execFileSync and execFile inherit
+// `process.env` as-is at spawn time) write into a per-test-file temp
+// directory instead of this repo's own gitignored hooks/state. Must be set
+// before the first `require("./model-routing-guards.state.js")` below —
+// state.js reads MODEL_ROUTING_STATE_DIR once, at module-load time.
+// Without this, hooks/orchestrator-tool-guard.js's appendDecision calls
+// (spawned via HOOK_JS below) wrote `routing-decisions.<key>.<h8>.jsonl`
+// files straight into this repo's own hooks/state, and this file's own
+// cleanupSessionState() never removed them — it only removes Hook 2's own
+// `orchestrator-tool-guard.<key>.ledger` tally file (state.ledgerPathForKey),
+// never the decision ledger's separate sha256-derived `h8` filename
+// component (see hooks/model-routing-guards.decisions.js's h8()), so those
+// files were never cleaned up: the leftover-fixture defect this override
+// fixes.
+const STATE_DIR_OVERRIDE = fs.mkdtempSync(path.join(os.tmpdir(), "otg-state-"));
+process.env.MODEL_ROUTING_STATE_DIR = STATE_DIR_OVERRIDE;
+test.after(() => {
+  try {
+    fs.rmSync(STATE_DIR_OVERRIDE, { recursive: true, force: true, maxRetries: 3 });
+  } catch (_) {
+    // best effort
+  }
+});
+
 const HOOK_JS = path.join(__dirname, "orchestrator-tool-guard.js");
 const DEBUG_LOG = path.join(__dirname, "orchestrator-tool-guard-debug.log");
 const unicode = require("./model-routing-guards.unicode.js");
@@ -731,4 +757,40 @@ test("concurrency: 10 rounds x 10 simultaneous Read calls, cap=2 -> allows never
     }
   }
   console.log(`[concurrency] Read max allows observed across ${CONCURRENCY_ROUNDS} rounds: ${maxAllows} (cap ${CAP})`);
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// fixture_isolation — regression for the 393-file routing-decisions.*.jsonl
+// leftover-fixture defect (see the MODEL_ROUTING_STATE_DIR override block
+// near the top of this file).
+// ══════════════════════════════════════════════════════════════════════════
+
+test("fixture_isolation: this file's own fixture-writing helper (runHook) never leaves a routing-decisions.*.jsonl file in the REAL (non-overridden) hooks/state", () => {
+  // Deliberately re-derives the real STATE_DIR the same __dirname-relative
+  // way model-routing-guards.state.js computes its own default (state.js's
+  // own `state.STATE_DIR` is NOT used here — with MODEL_ROUTING_STATE_DIR
+  // set for this whole file, that now points at STATE_DIR_OVERRIDE, which
+  // is exactly the isolation this test is verifying, not the thing to
+  // assert against).
+  const realStateDir = path.join(__dirname, "state");
+  const routingDecisionsFiles = (dir) =>
+    fs.existsSync(dir) ? new Set(fs.readdirSync(dir).filter((f) => f.startsWith("routing-decisions."))) : new Set();
+  const before = routingDecisionsFiles(realStateDir);
+
+  const session = uniqueSession("fixture-isolation-check");
+  cleanupSessionState(session);
+  try {
+    const r = runHook({ tool_name: "Read", session_id: session, tool_input: { file_path: __filename, limit: 3 } });
+    assert.equal(r.code, 0);
+  } finally {
+    cleanupSessionState(session);
+  }
+
+  const after = routingDecisionsFiles(realStateDir);
+  const newFiles = [...after].filter((f) => !before.has(f));
+  assert.deepEqual(
+    newFiles,
+    [],
+    `expected no new routing-decisions.*.jsonl fixture in the real hooks/state, found: ${newFiles.join(", ")}`
+  );
 });

@@ -75,6 +75,28 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
+// Redirect every state/ledger file this file's own subprocess spawns
+// (run() below always builds its own `env` via `Object.assign({},
+// process.env)` at call time, so this propagates automatically) write
+// into a per-test-file temp directory instead of this repo's own
+// gitignored hooks/state. This file's own GUARDS table (below) uses
+// fixed, non-unique session ids ("otg-allow", "amrg-block", etc. — one
+// per guard x envelope, reused across every SHAPES iteration) plus a
+// malformed-JSON envelope with no session_id at all (falls to the shared
+// `global-YYYY-MM-DD` file), and had no cleanup of any kind for either —
+// the fixture-residue defect this override fixes. Must be set before any
+// subprocess is spawned below (state.js reads MODEL_ROUTING_STATE_DIR
+// once, at module-load time, inside each freshly-spawned child process).
+const STATE_DIR_OVERRIDE = fs.mkdtempSync(path.join(os.tmpdir(), "crash-path-state-"));
+process.env.MODEL_ROUTING_STATE_DIR = STATE_DIR_OVERRIDE;
+test.after(() => {
+  try {
+    fs.rmSync(STATE_DIR_OVERRIDE, { recursive: true, force: true, maxRetries: 3 });
+  } catch (_) {
+    // best effort
+  }
+});
+
 const HOOKS_DIR = __dirname;
 const DECISIONS_MODULE_PATH = path.join(HOOKS_DIR, "model-routing-guards.decisions.js");
 
@@ -292,3 +314,35 @@ for (const guard of GUARDS) {
     }
   }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// fixture_isolation — regression for the routing-decisions.*.jsonl
+// leftover-fixture defect (see the MODEL_ROUTING_STATE_DIR override block
+// near the top of this file). This file's GUARDS table uses fixed,
+// non-unique session ids with no cleanup, so it is the highest-risk file
+// in this repo for this defect if the override regresses.
+// ══════════════════════════════════════════════════════════════════════════
+
+test("fixture_isolation: this file's own fixture-writing helper (run(), healthy module) never leaves a routing-decisions.*.jsonl file in the REAL (non-overridden) hooks/state", () => {
+  // Deliberately re-derives the real STATE_DIR the same __dirname-relative
+  // way model-routing-guards.state.js computes its own default — with
+  // MODEL_ROUTING_STATE_DIR set for this whole file, requiring that module
+  // directly would return STATE_DIR_OVERRIDE, which is exactly the
+  // isolation under test here, not the thing to assert against.
+  const realStateDir = path.join(__dirname, "state");
+  const routingDecisionsFiles = (dir) =>
+    fs.existsSync(dir) ? new Set(fs.readdirSync(dir).filter((f) => f.startsWith("routing-decisions."))) : new Set();
+  const before = routingDecisionsFiles(realStateDir);
+
+  const guard = GUARDS[0];
+  const healthy = run(guard.file, guard.envelopes.block);
+  assert.equal(typeof healthy.code, "number");
+
+  const after = routingDecisionsFiles(realStateDir);
+  const newFiles = [...after].filter((f) => !before.has(f));
+  assert.deepEqual(
+    newFiles,
+    [],
+    `expected no new routing-decisions.*.jsonl fixture in the real hooks/state, found: ${newFiles.join(", ")}`
+  );
+});
