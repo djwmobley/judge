@@ -189,22 +189,24 @@ conservative default rather than throwing.
 own) that lets a `SendMessage` dispatch be checked against the tier its
 recipient actually spawned with, instead of trusting a self-report.
 
-- **Capture** happens across two additional hook registrations that share
-  `agent-model-routing-guard.js`'s enforcement logic (via two thin shim
-  entry points, `agent-model-routing-guard-posttooluse.js` and
-  `agent-model-routing-guard-subagentstart.js` — see those files' header
-  comments for why they're separate on-disk files rather than a second
+- **Capture** happens at `PreToolUse` (the "pending" record) plus one
+  additional hook registration that shares `agent-model-routing-guard.js`'s
+  enforcement logic (via a thin shim entry point,
+  `agent-model-routing-guard-subagentstart.js` — see that file's header
+  comment for why it's a separate on-disk file rather than a second
   registration of the identical filename):
-  - **`PostToolUse` (Agent):** once a dispatch is allowed at `PreToolUse`,
-    a "pending" record (`tool_use_id`, raw model literal, resolved tier,
+  - **`PreToolUse` (Agent):** once a dispatch is allowed, a "pending"
+    record (`tool_use_id`, raw model literal, resolved tier,
     `subagent_type`, `description`, `session_id`) is appended immediately.
-    At `PostToolUse`, once `tool_response` is available, an "id" record
-    (the spawned agent's id + display name, plus `rules_version`) is
-    appended and joined to the pending record by `tool_use_id`.
-  - **`SubagentStart`:** best-effort, NOT depended on — logs its payload's
-    top-level keys once per session for future verification, and appends
-    an id record too if `agent_id` and `tool_use_id` both happen to be
-    present on it.
+  - **`SubagentStart`:** appends the matching "id" record (the spawned
+    agent's id, plus `rules_version`) from the event's top-level `agent_id`
+    + `tool_use_id` fields, joined to the pending record by `tool_use_id`.
+    Also logs the payload's top-level keys once per session for future
+    reference. Still best-effort in the sense that a harness version whose
+    `SubagentStart` payload lacks either field simply records nothing for
+    that dispatch (falls to the "unknown recipient" branch below) — but it
+    is, as of 2026-09-06, the sole capture path (see "Capture verified"
+    below).
   - **Record shape (metadata only, exactly 9 fields):** agent id, display
     name, raw model literal, resolved tier, `subagent_type`,
     `description`, `session_id`, an ISO timestamp, and `rules_version`.
@@ -212,7 +214,7 @@ recipient actually spawned with, instead of trusting a self-report.
     not a size-tuning choice.
   - **`rules_version`:** `"<guard version>:<hash-or-nopolicy>"` — the
     first 12 hex characters of a sha256 digest of the local-policy file's
-    raw bytes, computed once, AT `PostToolUse` CAPTURE TIME — a distinct
+    raw bytes, computed once, AT `SubagentStart` CAPTURE TIME — a distinct
     read from whatever `PreToolUse` read actually enforced the dispatch
     (accepted gap, not closed by this guard: see "Blind spots" in the PR
     description). `"nopolicy"` if no local-policy file exists at that
@@ -243,33 +245,47 @@ recipient actually spawned with, instead of trusting a self-report.
   declaration is a fallback for the unknown branch only. A missing
   declaration there → BLOCK (`recipient_tier_unknown`).
 
-#### Capture verification pending
+#### Capture verified
 
-The exact field path of the spawned agent's id inside the `Agent` tool's
-`PostToolUse` `tool_response` is **UNVERIFIED** as of this PR — the code
-tries, in order, `tool_response.agentId`, `.agent_id`, `.id`, then (for a
-string response, or any `content`/`text`/`result` string field) the regex
-`/\bagentId:\s*([a-z0-9]{8,})/i`. If none resolve, capture logs one debug
-line per session (the top-level keys of `tool_response` plus its first 300
-characters — never a prompt/message body) and records nothing for that
-dispatch; a later `SendMessage` to that recipient then falls to the
-"unknown recipient" branch above, exactly as if no `Agent` dispatch had
-ever been captured. To confirm the real field path in a fresh session:
+The field path of the spawned agent's id was confirmed live on 2026-09-06,
+in a session with the ledger shims installed at user scope: 6 `Agent`
+dispatches were run, and the ledger state file received exactly 6 "id"
+records — one per dispatch, each with `tool_use_id` and `agent_id`
+populated. The debug log showed exactly one `subagent_start_payload_keys`
+event (top-level keys `["session_id","transcript_path","cwd",
+"scratchpad_dir","prompt_id","agent_id","agent_type","hook_event_name"]`,
+plus `tool_use_id` on the payloads that actually joined — the debug line
+itself only fires once per session, so it does not by itself enumerate
+every dispatch's exact shape) and zero `ledger_capture_unresolved` events.
 
-1. Run `node scripts/install-guards.js` (writes your real
-   `~/.claude/settings.json` — an owner action, not something this PR
-   performs).
-2. Dispatch one real `Agent` subagent with a valid `model`/tier, a
-   `PLAN-ONLY` line if planning-tier, and a `REPORT CAP` line.
-3. Read `~/.claude/hooks/agent-model-routing-guard-debug.log` — look for an
-   `event: "ledger_capture_unresolved"` line (payload keys + first 300
-   chars) if the id didn't resolve, or the absence of one if it did.
-4. Check `~/.claude/hooks/state/agent-tier-ledger.<session>.jsonl` for a
-   joined record (an `"id"`-kind line whose `agent_id` is populated) to
-   confirm which field path actually worked.
-5. Update this section and the spec once confirmed — this PR ships the
-   defensive, logged-fallback design above specifically because that
-   confirmation could not happen in this run.
+**Verified path:** the `SubagentStart` handler's top-level `agent_id` +
+`tool_use_id` fields (`handleSubagentStart` in
+`agent-model-routing-guard.js`) is the capture path — no `tool_response`
+involved.
+
+**What this ruled out, and what was removed:** PR 2 also shipped a
+`PostToolUse` (Agent) registration carrying an unverified fallback chain
+(`tool_response.agentId` / `.agent_id` / `.id` / a regex over
+`content`/`text`/`result` strings), for the case where the field path
+above turned out not to work. `agent-tier-ledger.js`'s `appendIdRecord`
+never dedupes or skips — every call unconditionally appends a line — so
+if that fallback had also resolved and appended across the same 6
+dispatches, the state file would show 12 "id" lines, not 6; and if it had
+failed to resolve even once, `ledger_capture_unresolved` would have logged
+(also once per session, same debug-line convention). Neither happened, so
+the fallback path never fired its append branch in this session. Since
+resolving the spawned agent's id was that registration's only job, it was
+removed rather than kept as an unexercised fallback:
+- `hooks/agent-model-routing-guard-posttooluse.js` (the shim entry point)
+- `handlePostToolUseAgent()` and the `PostToolUse` branch in `main()` in
+  `agent-model-routing-guard.js`
+- `resolveAgentIdFromToolResponse()`, `AGENT_ID_FROM_TEXT_RE`,
+  `topLevelKeys()`, and `summarizeUnresolved()` in `agent-tier-ledger.js`
+- The `agent-model-routing-guard-ledger` / `PostToolUse` / `Agent` entry in
+  `scripts/install-guards.js`'s `GUARDS` array
+- The PostToolUse-shaped capture helper and its dedicated test in
+  `agent-model-routing-guard.test.js`, replaced with a `SubagentStart`-
+  shaped equivalent
 
 ### pr-independence.js
 - **Event:** `PreToolUse` (Bash) — as a library, `scrubDataRegions` is also

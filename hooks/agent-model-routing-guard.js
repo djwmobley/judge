@@ -54,12 +54,14 @@
 // character) is not stripped by either normalization function and will not
 // match "fork" / an EXEMPT_TYPES name / any of the three bare-line markers.
 //
-// This file also answers PostToolUse (Agent) and SubagentStart events for
-// the per-agent tier ledger (agent-tier-ledger.js, owner decision D3) —
-// see hooks/README.md's "Capture verification pending" section for the
-// unverified tool_response field path this depends on. Neither of those
-// two paths ever blocks; they only capture metadata for a later
-// SendMessage lookup.
+// This file also answers SubagentStart events for the per-agent tier
+// ledger (agent-tier-ledger.js, owner decision D3) — see hooks/README.md's
+// "Capture verified" section for the verified top-level `agent_id` field
+// path this depends on (a PostToolUse (Agent) registration also existed
+// through PR 2 as an unverified fallback; it was removed 2026-09-06 once
+// live verification showed SubagentStart alone accounted for every
+// captured id). This path never blocks; it only captures metadata for a
+// later SendMessage lookup.
 
 const fs = require("fs");
 const { stripNormalize, stripInvisible, isBlankAfterStrip } = require("./model-routing-guards.unicode.js");
@@ -416,47 +418,20 @@ function evaluateReportCapFloor(fieldRaw, isString, oversized, findings) {
   return true;
 }
 
-// ─── PostToolUse (Agent) — ledger id capture ──────────────────────────────
-
-function handlePostToolUseAgent(parsed) {
-  try {
-    const toolName = typeof parsed.tool_name === "string" ? parsed.tool_name : "";
-    if (toolName !== "Agent") {
-      process.exit(0);
-      return;
-    }
-    const sessionKey = ledger.resolveLedgerSessionKey(parsed.session_id);
-    const toolUseId = typeof parsed.tool_use_id === "string" && parsed.tool_use_id !== "" ? parsed.tool_use_id : null;
-    const resolved = ledger.resolveAgentIdFromToolResponse(parsed.tool_response);
-
-    if (!toolUseId || !resolved) {
-      if (ledger.markOnceAndCheck(sessionKey, "posttooluse-unresolved")) {
-        appendDebug(
-          Object.assign(
-            { ts: new Date().toISOString(), event: "ledger_capture_unresolved" },
-            ledger.summarizeUnresolved(parsed.tool_response)
-          )
-        );
-      }
-      process.exit(0);
-      return;
-    }
-
-    ledger.appendIdRecord(sessionKey, {
-      tool_use_id: toolUseId,
-      agent_id: resolved.agentId,
-      name: ledger.resolveDisplayNameFromToolResponse(parsed.tool_response),
-      rules_version: ledger.computeRulesVersion(GUARD_VERSION),
-      ts: new Date().toISOString(),
-    });
-    process.exit(0);
-  } catch (_) {
-    // Capture never blocks — this event does not gate a decision.
-    process.exit(0);
-  }
-}
-
-// ─── SubagentStart — best-effort id capture, never depended on ───────────
+// ─── SubagentStart — verified sole id-capture path ────────────────────────
+// Through PR 2 this ran alongside a PostToolUse (Agent) registration that
+// carried an unverified tool_response-based fallback id-resolution chain.
+// Live verification on 2026-09-06 (6/6 dispatches in one session) showed
+// this handler's top-level `agent_id` + `tool_use_id` fields resolving
+// every dispatch, with zero PostToolUse-sourced "id" records and zero
+// `ledger_capture_unresolved` debug lines — see hooks/README.md's
+// "Capture verified" section. The PostToolUse registration was removed as
+// dead weight rather than kept as an unexercised fallback. This handler
+// remains best-effort in the sense that a harness version whose
+// SubagentStart payload lacks `agent_id`/`tool_use_id` simply records
+// nothing for that dispatch (falls to the "unknown recipient" branch at
+// SendMessage time, same as before) — it just no longer has a second,
+// independently-sourced path backing it up.
 
 function handleSubagentStart(parsed) {
   try {
@@ -511,10 +486,6 @@ function main() {
 
   const hookEventName = typeof parsed.hook_event_name === "string" ? parsed.hook_event_name : "PreToolUse";
 
-  if (hookEventName === "PostToolUse") {
-    handlePostToolUseAgent(parsed);
-    return;
-  }
   if (hookEventName === "SubagentStart") {
     handleSubagentStart(parsed);
     return;
@@ -608,7 +579,6 @@ module.exports = {
   computeFenceMask,
   stripBlockquoteMarkers,
   normalizeLineEndings,
-  handlePostToolUseAgent,
   handleSubagentStart,
   isBlankAfterStrip,
 };
