@@ -511,6 +511,78 @@ test("CLI --dry-run: reports how many differing files would be backed up, withou
   }
 });
 
+// ── --yes / non-TTY fail-fast (this PR) ─────────────────────────────────────
+
+test("CLI with no --yes/--force/--non-interactive and non-TTY stdin: refuses fast naming --yes, writes nothing", () => {
+  const fakeHome = mkTmpDir("install-guards-home-");
+  const fakeProject = mkTmpDir("install-guards-project-");
+  try {
+    // execFileSync defaults to stdio:'pipe' — a pipe is never a TTY, so this
+    // exercises exactly the shape that used to hang forever on
+    // readline.question() waiting for stdin that can never arrive.
+    let threw = null;
+    try {
+      runCli(["--hooks-scope", "project"], { home: fakeHome, cwd: fakeProject });
+    } catch (e) {
+      threw = e;
+    }
+    assert.ok(threw, "must exit non-zero instead of hanging or succeeding");
+    assert.equal(threw.status, 1);
+    assert.match(threw.stderr, /--yes/);
+    assert.match(threw.stderr, /not a TTY/);
+
+    // Nothing was written: no settings file, no copied hook files.
+    assert.equal(fs.existsSync(path.join(fakeProject, ".claude", "settings.local.json")), false);
+    assert.equal(fs.existsSync(path.join(fakeHome, ".claude", "hooks")), false);
+  } finally {
+    rmTree(fakeHome);
+    rmTree(fakeProject);
+  }
+});
+
+test("CLI --dry-run with no --yes/--force: never prompts, even with non-TTY stdin (unaffected by this PR)", () => {
+  const fakeHome = mkTmpDir("install-guards-home-");
+  const fakeProject = mkTmpDir("install-guards-project-");
+  try {
+    // Must NOT throw and must NOT hang: --dry-run bypasses the confirmation
+    // gate entirely, before the TTY check is ever reached.
+    const out = runCli(["--dry-run", "--hooks-scope", "project"], { home: fakeHome, cwd: fakeProject });
+    assert.match(out, /dry-run/i);
+    assert.doesNotMatch(out, /--yes/);
+  } finally {
+    rmTree(fakeHome);
+    rmTree(fakeProject);
+  }
+});
+
+test("CLI --yes --hooks-scope project then --uninstall: skips confirmation and writes, full round trip", () => {
+  const fakeHome = mkTmpDir("install-guards-home-");
+  const fakeProject = mkTmpDir("install-guards-project-");
+  try {
+    runCli(["--yes", "--hooks-scope", "project"], { home: fakeHome, cwd: fakeProject });
+    const settingsPath = path.join(fakeProject, ".claude", "settings.local.json");
+    assert.ok(fs.existsSync(settingsPath), "project settings file must be created");
+    assert.ok(detectOursPresent(settingsPath), "settings must contain judge's guard entries");
+    for (const g of GUARDS) {
+      assert.ok(fs.existsSync(path.join(fakeHome, ".claude", "hooks", g.file)), `${g.file} must be copied`);
+    }
+
+    // -y (the short alias) must behave identically for --uninstall.
+    runCli(["-y", "--hooks-scope", "project", "--uninstall"], { home: fakeHome, cwd: fakeProject });
+    assert.equal(detectOursPresent(settingsPath), false, "guard entries must be gone after uninstall");
+    for (const g of GUARDS) {
+      assert.equal(
+        fs.existsSync(path.join(fakeHome, ".claude", "hooks", g.file)),
+        false,
+        `${g.file} must be removed by uninstall`
+      );
+    }
+  } finally {
+    rmTree(fakeHome);
+    rmTree(fakeProject);
+  }
+});
+
 test("CLI --force real run: backs up a differing hook file and leaves a byte-identical one alone", () => {
   const fakeHome = mkTmpDir("install-guards-home-");
   const fakeProject = mkTmpDir("install-guards-project-");
