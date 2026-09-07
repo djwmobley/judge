@@ -130,7 +130,72 @@ const fs   = require("fs");
 const path = require("path");
 const { appendRotating } = require("./model-routing-guards.log.js");
 const { isBlankAfterStrip } = require("./model-routing-guards.unicode.js");
-const decisions = require("./model-routing-guards.decisions.js");
+
+// docs/specs/routing-scorecard.md §2.1 / R9 — the decisions module is
+// loaded defensively, and EVERY call into it — not just require() itself —
+// is routed through the three safe wrappers below (logDecision/safeHash/
+// safeCrash). Each wrapper (i) checks typeof === "function" before
+// calling, (ii) wraps the call in try/catch, (iii) returns a harmless
+// default (undefined for logDecision/safeCrash, null for safeHash) on ANY
+// failure — require() throwing, a loaded module whose export is present
+// but not a function (install drift replacing a function with an
+// object/undefined — the case a bare require()-guard alone does not
+// cover), or a function that throws when called. No call site in this file
+// calls decisions.appendDecision/appendCrashRecord/hashTarget directly;
+// every one goes through logDecision/safeCrash/safeHash. This guard's
+// decision logic never reads a wrapper's return value in a way that
+// changes its outcome (logDecision/safeCrash are called only for their
+// side effect; safeHash's `null` default is a value the record schema
+// already treats as "no target", never a branch condition) — so a
+// decisions-module failure, in any of the shapes above, can never change
+// this guard's exit code or stdout/stderr on any path, crash path
+// included — including this guard's own documented fail-open behavior.
+let decisions;
+try {
+  decisions = require("./model-routing-guards.decisions.js");
+} catch (_) {
+  decisions = {};
+}
+
+// Each wrapper captures the module's function reference into a local
+// before calling it (never a direct decisions.appendDecision-style
+// call in this file's own source outside this block) — both so a
+// non-function export is caught by the typeof check below and so a later
+// global find/replace of the (un-wrapped) call pattern elsewhere in this
+// file can never accidentally rewrite these three definitions themselves.
+function logDecision(record) {
+  try {
+    const fn = decisions.appendDecision;
+    if (typeof fn === "function") {
+      fn(record);
+    }
+  } catch (_) {
+    // See header comment above.
+  }
+}
+
+function safeHash(target) {
+  try {
+    const fn = decisions.hashTarget;
+    if (typeof fn === "function") {
+      return fn(target);
+    }
+  } catch (_) {
+    // fall through to the harmless default below.
+  }
+  return null;
+}
+
+function safeCrash(rawStdinBufferArg, guard, guardVersion) {
+  try {
+    const fn = decisions.appendCrashRecord;
+    if (typeof fn === "function") {
+      fn(rawStdinBufferArg, guard, guardVersion);
+    }
+  } catch (_) {
+    // See header comment above.
+  }
+}
 
 // ── Paths ──────────────────────────────────────────────────────────────────
 // The debug log lives next to wherever this file itself is actually running
@@ -311,7 +376,7 @@ function main() {
   // called (docs/specs/routing-scorecard.md §2.1 R1) — see captureStdin().
   if (stdinReadFailed) {
     appendDebug({ ts: new Date().toISOString(), event: "fail_open", reason: "stdin_read_error" });
-    decisions.appendDecision(
+    logDecision(
       decisionRecord({ event: "fail_open", reason: "stdin_read_error", session_id: null, agent_id: null, caller: "unknown", tool_name: null })
     );
     process.exit(0);
@@ -324,7 +389,7 @@ function main() {
     parsed = JSON.parse(raw);
   } catch (_) {
     appendDebug({ ts: new Date().toISOString(), event: "fail_open", reason: "json_parse_error" });
-    decisions.appendDecision(
+    logDecision(
       decisionRecord({ event: "fail_open", reason: "json_parse_error", session_id: null, agent_id: null, caller: "unknown", tool_name: null })
     );
     process.exit(0);
@@ -332,7 +397,7 @@ function main() {
 
   if (!parsed || typeof parsed !== "object") {
     appendDebug({ ts: new Date().toISOString(), event: "fail_open", reason: "parsed_not_object" });
-    decisions.appendDecision(
+    logDecision(
       decisionRecord({ event: "fail_open", reason: "parsed_not_object", session_id: null, agent_id: null, caller: "unknown", tool_name: null })
     );
     process.exit(0);
@@ -346,7 +411,7 @@ function main() {
   const tool_name = typeof parsed.tool_name === "string" ? parsed.tool_name : "";
   if (!tool_name) {
     appendDebug({ ts: new Date().toISOString(), event: "fail_open", reason: "missing_tool_name" });
-    decisions.appendDecision(
+    logDecision(
       decisionRecord({
         event: "fail_open",
         reason: "missing_tool_name",
@@ -373,7 +438,7 @@ function main() {
   // quotes: "a normal no-op path, not a fail-open occurrence"). The debug
   // log itself is intentionally left untouched here.
   if (tool_name !== "Agent" && tool_name !== "SendMessage") {
-    decisions.appendDecision(
+    logDecision(
       decisionRecord({
         event: "allow_out_of_scope_tool_name",
         session_id: sessionIdForDecision,
@@ -399,7 +464,7 @@ function main() {
         tool_name,
         tool_use_id: toolUseIdForDecision,
         subagent_type: subagentType,
-        target_hash: decisions.hashTarget(subagentType),
+        target_hash: safeHash(subagentType),
       };
 
       // Step 4: structural capability classification.
@@ -408,7 +473,7 @@ function main() {
           ts: new Date().toISOString(), event: "allow_exempt_type",
           tool_name, subagent_type: subagentType,
         });
-        decisions.appendDecision(decisionRecord(Object.assign({ event: "allow_exempt_type" }, decisionCtx)));
+        logDecision(decisionRecord(Object.assign({ event: "allow_exempt_type" }, decisionCtx)));
         process.exit(0);
       }
 
@@ -420,7 +485,7 @@ function main() {
           ts: new Date().toISOString(), event: "fail_open",
           reason: "prompt_missing_or_non_string", tool_name, subagent_type: subagentType,
         });
-        decisions.appendDecision(
+        logDecision(
           decisionRecord(Object.assign({ event: "fail_open", reason: "prompt_missing_or_non_string" }, decisionCtx))
         );
         process.exit(0);
@@ -431,7 +496,7 @@ function main() {
         ts: new Date().toISOString(), event: signal.ok ? "allow" : "block",
         tool_name, subagent_type: subagentType, via: signal.via, detail: signal.detail,
       });
-      decisions.appendDecision(
+      logDecision(
         decisionRecord(
           Object.assign({ event: signal.ok ? "allow" : "block", via: signal.via, reason: signal.detail }, decisionCtx)
         )
@@ -462,7 +527,7 @@ function main() {
           ts: new Date().toISOString(), event: "allow_sendmessage_not_workassignment",
           tool_name,
         });
-        decisions.appendDecision(
+        logDecision(
           decisionRecord(Object.assign({ event: "allow_sendmessage_not_workassignment" }, decisionCtx))
         );
         process.exit(0);
@@ -473,7 +538,7 @@ function main() {
         ts: new Date().toISOString(), event: signal.ok ? "allow" : "block",
         tool_name, via: signal.via, detail: signal.detail,
       });
-      decisions.appendDecision(
+      logDecision(
         decisionRecord(
           Object.assign({ event: signal.ok ? "allow" : "block", via: signal.via, reason: signal.detail }, decisionCtx)
         )
@@ -497,7 +562,7 @@ function main() {
       ts: new Date().toISOString(), event: "fail_open",
       reason: "internal_exception", message: String(internalErr && internalErr.message || internalErr),
     });
-    decisions.appendDecision(
+    logDecision(
       decisionRecord({
         event: "fail_open",
         reason: "internal_exception",
@@ -534,9 +599,14 @@ if (require.main === module) {
       });
     } catch (_) {}
     // §2.1 R1 — best-effort session recovery from the raw stdin captured
-    // before main() ran; the guard's own exit code (0, unchanged) is
-    // decided independently below.
-    decisions.appendCrashRecord(rawStdinBuffer, "agent-adversary-floor", DECISIONS_GUARD_VERSION);
+    // before main() ran. safeCrash() (see the wrapper block near the top
+    // of this file) already never throws — a missing module, a
+    // non-function export, or a throwing appendCrashRecord are all
+    // absorbed there — so no further try/catch is needed at this, the
+    // guard's last line of defense before its own exit code below (0,
+    // unchanged — this guard's documented fail-open behavior), which is
+    // decided independently of whether this call did anything at all.
+    safeCrash(rawStdinBuffer, "agent-adversary-floor", DECISIONS_GUARD_VERSION);
     process.exit(0);
   }
 }
