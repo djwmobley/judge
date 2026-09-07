@@ -53,6 +53,19 @@ where a guard needs to check session state; it does not implement it.
   without writing anything. This script is never run against a live
   machine as part of this repository's own tests — it is exercised only
   against a temporary settings fixture.
+  - A real (non-`--dry-run`) run normally asks for interactive confirmation
+    on stdin before writing. Pass `--yes` (or `-y`) to skip that prompt for
+    a non-interactive run (CI, an agent shell) — it means "I consent to
+    this run" and nothing more; backups and every other safety check still
+    happen exactly as in an interactive run. `--force` skips the same
+    prompt (identical effect today, kept for backward compatibility and a
+    possible future "overwrite despite a safety check" meaning) but is
+    semantically about overwriting, not consent — it was never a "skip
+    backups" switch, so `--yes` is the flag to reach for when scripting a
+    non-interactive install. If stdin is not a TTY and none of `--yes`,
+    `--force`, `--non-interactive`, or `--dry-run` is given, the prompt
+    could never be answered; the installer refuses immediately (exit 1)
+    naming `--yes` instead of hanging.
 - `docs/independence.md` — the first written law: authoring and
   approving/merging are always two separate dispatches; a spec-adversary
   pass runs before a matcher, parser, validator, or gate is authored, not

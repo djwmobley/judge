@@ -22,9 +22,18 @@
  * hooks or any other tool's entries.
  *
  * Usage:
- *   node scripts/install-guards.js [--dry-run] [--force] [--non-interactive]
+ *   node scripts/install-guards.js [--dry-run] [--yes|-y] [--force] [--non-interactive]
  *                                   [--hooks-scope user|project|auto]
  *                                   [--uninstall] [--help|-h]
+ *
+ * --yes/-y and --force both skip the interactive confirmation prompt; they
+ * are otherwise identical today (--force is kept for backward compatibility
+ * and any future meaning specific to overwriting — see the "Flags" section
+ * of USAGE below for the documented distinction). If stdin is not a TTY and
+ * none of --yes, --force, --non-interactive, or --dry-run is given, the
+ * confirmation prompt could never be answered — main() refuses immediately
+ * (exit 1) naming --yes, instead of hanging on an unanswerable
+ * readline.question().
  *
  * Exit codes: 0 success, 1 error or user abort, 2 refused (malformed input).
  *
@@ -134,7 +143,7 @@ const SUPPORT_DIRS = ['lib'];
 // ─── USAGE ───────────────────────────────────────────────────────────────────
 
 const USAGE = `
-Usage: node scripts/install-guards.js [--dry-run] [--force] [--non-interactive]
+Usage: node scripts/install-guards.js [--dry-run] [--yes|-y] [--force] [--non-interactive]
                                        [--hooks-scope user|project|auto]
                                        [--uninstall] [--help|-h]
 
@@ -149,13 +158,32 @@ left alone).
 
 Flags:
   --dry-run          Show what would happen without writing anything; prints
-                      a unified diff of the settings file.
-  --force            Skip confirmation; overwrite existing hook files.
-  --non-interactive  Same as --force (for CI / scripted setups).
+                      a unified diff of the settings file. Never prompts.
+  --yes, -y          Skip the interactive confirmation prompt. This is the
+                      flag to use for a non-interactive run (CI, an agent
+                      shell with no TTY on stdin): it means "I consent to
+                      this run", nothing more — backups and every other
+                      safety check (backup-before-overwrite, atomic write,
+                      JSON validation) still happen exactly as in an
+                      interactive run.
+  --force            Skip confirmation (same effect as --yes today). Kept
+                      for backward compatibility and reserved for a
+                      possible future "overwrite despite a safety check"
+                      meaning; it is not, and never was, a "skip backups"
+                      switch — overwritten hook files are always backed up
+                      first regardless of which flag was used to skip the
+                      prompt. Prefer --yes when scripting a non-interactive
+                      run: it says what it means.
+  --non-interactive  Same as --force/--yes (for CI / scripted setups).
   --hooks-scope      user | project | auto (default: auto).
   --uninstall        Remove judge's guard entries (and copied hook files)
                       instead of installing them.
   --help, -h         Print this message and exit.
+
+Non-interactive stdin: if stdin is not a TTY and none of --yes, --force,
+--non-interactive, or --dry-run is given, the confirmation prompt could
+never be answered. The installer refuses immediately (exit 1) naming --yes,
+instead of hanging.
 `.trim();
 
 // ─── ARG PARSING ─────────────────────────────────────────────────────────────
@@ -170,6 +198,7 @@ function resolveConfig() {
   const showHelp = args.includes('--help') || args.includes('-h');
   const dryRun   = args.includes('--dry-run');
   const force    = args.includes('--force') || args.includes('--non-interactive');
+  const yes      = args.includes('--yes') || args.includes('-y');
   const uninstall = args.includes('--uninstall');
 
   if (showHelp) { console.log(USAGE); process.exit(0); }
@@ -196,7 +225,7 @@ function resolveConfig() {
   }
 
   return {
-    dryRun, force, uninstall, hooksScopeArg,
+    dryRun, force, yes, uninstall, hooksScopeArg,
     repoRoot, srcHooksDir, destHooksDir,
     userSettingsPath, projectSettingsPath,
   };
@@ -724,7 +753,7 @@ function printReport(report) {
 
 async function main(cfg) {
   const {
-    dryRun, force, uninstall, hooksScopeArg,
+    dryRun, force, yes, uninstall, hooksScopeArg,
     srcHooksDir, destHooksDir,
     userSettingsPath, projectSettingsPath,
   } = cfg;
@@ -743,7 +772,17 @@ async function main(cfg) {
   console.log(`  Hooks scope: ${scope} → ${targetSettingsPath}`);
   console.log('');
 
-  if (!dryRun && !force) {
+  if (!dryRun && !force && !yes) {
+    if (!process.stdin.isTTY) {
+      console.error(
+        'Refusing: stdin is not a TTY, so the interactive confirmation prompt ' +
+        'could never be answered (this would otherwise hang forever).\n' +
+        'Pass --yes (or -y) to skip the confirmation prompt for a ' +
+        'non-interactive run (CI, an agent shell), or --dry-run to preview ' +
+        'without writing anything.'
+      );
+      process.exit(1);
+    }
     const ok = await confirm(
       uninstall
         ? `About to remove judge's guard entries from ${targetSettingsPath} and delete copied hook files from ${destHooksDir}.\nContinue?`
