@@ -24,6 +24,13 @@ const os = require("os");
 const path = require("path");
 
 const HOOK_JS = path.join(__dirname, "agent-model-routing-guard.js");
+// The REAL production SubagentStart entry point (scripts/install-guards.js's
+// GUARDS registry, event: 'SubagentStart') — a separate on-disk file from
+// HOOK_JS that does `require("./agent-model-routing-guard.js").main()`. See
+// the "subagentstart_capture_via_production_shim" regression test below:
+// every other SubagentStart-shaped test in this file spawns HOOK_JS
+// directly, which never exercises this file at all.
+const SHIM_JS = path.join(__dirname, "agent-model-routing-guard-subagentstart.js");
 const { stripNormalize, isBlankAfterStrip, stripInvisible } = require("./model-routing-guards.unicode.js");
 const { PINNED_EXEMPT_TYPES, resolveExemptTypes, sameSet } = require("./model-routing-guards.exempt.js");
 const { validateModelTiers, foldModelTierToken } = require("./lib/local-policy.js");
@@ -64,6 +71,21 @@ function runHook(stdinObj, opts) {
     env.USERPROFILE = home;
   }
   const result = spawnSync(process.execPath, [HOOK_JS], { input, encoding: "utf8", timeout: 10000, env });
+  return { code: result.status != null ? result.status : 1, stdout: result.stdout || "", stderr: result.stderr || "" };
+}
+
+/** Same as runHook(), but spawns SHIM_JS (the real installed SubagentStart
+ * entry point) instead of HOOK_JS directly. */
+function runShim(stdinObj, opts) {
+  opts = opts || {};
+  const input = typeof stdinObj === "string" ? stdinObj : JSON.stringify(stdinObj);
+  const env = Object.assign({}, process.env);
+  const home = opts.home !== undefined ? opts.home : DEFAULT_HOME;
+  if (home) {
+    env.HOME = home;
+    env.USERPROFILE = home;
+  }
+  const result = spawnSync(process.execPath, [SHIM_JS], { input, encoding: "utf8", timeout: 10000, env });
   return { code: result.status != null ? result.status : 1, stdout: result.stdout || "", stderr: result.stderr || "" };
 }
 
@@ -822,6 +844,64 @@ test("subagentstart_capture_verified_shape: top-level agent_id + tool_use_id, no
   } finally {
     cleanupLedgerSession(session);
   }
+});
+
+test("subagentstart_capture_via_production_shim: the real installed SubagentStart entry point (agent-model-routing-guard-subagentstart.js) also captures the id", () => {
+  // Regression for the reported defect (routing-scorecard §2/decision
+  // ledger): the real ~/.claude/hooks state showed
+  // {guard:"agent-model-routing-guard", event:"fail_open",
+  // reason:"json_parse_error", session_id:null} logged on every subagent
+  // dispatch. Root cause: agent-model-routing-guard.js's stdin capture
+  // (captureStdin(), which fills module-scope rawStdinBuffer) was only
+  // ever invoked from its own `if (require.main === module) { ... }`
+  // block — true when this file is executed directly, but ALWAYS false
+  // when entered via SHIM_JS's `require("./agent-model-routing-guard.js"
+  // ).main()`, because `require.main` there is the shim module, not this
+  // one. So on every real SubagentStart dispatch, rawStdinBuffer stayed
+  // `undefined`, main() did `JSON.parse(undefined)` (stringifies to the
+  // non-JSON text "undefined"), and failed open with a bogus
+  // "json_parse_error" before ever reaching handleSubagentStart — silently
+  // breaking id capture on 100% of dispatches. Every OTHER SubagentStart
+  // test in this file (including subagentstart_capture_verified_shape
+  // directly above) spawns HOOK_JS, never the shim, so none of them could
+  // have caught this. This test spawns SHIM_JS — the actual file
+  // scripts/install-guards.js registers for the SubagentStart event — with
+  // a fully valid, production-shaped payload, and asserts the id capture
+  // that guard exists to perform actually happens through it.
+  const session = uniqueSession("ledger-shim-path");
+  const tu = `tu-${Math.random().toString(36).slice(2)}`;
+  const agentId = `agent-${Math.random().toString(36).slice(2)}`;
+  try {
+    const pre = runHook(
+      agentPayload(
+        { model: DRAFTING_MODEL, prompt: "Do it.\nREPORT CAP: 50 words" },
+        { session_id: session, tool_use_id: tu, hook_event_name: "PreToolUse" }
+      )
+    );
+    assert.equal(pre.code, 0);
+
+    const post = runShim(subagentStartPayload(session, tu, agentId));
+    assert.equal(post.code, 0, "SubagentStart capture via the shim must never block");
+
+    const c = ledger.classifyRecipient(agentId);
+    assert.equal(c.kind, "resolved", "the shim must reach handleSubagentStart() and append the id record, not fail open on an unread stdin");
+    assert.equal(c.tier, "drafting");
+  } finally {
+    cleanupLedgerSession(session);
+  }
+});
+
+test("subagentstart_shim_empty_stdin_still_fails_open_cleanly: genuinely empty stdin via the shim is a real parse failure, not silently swallowed or crashed on", () => {
+  // Distinguishes the fixed behavior from the bug: an actually-empty stdin
+  // (the harness failing to pipe anything at all) must still fail open with
+  // json_parse_error — that is correct, unparseable input, on either entry
+  // point. The bug was that the shim produced this SAME outcome even when
+  // stdin was fully valid JSON, because it was never read in the first
+  // place. This test pins the genuinely-empty case never regresses into an
+  // uncaught exception (non-zero/null exit) now that captureStdin() runs
+  // unconditionally inside main().
+  const result = spawnSync(process.execPath, [SHIM_JS], { input: "", encoding: "utf8", timeout: 10000 });
+  assert.equal(result.status, 0, "empty stdin must still fail open (exit 0), never crash");
 });
 
 test("lookup_by_id_exact", () => {

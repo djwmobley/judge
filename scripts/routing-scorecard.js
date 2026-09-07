@@ -859,6 +859,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+  // Exported so a test can assert this equals
+  // hooks/model-routing-guards.decisions.js's own STATE_DIR (the ledger
+  // WRITER's directory) without duplicating the path or re-deriving it —
+  // see hooks/routing-scorecard.test.js's
+  // "default_state_dir_matches_decisions_module" test.
+  DEFAULT_STATE_DIR,
   parseArgs,
   resolveWindow,
   normalizeRecord,

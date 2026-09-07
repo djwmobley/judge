@@ -24,6 +24,7 @@ const path = require("path");
 const { execFileSync } = require("child_process");
 
 const sc = require("../scripts/routing-scorecard.js");
+const decisionsModule = require("../hooks/model-routing-guards.decisions.js");
 
 const SCRIPT = path.join(__dirname, "..", "scripts", "routing-scorecard.js");
 
@@ -665,6 +666,64 @@ test("state_dir_override: --state-dir reads only the alternate directory, ignori
     assert.equal(parsed.decisions, 1);
   } finally {
     rmTree(altDir);
+  }
+});
+
+// Regression for the reported defect: `node scripts/routing-scorecard.js`
+// run with no `--state-dir` flag reported "sessions 0, decisions 0,
+// NO-DATA" even with a fully populated real STATE_DIR on disk, because
+// hooks/model-routing-guards.decisions.js never re-exported STATE_DIR from
+// model-routing-guards.state.js — decisionsModule.STATE_DIR was
+// `undefined`, so scripts/routing-scorecard.js:18's
+// `DEFAULT_STATE_DIR = decisionsModule.STATE_DIR` was also `undefined`,
+// and listLedgerFiles()'s fs.readdirSync(undefined) fails inside its own
+// fail-soft try/catch, silently returning zero files every time — no
+// matter how populated the real ledger writer's own directory was.
+test("default_state_dir_matches_decisions_module: routing-scorecard's default STATE_DIR is the exact directory hooks/model-routing-guards.decisions.js writes the ledger to (not undefined, not a re-derived duplicate path)", () => {
+  assert.equal(typeof decisionsModule.STATE_DIR, "string");
+  assert.ok(decisionsModule.STATE_DIR.length > 0, "decisionsModule.STATE_DIR must not be empty");
+  assert.equal(
+    sc.DEFAULT_STATE_DIR,
+    decisionsModule.STATE_DIR,
+    "scripts/routing-scorecard.js's DEFAULT_STATE_DIR must equal hooks/model-routing-guards.decisions.js's own STATE_DIR — same module instance (Node's require cache resolves both relative requires to the identical absolute path), so this can only fail if the export is missing or shadowed again"
+  );
+});
+
+// Regression: production ledger filenames come in two shapes —
+// "routing-decisions.<sanitized session id>.<h8>.jsonl" (per-session) and
+// "routing-decisions.global-YYYY-MM-DD.<h8>.jsonl" (the session_id: null
+// fallback bucket, e.g. every fail_open logged before a session id is
+// parsed). Both must be discovered and counted by the reader with no
+// --state-dir override needed beyond pointing at the directory they live
+// in — this pins LEDGER_FILENAME_RE/GLOBAL_FALLBACK_KEY_RE against the
+// exact real-world filenames (a UUID-shaped session id with dashes, and
+// the literal "global-YYYY-MM-DD" key) rather than only the synthetic
+// short keys ("alt-session", "s1", etc.) most of this file's other tests
+// use.
+test("production_filename_shapes_are_counted: both the per-session and global-fallback filename shapes are read and counted", () => {
+  const dir = mkTmpDir();
+  try {
+    writeLedgerFile(
+      dir,
+      "02bd416a-13de-40b1-aabe-79f707e2e0ad",
+      [
+        { session_id: "02bd416a-13de-40b1-aabe-79f707e2e0ad", guard: "orchestrator-tool-guard", event: "exempt_subagent", tool_name: "Bash" },
+      ],
+      "039e8e55"
+    );
+    writeLedgerFile(
+      dir,
+      "global-2026-09-07",
+      [{ session_id: null, guard: "agent-model-routing-guard", event: "fail_open", reason: "json_parse_error" }],
+      "0834c41f"
+    );
+    const { outputs } = sc.run(["--state-dir", dir, "--window", "1d"]);
+    const r = outputs[0].report;
+    assert.equal(r.totalDecisions, 2, "both filename shapes must be counted toward decisions");
+    assert.equal(r.sessionsCount, 1, "only the per-session file's session_id counts toward sessions — the global file's is null");
+    assert.equal(r.healthFailureCount, 1, "the global-fallback record classifies health_failure, per isHealthFailure()");
+  } finally {
+    rmTree(dir);
   }
 });
 
