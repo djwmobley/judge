@@ -99,6 +99,22 @@ const GUARDS = [
     event: 'SubagentStart',
     matcher: null,
   },
+  // Explicit 30s timeout (10s of margin over this guard's own internal
+  // 20s classification deadline — see the guard's own header comment):
+  // Claude Code's documented platform default hook timeout is 600s, and a
+  // hook killed for exceeding ITS timeout has its output discarded (the
+  // harness then treats that the same as an ordinary no-output allow) —
+  // an explicit, much shorter registered timeout plus the guard's own
+  // internal deadline both exist so a stuck classification pass fails
+  // into this guard's own UNKNOWN-block path well before either timeout
+  // could turn "stuck" into a silent allow.
+  {
+    id: 'stop-stale-worktrees-guard',
+    file: 'stop-stale-worktrees-guard.js',
+    event: 'Stop',
+    matcher: null,
+    timeout: 30,
+  },
 ];
 
 // Files copied into the destination hooks directory alongside the guards
@@ -330,11 +346,15 @@ function mergeGuardHooks(settings, opts) {
 
   const innerToRemove = new Set();
   const groupsToCheckEmpty = new Set();
-  const additions = []; // { event, matcher, command }
+  const additions = []; // { event, matcher, command, timeout? }
 
   for (const g of GUARDS) {
     const list = candidates[g.id];
     const command = `node ${path.join(hooksDir, g.file).replace(/\\/g, '/')}`;
+    // `timeout` is an explicit per-guard opt-in (currently only
+    // stop-stale-worktrees-guard) — most guards rely on Claude Code's
+    // documented 600s platform default and declare nothing here.
+    const timeout = typeof g.timeout === 'number' ? g.timeout : undefined;
 
     if (uninstall) {
       if (list.length > 0) {
@@ -348,7 +368,7 @@ function mergeGuardHooks(settings, opts) {
     }
 
     if (list.length === 0) {
-      additions.push({ event: g.event, matcher: g.matcher, command });
+      additions.push({ event: g.event, matcher: g.matcher, command, timeout });
       report.added.push(g.id);
       continue;
     }
@@ -364,17 +384,27 @@ function mergeGuardHooks(settings, opts) {
     }
 
     if (keep.event === g.event && keep.matcher === g.matcher) {
+      let changed = false;
       if (keep.innerRef.command !== command) {
         keep.innerRef.command = command;
-        report.repointed.push(g.id);
+        changed = true;
       }
+      // Only a guard that actually declares a timeout owns that field on
+      // its own entry — never touches/clears a field on a guard that
+      // doesn't declare one (no guard currently sets one by hand, but this
+      // keeps a future manual edit for an undeclared guard untouched).
+      if (timeout !== undefined && keep.innerRef.timeout !== timeout) {
+        keep.innerRef.timeout = timeout;
+        changed = true;
+      }
+      if (changed) report.repointed.push(g.id);
       continue;
     }
 
     // keep lives at the wrong (event, matcher) — move it.
     innerToRemove.add(keep.innerRef);
     groupsToCheckEmpty.add(keep.groupRef);
-    additions.push({ event: g.event, matcher: g.matcher, command });
+    additions.push({ event: g.event, matcher: g.matcher, command, timeout });
     report.moved.push({ id: g.id, from: keep.event, to: g.event });
   }
 
@@ -402,10 +432,12 @@ function mergeGuardHooks(settings, opts) {
       const entryMatcher = typeof entry.matcher === 'string' ? entry.matcher : null;
       return entryMatcher === add.matcher;
     });
+    const newInner = { type: 'command', command: add.command };
+    if (add.timeout !== undefined) newInner.timeout = add.timeout;
     if (target) {
-      target.hooks.push({ type: 'command', command: add.command });
+      target.hooks.push(newInner);
     } else {
-      const newGroup = { hooks: [{ type: 'command', command: add.command }] };
+      const newGroup = { hooks: [newInner] };
       if (add.matcher !== null) newGroup.matcher = add.matcher;
       hooks[add.event].push(newGroup);
     }

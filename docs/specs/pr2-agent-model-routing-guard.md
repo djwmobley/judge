@@ -619,7 +619,7 @@ wording as-is.
       port wired `PreToolUse` / `Agent|SendMessage`, the ledger capture
       wired `PostToolUse` / `Agent` (owner decision D3). **Superseded
       2026-09-06:** the `PostToolUse` / `Agent` registration was verified
-      unused and removed (see §4) — the array now has 10 entries.
+      unused and removed (see §4) — the array now has 11 entries.
 - [ ] `hooks/README.md` has a new guard section (and a ledger subsection
       or section, per where capture ends up living).
 - [ ] `npm test` reports the expected new total (692 + 52 + 14 + 8 = 766,

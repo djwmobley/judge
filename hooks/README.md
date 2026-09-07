@@ -296,6 +296,72 @@ removed rather than kept as an unexercised fallback:
   independence between author and approver/merger is structural, not a
   courtesy (see `docs/independence.md`).
 
+### stop-stale-worktrees-guard.js
+- **Event:** `Stop` (registered with an explicit **30-second timeout** —
+  see `scripts/install-guards.js`'s `GUARDS` entry — 10s of margin over
+  this guard's own internal 20s classification deadline).
+- **Blocks:** the session from ending while the repo containing the
+  resolved project directory has a stale linked worktree or a stale local
+  branch. Resolves the target directory via `CLAUDE_PROJECT_DIR`, then
+  stdin `cwd`, then `process.cwd()` — never a raw, unvalidated `cwd` alone.
+- **Worktree classes:** `ok` (on the base branch, or not prunable/dir
+  exists/branch active), `stale` (prunable, missing directory, or a
+  `git worktree prune --dry-run` hit — fix leads with `git worktree
+  unlock` if locked, then `remove`/`prune`; or a linked worktree whose
+  checked-out branch itself classifies stale — combined fix), `unknown`
+  (detached HEAD with no in-progress marker — no fix offered), and
+  `in-progress-operation` (primary worktree only, detached HEAD with a
+  `rebase-merge`/`rebase-apply`/`MERGE_HEAD`/`CHERRY_PICK_HEAD`/
+  `BISECT_START`/`REVERT_HEAD` marker present — allows with a naming
+  `systemMessage` instead of blocking a mid-flight handoff).
+- **Branch classes (first match wins):** `ok` (is the base branch, or tip
+  equals base with no upstream — `empty-local`, never targeted for
+  deletion — or tip equals base with a live, non-gone upstream), `stale`
+  (gone upstream `[gone]`; local tip is an ancestor of base; local tip's
+  tree matches one of the base's last 500 commit trees; `git cherry`
+  reports every local commit already applied; or none of those fire on
+  the LOCAL tip but the branch's own UPSTREAM ref's cached tip
+  independently matches one of the same three detectors — catches a
+  branch reset to base after a squash-merge whose remote copy still holds
+  the pre-reset history), and `active` (none of the above). Ancestor-stale
+  branches get a `-d` fix (git can verify these itself); every other stale
+  row leads with `-D` plus an inline comment, and the upstream-tip row
+  adds an operator-confirmed `git push origin --delete` line on its own.
+  If the checked-out branch (in the PRIMARY worktree only) classifies
+  stale, its fix leads with `git checkout <base>`.
+- **Deadline:** a 20-second internal wall-clock budget from hook start,
+  checked between steps and enforced again via a per-call `timeout` on
+  every individual git subprocess (sized to whatever budget remains when
+  that call is spawned) — either expiry is a block naming what was and
+  wasn't classified yet, never a silent allow. Git calls are batched
+  (`for-each-ref` once, the base's candidate tree set once) rather than
+  issued per branch; `merge-base --is-ancestor` and, only when still
+  unresolved, `git cherry` remain per-branch.
+- **Bypass:** `JUDGE_STOP_GUARD=off`, read from the hook process's own
+  inherited environment — allows with a `systemMessage` stating the
+  bypass is active. **Accepted blind spot:** an agent with write access to
+  `.claude/settings.json` could add this to its `env` block itself,
+  indistinguishable from a genuine operator-set variable once inherited;
+  closing that needs a separate guard restricting writes to that file,
+  out of scope here.
+- **Other declared blind spots** (see the guard's own header and
+  `docs/specs/stop-stale-worktrees-guard.md` §8 for the full list): a
+  squash-merge whose matching base commit falls outside the 500-commit
+  window misclassifies as active; one trivial extra commit on top of
+  already-squash-merged content defeats the tree-equality/cherry
+  detectors by design (this guard's threat model is a forgetful agent,
+  not an adversarial one); a repo with very many never-merged branches can
+  still exhaust the 20s deadline on every Stop call (only the global
+  bypass escapes that, disabling ALL staleness detection, not just the
+  expensive path); classification is entirely local-ref-based and never
+  runs `git fetch`; a resolved `main`/`master` (including via
+  `origin/HEAD`) is never verified against the team's actual live
+  integration branch, including the fork-workflow variant where `origin`
+  is the contributor's own fork; and a linked worktree that is itself
+  mid-rebase/mid-cherry-pick gets no special treatment (that allowance is
+  primary-worktree-only) and still falls to the ordinary
+  linked-detached-HEAD `unknown` row.
+
 ### model-routing-guards.state.js / .unicode.js / .log.js / .exempt.js
 Shared plumbing used by the guards above, not hooks in their own right:
 - `state.js` — the per-session ledger (Read/Edit tallies) `rules.js` reads
