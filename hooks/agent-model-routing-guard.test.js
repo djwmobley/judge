@@ -23,6 +23,32 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
+// Redirect every state/ledger file this file's own in-process requires AND
+// every subprocess it spawns (runHook/runShim/runHookAsync below all copy
+// `process.env` at call time via `Object.assign({}, process.env)`, so this
+// propagates automatically) write into a per-test-file temp directory
+// instead of this repo's own gitignored hooks/state. Must be set before
+// the first `require("./model-routing-guards.state.js")` anywhere in this
+// process (including transitively, via `guard`/`ledger` below) — state.js
+// reads MODEL_ROUTING_STATE_DIR once, at module-load time. Without this,
+// hooks/agent-model-routing-guard.js's appendDecision calls (spawned via
+// HOOK_JS/SHIM_JS below) wrote `routing-decisions.<key>.<h8>.jsonl` files
+// straight into this repo's own hooks/state, and this file's own
+// cleanupLedgerSession() never removed them — it only knows the
+// agent-tier-ledger.*/.once filenames it constructs itself, never the
+// decision ledger's sha256-derived `h8` filename component (see
+// hooks/model-routing-guards.decisions.js's h8()), so those files were
+// never cleaned up: the leftover-fixture defect this override fixes.
+const STATE_DIR_OVERRIDE = fs.mkdtempSync(path.join(os.tmpdir(), "amrg-state-"));
+process.env.MODEL_ROUTING_STATE_DIR = STATE_DIR_OVERRIDE;
+test.after(() => {
+  try {
+    fs.rmSync(STATE_DIR_OVERRIDE, { recursive: true, force: true, maxRetries: 3 });
+  } catch (_) {
+    // best effort
+  }
+});
+
 const HOOK_JS = path.join(__dirname, "agent-model-routing-guard.js");
 // The REAL production SubagentStart entry point (scripts/install-guards.js's
 // GUARDS registry, event: 'SubagentStart') — a separate on-disk file from
@@ -1116,4 +1142,38 @@ test("ledger_record_tier_invalid_blocks: a resolved record whose tier is corrupt
   } finally {
     cleanupLedgerSession(session);
   }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// fixture_isolation — regression for the 393-file routing-decisions.*.jsonl
+// leftover-fixture defect (see the MODEL_ROUTING_STATE_DIR override block
+// near the top of this file).
+// ══════════════════════════════════════════════════════════════════════════
+
+test("fixture_isolation: this file's own fixture-writing helper (captureAgent) never leaves a routing-decisions.*.jsonl file in the REAL (non-overridden) hooks/state", () => {
+  // Deliberately re-derives the real STATE_DIR the same __dirname-relative
+  // way model-routing-guards.state.js computes its own default — `state`'s
+  // own `state.STATE_DIR` is NOT used here, since with
+  // MODEL_ROUTING_STATE_DIR set for this whole file it now points at
+  // STATE_DIR_OVERRIDE, which is exactly the isolation under test.
+  const realStateDir = path.join(__dirname, "state");
+  const routingDecisionsFiles = (dir) =>
+    fs.existsSync(dir) ? new Set(fs.readdirSync(dir).filter((f) => f.startsWith("routing-decisions."))) : new Set();
+  const before = routingDecisionsFiles(realStateDir);
+
+  const session = uniqueSession("fixture-isolation-check");
+  try {
+    const { agentId } = captureAgent(session, { tier: "drafting" });
+    assert.equal(typeof agentId, "string");
+  } finally {
+    cleanupLedgerSession(session);
+  }
+
+  const after = routingDecisionsFiles(realStateDir);
+  const newFiles = [...after].filter((f) => !before.has(f));
+  assert.deepEqual(
+    newFiles,
+    [],
+    `expected no new routing-decisions.*.jsonl fixture in the real hooks/state, found: ${newFiles.join(", ")}`
+  );
 });

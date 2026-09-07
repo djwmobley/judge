@@ -22,6 +22,12 @@ const path = require("path");
 const crypto = require("crypto");
 
 const state = require("./model-routing-guards.state.js");
+// STATE_DIR here is exactly state.js's own STATE_DIR (see that module's
+// header comment on the MODEL_ROUTING_STATE_DIR test-only override) —
+// this module never re-derives or overrides it independently, so a test
+// that sets MODEL_ROUTING_STATE_DIR before this module is first required
+// redirects the decision ledger the same way it redirects every other
+// state file.
 const { STATE_DIR, sanitizeForFilename } = state;
 const { isBlankAfterStrip } = require("./model-routing-guards.unicode.js");
 

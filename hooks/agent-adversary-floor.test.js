@@ -45,11 +45,34 @@
 //   H26  SendMessage, with exemption marker -> ALLOW
 //   H27  empty stdin -> ALLOW (fail-open)
 
-const { test }         = require("node:test");
+const { test, after }  = require("node:test");
 const assert           = require("node:assert/strict");
 const fs               = require("fs");
+const os               = require("os");
 const path             = require("path");
 const { execFileSync } = require("child_process");
+
+// Redirect every state/ledger file this file's own in-process `require(HOOK_PATH)`
+// AND every subprocess runHook() spawns write into a per-test-file temp
+// directory instead of this repo's own gitignored hooks/state. Must be set
+// before the first `require("./model-routing-guards.state.js")` — reached
+// transitively via `require(HOOK_PATH)` below, since
+// hooks/agent-adversary-floor.js itself calls appendDecision — because
+// state.js reads MODEL_ROUTING_STATE_DIR once, at module-load time.
+// Without this: this file never sets `session_id` on any fixture payload
+// (every runHook() call below omits it), so every appendDecision call here
+// fell to the shared `global-YYYY-MM-DD` fallback file (§2.1) — the same
+// file every OTHER process on this machine also appends to — and this file
+// had no cleanup of any kind for it.
+const STATE_DIR_OVERRIDE = fs.mkdtempSync(path.join(os.tmpdir(), "aaf-state-"));
+process.env.MODEL_ROUTING_STATE_DIR = STATE_DIR_OVERRIDE;
+after(() => {
+  try {
+    fs.rmSync(STATE_DIR_OVERRIDE, { recursive: true, force: true, maxRetries: 3 });
+  } catch (_) {
+    // best effort
+  }
+});
 
 const HOOK_PATH  = path.join(__dirname, "agent-adversary-floor.js");
 const DEBUG_LOG  = path.join(__dirname, "agent-adversary-floor-debug.log");
@@ -318,4 +341,37 @@ test("H27: empty stdin -> ALLOW (fail-open)", () => {
   const { exitCode, stderr } = runHook("", true);
   assert.equal(exitCode, 0, `expected exit 0 on empty stdin, got ${exitCode}`);
   assert.equal(stderr, "");
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// fixture_isolation — regression for the 393-file routing-decisions.*.jsonl
+// leftover-fixture defect (see the MODEL_ROUTING_STATE_DIR override block
+// near the top of this file). This file never sets a `session_id` on any
+// payload, so every appendDecision call it triggers falls to the shared
+// `global-YYYY-MM-DD` fallback file — the highest-risk case, since that
+// filename is shared with every other process on the machine and this file
+// previously had no cleanup for it at all.
+// ══════════════════════════════════════════════════════════════════════════
+
+test("fixture_isolation: this file's own fixture-writing helper (runHook) never leaves a routing-decisions.*.jsonl file in the REAL (non-overridden) hooks/state", () => {
+  // Deliberately re-derives the real STATE_DIR the same __dirname-relative
+  // way model-routing-guards.state.js computes its own default — with
+  // MODEL_ROUTING_STATE_DIR set for this whole file, requiring that module
+  // directly would return STATE_DIR_OVERRIDE, which is exactly the
+  // isolation under test here, not the thing to assert against.
+  const realStateDir = path.join(__dirname, "state");
+  const routingDecisionsFiles = (dir) =>
+    fs.existsSync(dir) ? new Set(fs.readdirSync(dir).filter((f) => f.startsWith("routing-decisions."))) : new Set();
+  const before = routingDecisionsFiles(realStateDir);
+
+  const { exitCode } = runHook(agentPayload("general-purpose", "no clause, no marker"));
+  assert.equal(exitCode, 2, "expected the write-capable spawn to BLOCK (this still appends a decision record)");
+
+  const after = routingDecisionsFiles(realStateDir);
+  const newFiles = [...after].filter((f) => !before.has(f));
+  assert.deepEqual(
+    newFiles,
+    [],
+    `expected no new routing-decisions.*.jsonl fixture in the real hooks/state, found: ${newFiles.join(", ")}`
+  );
 });
