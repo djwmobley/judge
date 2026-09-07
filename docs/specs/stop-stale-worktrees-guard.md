@@ -186,9 +186,9 @@ First match wins, in this order:
 | 3 | stale | local tip is an ancestor of base (`merge-base --is-ancestor` exits 0) AND local tip != base tip | `git branch -d <name>` (git can verify ordinary ancestry itself, so `-d` succeeds) |
 | 4 | stale | local tip's tree equals the tree of any commit in `git rev-list --max-count=500 <base>` (squash-merge signature) | `git branch -D <name>  # squash-merged: -d will refuse; evidence: tree-equality` |
 | 5 | stale | `git cherry <base> <branch>` on the local tip reports every commit already applied (all lines start with `-`), ≥1 commit (rebase-merged signature) | `git branch -D <name>  # squash-merged: -d will refuse; evidence: cherry` |
-| 6 | stale | upstream configured, not gone, and the **upstream ref's tip** (not the local tip — rows 3–5 already ruled the local tip out) independently satisfies the ancestor, tree-equality, or cherry detector against base | `git branch -D <name>  # squash-merged: -d will refuse; evidence: upstream-tip-<ancestor\|tree-equality\|cherry>`, then on its own line `git push origin --delete <name>` — labeled in `reason` as an **operator-confirmed step**: it mutates the remote, is externally visible, and this guard only ever emits fix text, never runs anything |
+| 6 | stale | upstream configured, not gone, the **upstream ref's tip is not itself equal to base's tip** (a trivial self-match guard — without it a branch whose upstream happens to BE base's own remote-tracking ref, e.g. freshly created via `git worktree add -b <name> origin/main` with no commits of its own yet, would have upstream-tip == base-tip, and `merge-base --is-ancestor X X` trivially returns true; this is not evidence of staleness, it's row 7/8 territory), and the **upstream ref's tip** (not the local tip — rows 3–5 already ruled the local tip out) independently satisfies the ancestor, tree-equality, or cherry detector against base | `git branch -D <name>  # squash-merged: -d will refuse; evidence: upstream-tip-<ancestor\|tree-equality\|cherry>`, then on its own line `git push origin --delete <name>` — labeled in `reason` as an **operator-confirmed step**: it mutates the remote, is externally visible, and this guard only ever emits fix text, never runs anything |
 | 7 | ok (`empty-local`) | local tip == base tip AND no upstream configured | — (a fresh branch about to receive work; never suggest deleting it) |
-| 8 | ok | local tip == base tip AND upstream present, not gone, AND the upstream tip does not independently satisfy row 6 | — |
+| 8 | ok | local tip == base tip AND upstream present, not gone, AND (the upstream tip equals base's own tip — the trivial self-match case row 6 excludes — OR the upstream tip does not independently satisfy row 6's detectors) | — |
 | 9 | active | none of the above matched | none |
 
 Any git failure (including a per-call timeout, §3 Deadline) while
@@ -340,6 +340,7 @@ following `no-punt-guard.test.js`'s subprocess pattern.
 | `branch_reset_to_base_with_stale_upstream_squash_signature_stale` | local branch reset to base's tip after a squash-merge; upstream ref still holds pre-reset, already-squash-merged commits | block, evidence `upstream-tip-tree-equality`, `-D` + `git push origin --delete` on its own line |
 | `branch_active_no_upstream` | unpushed commits, no upstream | allow |
 | `branch_active_upstream_present` | tracking live remote, ahead, upstream tip also unmerged | allow |
+| `branch_upstream_equals_base_tip_empty_local_not_stale` | fresh branch whose upstream is set directly to base's own remote-tracking ref (e.g. via `worktree add -b <name> origin/main`), no commits of its own yet | allow — row 6's trivial self-match guard prevents `merge-base --is-ancestor X X` from misclassifying this as stale |
 | `git_failure_during_item_classification_unknown_blocks` | one branch's `merge-base`/`cherry` call forced to fail | that item unknown, block; other items classify normally |
 | `git_call_timeout_treated_as_failure_unknown_blocks` | one git call hangs past its per-call timeout | that item unknown, block; reason distinguishes timeout from a hard failure |
 | `checked_out_branch_stale_suggests_checkout_first` | current branch is ancestor (has diverged history, not empty-local) | block, leads with `checkout <base>` |
@@ -498,3 +499,36 @@ findings were dispositioned as fixed or accepted blind spots — see §10,
 | R2-C1 | fixed | §2 | Same defect and same fix as R2-A3 — the `CLAUDE_PROJECT_DIR`-first resolution order closes both framings of the gap at once. |
 | R2-C2 | fixed | §5 | Output contract is now pinned to `no-punt-guard.js`'s exact, deployed, cited convention rather than an independently-reverified reading of platform docs. |
 | R2-C3 | fixed | §2 | Three-level fallback (`CLAUDE_PROJECT_DIR` → stdin `cwd` → `process.cwd()`) means a missing stdin `cwd` no longer leaves the guard without a target directory. |
+
+## 12. Author smoke-run finding
+
+During implementation, a real smoke run of the finished hook against a
+live repo (`CLAUDE_PROJECT_DIR` pointed at this guard's own linked
+development worktree) produced a **false positive**: the hook blocked,
+flagging the guard's own in-progress feature branch as stale via
+`evidence: upstream-tip-ancestor`.
+
+- **Cause:** the branch had been created via `git worktree add -b <name>
+  origin/main` — its upstream was set directly to the BASE's own
+  remote-tracking ref, with no commits of its own yet. §3 Branches row 6
+  (as originally written) checked whether the upstream ref's tip
+  satisfies the ancestor/tree-equality/cherry detectors against base with
+  no guard against the upstream tip being IDENTICAL to base's own tip.
+  Since `git merge-base --is-ancestor X X` always exits 0 (a commit is
+  trivially an ancestor of itself), every such freshly-created,
+  not-yet-diverged branch tracking base's own remote ref misclassified as
+  stale on its very first `Stop` invocation.
+- **Fix:** row 6 (§3 Branches) now requires the upstream ref's tip to be
+  **unequal** to base's tip before running any of the three detectors
+  against it — the same trivial-self-match exclusion rows 3–5 already
+  apply to the LOCAL tip. A branch in this state now correctly falls
+  through to row 8 (`ok`). See §3's row 6/row 8 text above (both updated
+  to reflect this) and the code's own comment at the guard clause
+  immediately before row 6's detector calls.
+- **Regression test:** `branch_upstream_equals_base_tip_empty_local_not_stale`
+  (§7) — a fresh branch whose upstream is set directly to `origin/main`,
+  no divergence yet, must allow.
+
+This finding and fix predate the PR's initial submission; this section
+exists so the spec's own record matches what the shipped code does,
+rather than describing only the pre-fix row 6 behavior.

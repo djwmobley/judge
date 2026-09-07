@@ -223,6 +223,16 @@ test("scope_submodule_in_scope: target dir inside a submodule classifies the sub
   try {
     git(outer, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", subSource.replace(/\\/g, "/"), "sub"]);
     const subDir = path.join(outer, "sub");
+    // A cloned submodule checkout does NOT inherit the outer repo's local
+    // user.email/user.name config -- on a clean CI runner with no global
+    // git identity configured at all, the writeAndCommit below fails with
+    // "unable to auto-detect email address". Every repo this test suite
+    // commits into needs its own explicit identity (initRepo() already
+    // does this for repos it creates directly; a clone needs it set
+    // separately since it isn't created via initRepo()).
+    git(subDir, ["config", "user.email", "test@example.com"]);
+    git(subDir, ["config", "user.name", "Test User"]);
+    git(subDir, ["config", "commit.gpgsign", "false"]);
     // `submodule add` leaves the submodule with an "origin" remote whose
     // remote-tracking HEAD/main are frozen at clone time -- removing it
     // avoids that becoming the resolved base (a stale-remote-ref scenario
