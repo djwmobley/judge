@@ -73,6 +73,30 @@ reimplementing their primitives:
   between the sanitized key and `.jsonl`, so it changes nothing about
   this prefix/suffix isolation — `startsWith("routing-decisions.")` /
   `endsWith(".jsonl")` still match every file this module writes.
+- **Test isolation: `MODEL_ROUTING_STATE_DIR` override.** `STATE_DIR`
+  (`model-routing-guards.state.js`) is `__dirname`-relative by design — an
+  installed hook always runs from inside the installed `~/.claude/hooks/`
+  tree, so `path.join(__dirname, "state")` is exactly that tree's own
+  `state/` with no configuration needed. When the environment variable
+  `MODEL_ROUTING_STATE_DIR` is set (checked once, at module-load time),
+  `STATE_DIR` is that directory instead — every module in this guard
+  family (`model-routing-guards.state.js`, and
+  `model-routing-guards.decisions.js` via its re-exported `STATE_DIR`)
+  honors the same override, since neither derives it independently.
+  Unset, behavior is unchanged. Its sole purpose is letting
+  `hooks/orchestrator-tool-guard.test.js`,
+  `hooks/agent-model-routing-guard.test.js`, and
+  `hooks/agent-adversary-floor.test.js` redirect the *subprocess* guard
+  invocations they spawn into a per-test-file `os.tmpdir()` directory,
+  since a spawned guard's `appendDecision` writes a
+  `routing-decisions.<key>.<h8>.jsonl` file whose `h8` component is an
+  unpredictable sha256 hash a test's own cleanup-by-exact-name logic
+  cannot reconstruct — the root cause of a defect where hundreds of these
+  fixture files accumulated, uncleaned, in this repo's own gitignored
+  `hooks/state`. `--state-dir` (§5.1) is the analogous, CLI-facing
+  override for `scripts/routing-scorecard.js`'s own read path; the two are
+  independent (`--state-dir` never sets this environment variable, and
+  vice versa).
 - **Sweep (owner ruling R2).** Calls
   `cleanupOldStateFiles(SEVEN_DAYS_MS, "routing-decisions.", ".jsonl",
   SWEEP_MIN_AGE_MS)` with `SWEEP_MIN_AGE_MS = 60000` — a new local
@@ -679,7 +703,7 @@ copy of that sweep, not a saving).
 | `--session <id>` | — | Restrict to one session's ledger file (implies `--per-session` framing for that one session; incompatible with a broad `--aggregate` claim across sessions that don't exist in scope). |
 | `--per-session` / `--aggregate` | `--aggregate` | Per-session breakout vs. summed totals. |
 | `--json` / `--text` | `--text` | Output format. |
-| `--state-dir <path>` | this repo's own `STATE_DIR` | Points the reader at an alternate directory — e.g. verifying an installed `~/.claude/hooks/state` tree instead of the repo checkout's own. |
+| `--state-dir <path>` | `<CLAUDE_CONFIG_DIR or ~/.claude>/hooks/state` (`resolveDefaultStateDir()`) — the INSTALLED tree's own state directory, never this repo checkout's own `hooks/state` | Points the reader at an alternate directory — e.g. an alternate installed tree, or a test fixture directory. |
 | `--fail-on-threshold` | off | Opt-in: exit 1 if the verdict is `FAIL`. Without this flag, the script always exits 0 regardless of verdict (a diagnostic tool by default, not a CI gate someone enables by accident). **Advisory only, never an enforcement gate (owner ruling R6)** — see §6: win-pairing has no causal link back to the underlying work, so a verdict this flag would fail on can be manufactured by re-issuing a trivial matching call, not just earned by genuinely fixing routing. `--fail-on-threshold` is provided for a human or a non-blocking CI annotation to notice a FAIL, not as something a merge/deploy gate should key off of. |
 
 ### 5.2 Parser rules (binding on the reader, not just style)
@@ -1109,6 +1133,8 @@ more "correct" than the other under the current discovery logic.
 | `per_session_vs_aggregate` | Two sessions' ledger files, differing block/allow counts — `--per-session` reports each separately; default `--aggregate` sums them; the two never silently disagree on total decision count. |
 | `fail_on_threshold_exit_code` | A FAIL-verdict fixture: exits 0 without `--fail-on-threshold`, exits 1 with it. A PASS-verdict fixture with `--fail-on-threshold`: exits 0. |
 | `state_dir_override` | `--state-dir <alt>` reads from the alternate directory only, ignoring any fixture files placed in the default `STATE_DIR`. |
+| `default_state_dir_resolves_under_home_config_not_repo` | With no `--state-dir`, `DEFAULT_STATE_DIR`/`resolveDefaultStateDir()` resolves under `<CLAUDE_CONFIG_DIR or ~/.claude>/hooks/state` — never this repo checkout's own `hooks/state`, and never `hooks/model-routing-guards.decisions.js`'s own (repo-relative) `STATE_DIR`; both the `CLAUDE_CONFIG_DIR`-set and unset cases are covered. |
+| `state_dir_printed_in_text_header` | The `--text` output's header line names the resolved state directory (honoring `--state-dir` when given). |
 | `escape_classification_matches_design` | A `fail_open` record from `agent-adversary-floor` with a real `session_id` (policy fail-open, `reason: "internal_exception"`) and an `orchestrator_direct_shell` record both count toward `escape`; a `block` record with `finding_ids: ["internal_exception"]` from `orchestrator-tool-guard` or `agent-model-routing-guard` does **not** count toward `escape` (§4.6's note) — this test exists specifically to pin the §3.1/§3.2 vs. §3.3 asymmetry described in §6. |
 | `crash_record_classification` (owner ruling R1) | A `guard_crash` record and a `fail_open` record with `session_id: null` (filed to the global fallback file) both classify `health_failure`, contributing to neither `escape`, `win`, `loss`, nor `friction` — even though the latter's own `event` is `fail_open`, which §4.6 would otherwise bucket as `escape`. |
 
@@ -1140,6 +1166,9 @@ more "correct" than the other under the current discovery logic.
 - **`scripts/routing-scorecard.js` needs no installer entry at all.** It
   is a read-only reporting script invoked directly from a repo checkout
   (`node scripts/routing-scorecard.js ...`), not a hook `install-guards.js`
-  copies or wires into `settings.json`. `--state-dir` (§5.1) is how an
-  operator points it at an installed tree's `~/.claude/hooks/state`
-  instead of the repo's own, without any installer involvement.
+  copies or wires into `settings.json`. Its default `--state-dir` (§5.1,
+  `resolveDefaultStateDir()`) already resolves to the INSTALLED tree's own
+  `~/.claude/hooks/state` (or `$CLAUDE_CONFIG_DIR/hooks/state`) with no
+  installer involvement — `--state-dir` is only needed to point it at some
+  OTHER directory (an alternate installed tree, or a test fixture
+  directory).

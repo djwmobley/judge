@@ -12,12 +12,44 @@
 //     [--state-dir <path>] [--fail-on-threshold]
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 const decisionsModule = require("../hooks/model-routing-guards.decisions.js");
-const DEFAULT_STATE_DIR = decisionsModule.STATE_DIR;
 const LEDGER_PREFIX = decisionsModule.LEDGER_PREFIX; // "routing-decisions."
 const LEDGER_SUFFIX = decisionsModule.LEDGER_SUFFIX; // ".jsonl"
+
+/**
+ * Default STATE_DIR for THIS script, deliberately independent of
+ * hooks/model-routing-guards.decisions.js's own STATE_DIR export.
+ *
+ * decisionsModule.STATE_DIR resolves to `path.join(__dirname, "state")`
+ * relative to wherever hooks/model-routing-guards.state.js is loaded FROM
+ * (hooks/model-routing-guards.state.js:35's `STATE_DIR`, unchanged by this
+ * fix — it is correct as-is for an INSTALLED hook, which always runs from
+ * inside the installed `~/.claude/hooks/` tree). But
+ * scripts/routing-scorecard.js is a repo-checkout CLI
+ * (`node scripts/routing-scorecard.js`, docs/specs/routing-scorecard.md
+ * §8's own "invoked directly from a repo checkout" note) — requiring
+ * `../hooks/model-routing-guards.decisions.js` from here resolves
+ * `__dirname` to the REPO'S OWN `hooks/` directory, not the installed one,
+ * so decisionsModule.STATE_DIR pointed this reader at the repo checkout's
+ * gitignored `hooks/state` — never where the real, installed guards
+ * actually write the ledger — silently reporting 0 decisions / NO-DATA
+ * against a fully populated real ledger.
+ *
+ * The correct default is the INSTALLED hooks state directory:
+ * `<CLAUDE_CONFIG_DIR or ~/.claude>/hooks/state` — the same directory
+ * `install-guards.js` copies the guard/support files into and the
+ * installed guards themselves write their ledger under. `--state-dir`
+ * (§5.1) still overrides this for any other directory (an alternate
+ * installed tree, or a test fixture directory).
+ */
+function resolveDefaultStateDir() {
+  const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+  return path.join(configDir, "hooks", "state");
+}
+const DEFAULT_STATE_DIR = resolveDefaultStateDir();
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -630,9 +662,10 @@ function pct1(value) {
   return value === null ? "n/a" : `${(value * 100).toFixed(1)}%`;
 }
 
-function formatText(windowLabel, report, signalsResult, sessionLabel) {
+function formatText(windowLabel, report, signalsResult, sessionLabel, stateDir) {
   const lines = [];
   lines.push(`routing-scorecard — window: ${windowLabel}`);
+  lines.push(`state dir: ${stateDir}`);
   const sessLine = sessionLabel ? `session: ${sessionLabel}` : `sessions: ${report.sessionsCount}`;
   lines.push(`${sessLine}   decisions: ${report.totalDecisions} (${report.malformedCount} malformed)`);
   lines.push("");
@@ -833,7 +866,7 @@ function run(argv, opts) {
     text = outputs
       .map((o) => {
         const header = o.sessionLabel && outputs.length > 1 ? `Session: ${o.sessionLabel}\n` : "";
-        return header + formatText(windowLabel, o.report, o.signalsResult, o.sessionLabel);
+        return header + formatText(windowLabel, o.report, o.signalsResult, o.sessionLabel, stateDir);
       })
       .join("\n\n");
   }
@@ -859,12 +892,17 @@ if (require.main === module) {
 }
 
 module.exports = {
-  // Exported so a test can assert this equals
-  // hooks/model-routing-guards.decisions.js's own STATE_DIR (the ledger
-  // WRITER's directory) without duplicating the path or re-deriving it —
-  // see hooks/routing-scorecard.test.js's
-  // "default_state_dir_matches_decisions_module" test.
+  // DEFAULT_STATE_DIR is resolveDefaultStateDir()'s result at module load
+  // time — the INSTALLED hooks state directory
+  // (<CLAUDE_CONFIG_DIR or ~/.claude>/hooks/state), deliberately NOT
+  // hooks/model-routing-guards.decisions.js's own STATE_DIR (which is
+  // relative to wherever that module is require()'d from — the repo
+  // checkout's own hooks/ when loaded by this script). See
+  // resolveDefaultStateDir()'s header comment above and
+  // hooks/routing-scorecard.test.js's
+  // "default_state_dir_resolves_under_home_config_not_repo" test.
   DEFAULT_STATE_DIR,
+  resolveDefaultStateDir,
   parseArgs,
   resolveWindow,
   normalizeRecord,

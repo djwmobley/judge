@@ -32,7 +32,27 @@ const fs = require("fs");
 const path = require("path");
 const { isBlankAfterStrip } = require("./model-routing-guards.unicode.js");
 
-const STATE_DIR = path.join(__dirname, "state");
+// STATE_DIR is __dirname-relative by design — an installed hook always
+// runs from inside the installed `~/.claude/hooks/` tree, so
+// `path.join(__dirname, "state")` is exactly that tree's own `state`
+// subdirectory with no configuration needed (see
+// scripts/routing-scorecard.js's own resolveDefaultStateDir() for the one
+// place that deliberately does NOT reuse this constant, because it runs
+// from a repo checkout rather than an installed tree).
+//
+// MODEL_ROUTING_STATE_DIR is a test-only override (docs/specs/
+// routing-scorecard.md §2.1's "Test isolation" note): when set, every
+// state/ledger file this module and hooks/model-routing-guards.decisions.js
+// read or write goes under that directory instead — used by
+// hooks/orchestrator-tool-guard.test.js and
+// hooks/agent-model-routing-guard.test.js to redirect the *subprocess*
+// guard invocations they spawn into a per-test-file temp directory, so a
+// spawned guard's `appendDecision` (whose ledger filename embeds an
+// unpredictable sha256-derived `h8` suffix, see decisions.js's h8())
+// never lands in — and is never left behind in — this repo's own
+// gitignored `hooks/state`. Unset (the default), behavior is
+// byte-for-byte identical to before this override existed.
+const STATE_DIR = process.env.MODEL_ROUTING_STATE_DIR || path.join(__dirname, "state");
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const LEDGER_PREFIX = "orchestrator-tool-guard.";
 const LEDGER_SUFFIX = ".ledger";

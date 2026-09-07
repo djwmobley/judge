@@ -669,24 +669,82 @@ test("state_dir_override: --state-dir reads only the alternate directory, ignori
   }
 });
 
-// Regression for the reported defect: `node scripts/routing-scorecard.js`
-// run with no `--state-dir` flag reported "sessions 0, decisions 0,
-// NO-DATA" even with a fully populated real STATE_DIR on disk, because
-// hooks/model-routing-guards.decisions.js never re-exported STATE_DIR from
-// model-routing-guards.state.js — decisionsModule.STATE_DIR was
-// `undefined`, so scripts/routing-scorecard.js:18's
-// `DEFAULT_STATE_DIR = decisionsModule.STATE_DIR` was also `undefined`,
-// and listLedgerFiles()'s fs.readdirSync(undefined) fails inside its own
-// fail-soft try/catch, silently returning zero files every time — no
-// matter how populated the real ledger writer's own directory was.
-test("default_state_dir_matches_decisions_module: routing-scorecard's default STATE_DIR is the exact directory hooks/model-routing-guards.decisions.js writes the ledger to (not undefined, not a re-derived duplicate path)", () => {
-  assert.equal(typeof decisionsModule.STATE_DIR, "string");
-  assert.ok(decisionsModule.STATE_DIR.length > 0, "decisionsModule.STATE_DIR must not be empty");
-  assert.equal(
-    sc.DEFAULT_STATE_DIR,
-    decisionsModule.STATE_DIR,
-    "scripts/routing-scorecard.js's DEFAULT_STATE_DIR must equal hooks/model-routing-guards.decisions.js's own STATE_DIR — same module instance (Node's require cache resolves both relative requires to the identical absolute path), so this can only fail if the export is missing or shadowed again"
+// Regression for the ORIGINAL reported defect: `node scripts/routing-
+// scorecard.js` run with no `--state-dir` flag reported "sessions 0,
+// decisions 0, NO-DATA" even with a fully populated real STATE_DIR on
+// disk, because hooks/model-routing-guards.decisions.js never re-exported
+// STATE_DIR from model-routing-guards.state.js — decisionsModule.STATE_DIR
+// was `undefined`, so DEFAULT_STATE_DIR was also `undefined`, and
+// listLedgerFiles()'s fs.readdirSync(undefined) failed inside its own
+// fail-soft try/catch, silently returning zero files every time.
+//
+// That original fix (re-exporting STATE_DIR from decisions.js and pointing
+// DEFAULT_STATE_DIR at it) was itself still wrong: decisionsModule.STATE_DIR
+// is `path.join(__dirname, "state")` relative to wherever
+// model-routing-guards.state.js is require()'d FROM. When THIS script
+// requires `../hooks/model-routing-guards.decisions.js`, that `__dirname`
+// resolves to the REPO's OWN hooks/ directory (this checkout's own
+// gitignored hooks/state), never the INSTALLED tree an operator actually
+// runs `node scripts/routing-scorecard.js` against — so the default still
+// silently read the wrong (usually empty) directory, just no longer
+// `undefined`. Fixed by giving this script its own default, independent of
+// decisionsModule.STATE_DIR: resolveDefaultStateDir()'s
+// `<CLAUDE_CONFIG_DIR or ~/.claude>/hooks/state` — the actual installed
+// tree's own state directory.
+test("default_state_dir_resolves_under_home_config_not_repo: routing-scorecard's default STATE_DIR is the installed hooks tree under the home-based config dir, never this repo checkout's own hooks/state", () => {
+  assert.equal(typeof sc.DEFAULT_STATE_DIR, "string");
+  assert.ok(sc.DEFAULT_STATE_DIR.length > 0, "DEFAULT_STATE_DIR must not be empty");
+
+  const repoHooksState = path.join(__dirname, "..", "hooks", "state");
+  assert.notEqual(
+    path.resolve(sc.DEFAULT_STATE_DIR),
+    path.resolve(repoHooksState),
+    "DEFAULT_STATE_DIR must not resolve to this repo checkout's own hooks/state"
   );
+  assert.notEqual(
+    path.resolve(sc.DEFAULT_STATE_DIR),
+    path.resolve(decisionsModule.STATE_DIR),
+    "DEFAULT_STATE_DIR must not resolve to hooks/model-routing-guards.decisions.js's own (repo-relative) STATE_DIR"
+  );
+
+  // No CLAUDE_CONFIG_DIR set -> falls back to os.homedir()/.claude/hooks/state.
+  const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CLAUDE_CONFIG_DIR;
+  try {
+    const expected = path.join(os.homedir(), ".claude", "hooks", "state");
+    assert.equal(path.resolve(sc.resolveDefaultStateDir()), path.resolve(expected));
+  } finally {
+    if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+  }
+
+  // CLAUDE_CONFIG_DIR set -> honored over the home-dir fallback.
+  const savedConfigDir2 = process.env.CLAUDE_CONFIG_DIR;
+  const altConfigDir = mkTmpDir();
+  try {
+    process.env.CLAUDE_CONFIG_DIR = altConfigDir;
+    const expected = path.join(altConfigDir, "hooks", "state");
+    assert.equal(path.resolve(sc.resolveDefaultStateDir()), path.resolve(expected));
+  } finally {
+    if (savedConfigDir2 === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedConfigDir2;
+    rmTree(altConfigDir);
+  }
+});
+
+// Regression: the resolved state dir is printed in the text header line
+// (an operator running this CLI with no flags needs to see, at a glance,
+// which directory zero decisions / NO-DATA actually means "empty", not
+// silently trust an unprintable default).
+test("state_dir_printed_in_text_header: --text output's header line names the directory actually read, honoring --state-dir when given", () => {
+  const dir = mkTmpDir();
+  try {
+    writeLedgerFile(dir, "s1", [{ session_id: "s1", event: "allow" }]);
+    const { text } = sc.run(["--state-dir", dir, "--text"]);
+    assert.match(text, new RegExp(`state dir: ${dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  } finally {
+    rmTree(dir);
+  }
 });
 
 // Regression: production ledger filenames come in two shapes —
