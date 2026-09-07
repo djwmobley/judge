@@ -129,6 +129,8 @@
 const fs   = require("fs");
 const path = require("path");
 const { appendRotating } = require("./model-routing-guards.log.js");
+const { isBlankAfterStrip } = require("./model-routing-guards.unicode.js");
+const decisions = require("./model-routing-guards.decisions.js");
 
 // ── Paths ──────────────────────────────────────────────────────────────────
 // The debug log lives next to wherever this file itself is actually running
@@ -140,6 +142,44 @@ const { appendRotating } = require("./model-routing-guards.log.js");
 // in this same directory.
 const HOOKS_DIR = __dirname;
 const DEBUG_LOG = path.join(HOOKS_DIR, "agent-adversary-floor-debug.log");
+
+// docs/specs/routing-scorecard.md §2.4 — this guard has no pre-existing
+// version constant of its own; a new local one is required for the
+// decision ledger's guard_version field.
+const DECISIONS_GUARD_VERSION = "1";
+
+// docs/specs/routing-scorecard.md §2.5 — this guard applies its floor to
+// every caller and never branches on agent_id for gating; this
+// classification exists ONLY for the decision ledger's `caller` field.
+// Duplicated (not imported) from orchestrator-tool-guard.js's identical
+// one-line-body function — see that guard's own §2.5 comment for why
+// duplication, not import, is the spec's preferred choice here.
+function classifyCaller(agentIdRaw) {
+  if (typeof agentIdRaw !== "string") return "orchestrator"; // absent or non-string
+  if (isBlankAfterStrip(agentIdRaw)) return "orchestrator"; // empty/whitespace/invisible
+  return "subagent";
+}
+
+function decisionRecord(fields) {
+  return Object.assign({ guard: "agent-adversary-floor", guard_version: DECISIONS_GUARD_VERSION }, fields);
+}
+
+// docs/specs/routing-scorecard.md §2.1 R1 — raw stdin captured into
+// module-level (outer-scope) scope BEFORE main() runs, so the top-level
+// catch (previously blind to the raw request) can recover session_id.
+// Changes only WHEN the read happens, not what is read or how any
+// allow/block outcome is decided (this guard's own fail-open house policy,
+// documented above, is otherwise completely unchanged).
+let rawStdinBuffer;
+let stdinReadFailed = false;
+
+function captureStdin() {
+  try {
+    rawStdinBuffer = fs.readFileSync(0, "utf8");
+  } catch (_) {
+    stdinReadFailed = true;
+  }
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -267,14 +307,16 @@ module.exports = {
 // ── Main ───────────────────────────────────────────────────────────────────
 
 function main() {
-  // Read all of stdin (fd 0) — works on Windows with Node.
-  let raw;
-  try {
-    raw = fs.readFileSync(0, "utf8");
-  } catch (_) {
+  // Raw stdin was already read into module scope, before main() was
+  // called (docs/specs/routing-scorecard.md §2.1 R1) — see captureStdin().
+  if (stdinReadFailed) {
     appendDebug({ ts: new Date().toISOString(), event: "fail_open", reason: "stdin_read_error" });
+    decisions.appendDecision(
+      decisionRecord({ event: "fail_open", reason: "stdin_read_error", session_id: null, agent_id: null, caller: "unknown", tool_name: null })
+    );
     process.exit(0);
   }
+  const raw = rawStdinBuffer;
 
   // JSON.parse — on failure, fail-open + log.
   let parsed;
@@ -282,17 +324,39 @@ function main() {
     parsed = JSON.parse(raw);
   } catch (_) {
     appendDebug({ ts: new Date().toISOString(), event: "fail_open", reason: "json_parse_error" });
+    decisions.appendDecision(
+      decisionRecord({ event: "fail_open", reason: "json_parse_error", session_id: null, agent_id: null, caller: "unknown", tool_name: null })
+    );
     process.exit(0);
   }
 
   if (!parsed || typeof parsed !== "object") {
     appendDebug({ ts: new Date().toISOString(), event: "fail_open", reason: "parsed_not_object" });
+    decisions.appendDecision(
+      decisionRecord({ event: "fail_open", reason: "parsed_not_object", session_id: null, agent_id: null, caller: "unknown", tool_name: null })
+    );
     process.exit(0);
   }
+
+  const sessionIdForDecision = typeof parsed.session_id === "string" ? parsed.session_id : null;
+  const agentIdForDecision = typeof parsed.agent_id === "string" ? parsed.agent_id : null;
+  const toolUseIdForDecision = typeof parsed.tool_use_id === "string" && parsed.tool_use_id !== "" ? parsed.tool_use_id : null;
+  const caller = classifyCaller(parsed.agent_id);
 
   const tool_name = typeof parsed.tool_name === "string" ? parsed.tool_name : "";
   if (!tool_name) {
     appendDebug({ ts: new Date().toISOString(), event: "fail_open", reason: "missing_tool_name" });
+    decisions.appendDecision(
+      decisionRecord({
+        event: "fail_open",
+        reason: "missing_tool_name",
+        session_id: sessionIdForDecision,
+        agent_id: agentIdForDecision,
+        caller,
+        tool_name: null,
+        tool_use_id: toolUseIdForDecision,
+      })
+    );
     process.exit(0);
   }
 
@@ -302,9 +366,23 @@ function main() {
 
   // Step 2 / non-target dispatch: only Agent (and SendMessage — see header
   // comment "SENDMESSAGE COVERAGE") are in scope. Everything else: allow,
-  // untouched, no special logging needed beyond the fail-open convention
-  // above (this is a normal no-op path, not a fail-open occurrence).
+  // untouched — docs/specs/routing-scorecard.md §3.3 names this
+  // `allow_out_of_scope_tool_name`: a NEW decision-ledger event with no
+  // pre-existing appendDebug call to hook into (this branch previously
+  // logged nothing at all, by design — see the header comment this spec
+  // quotes: "a normal no-op path, not a fail-open occurrence"). The debug
+  // log itself is intentionally left untouched here.
   if (tool_name !== "Agent" && tool_name !== "SendMessage") {
+    decisions.appendDecision(
+      decisionRecord({
+        event: "allow_out_of_scope_tool_name",
+        session_id: sessionIdForDecision,
+        agent_id: agentIdForDecision,
+        caller,
+        tool_name,
+        tool_use_id: toolUseIdForDecision,
+      })
+    );
     process.exit(0);
   }
 
@@ -314,6 +392,15 @@ function main() {
       const subagentType = (typeof tool_input.subagent_type === "string" && tool_input.subagent_type)
         ? tool_input.subagent_type
         : "general-purpose";
+      const decisionCtx = {
+        session_id: sessionIdForDecision,
+        agent_id: agentIdForDecision,
+        caller,
+        tool_name,
+        tool_use_id: toolUseIdForDecision,
+        subagent_type: subagentType,
+        target_hash: decisions.hashTarget(subagentType),
+      };
 
       // Step 4: structural capability classification.
       if (isExemptType(subagentType)) {
@@ -321,6 +408,7 @@ function main() {
           ts: new Date().toISOString(), event: "allow_exempt_type",
           tool_name, subagent_type: subagentType,
         });
+        decisions.appendDecision(decisionRecord(Object.assign({ event: "allow_exempt_type" }, decisionCtx)));
         process.exit(0);
       }
 
@@ -332,6 +420,9 @@ function main() {
           ts: new Date().toISOString(), event: "fail_open",
           reason: "prompt_missing_or_non_string", tool_name, subagent_type: subagentType,
         });
+        decisions.appendDecision(
+          decisionRecord(Object.assign({ event: "fail_open", reason: "prompt_missing_or_non_string" }, decisionCtx))
+        );
         process.exit(0);
       }
 
@@ -340,6 +431,11 @@ function main() {
         ts: new Date().toISOString(), event: signal.ok ? "allow" : "block",
         tool_name, subagent_type: subagentType, via: signal.via, detail: signal.detail,
       });
+      decisions.appendDecision(
+        decisionRecord(
+          Object.assign({ event: signal.ok ? "allow" : "block", via: signal.via, reason: signal.detail }, decisionCtx)
+        )
+      );
 
       if (signal.ok) {
         process.exit(0);
@@ -350,6 +446,13 @@ function main() {
     }
 
     if (tool_name === "SendMessage") {
+      const decisionCtx = {
+        session_id: sessionIdForDecision,
+        agent_id: agentIdForDecision,
+        caller,
+        tool_name,
+        tool_use_id: toolUseIdForDecision,
+      };
       // Step 6: SendMessage has no subagent_type — apply the total rule
       // directly to `message`, only when it is plausibly a work-assignment
       // (non-empty string). No semantic classification beyond that.
@@ -359,6 +462,9 @@ function main() {
           ts: new Date().toISOString(), event: "allow_sendmessage_not_workassignment",
           tool_name,
         });
+        decisions.appendDecision(
+          decisionRecord(Object.assign({ event: "allow_sendmessage_not_workassignment" }, decisionCtx))
+        );
         process.exit(0);
       }
 
@@ -367,6 +473,11 @@ function main() {
         ts: new Date().toISOString(), event: signal.ok ? "allow" : "block",
         tool_name, via: signal.via, detail: signal.detail,
       });
+      decisions.appendDecision(
+        decisionRecord(
+          Object.assign({ event: signal.ok ? "allow" : "block", via: signal.via, reason: signal.detail }, decisionCtx)
+        )
+      );
 
       if (signal.ok) {
         process.exit(0);
@@ -380,10 +491,23 @@ function main() {
     process.exit(0);
   } catch (internalErr) {
     // Any internal exception during classification -> fail-open + log.
+    // Per this guard's own house policy (unlike the other two guards) an
+    // internal exception genuinely IS a fail-open/escape — see §4.6.
     appendDebug({
       ts: new Date().toISOString(), event: "fail_open",
       reason: "internal_exception", message: String(internalErr && internalErr.message || internalErr),
     });
+    decisions.appendDecision(
+      decisionRecord({
+        event: "fail_open",
+        reason: "internal_exception",
+        session_id: sessionIdForDecision,
+        agent_id: agentIdForDecision,
+        caller,
+        tool_name,
+        tool_use_id: toolUseIdForDecision,
+      })
+    );
     process.exit(0);
   }
 }
@@ -392,15 +516,27 @@ function main() {
 // bug in this hook can never deadlock delegation. See "FAIL-OPEN POLICY"
 // header comment for why this is deliberate, not an oversight.
 if (require.main === module) {
+  captureStdin();
   try {
     main();
   } catch (topErr) {
     try {
+      // §6 blind spot ("The top-level-catch block record ... logs a
+      // different outcome than the guard actually took", owner ruling R1):
+      // this guard's own *-debug.log line and its actual runtime behavior
+      // (still fail-open, process.exit(0)) are deliberately UNCHANGED by
+      // this spec — only the decision-ledger record below differs (event
+      // "block" or "guard_crash" per appendCrashRecord, never "fail_open",
+      // per §3.3's guard_crash row: "Never logged as fail_open any more").
       appendDebug({
         ts: new Date().toISOString(), event: "fail_open",
         reason: "top_level_exception", message: String(topErr && topErr.message || topErr),
       });
     } catch (_) {}
+    // §2.1 R1 — best-effort session recovery from the raw stdin captured
+    // before main() ran; the guard's own exit code (0, unchanged) is
+    // decided independently below.
+    decisions.appendCrashRecord(rawStdinBuffer, "agent-adversary-floor", DECISIONS_GUARD_VERSION);
     process.exit(0);
   }
 }

@@ -69,12 +69,47 @@ const { resolveExemptTypes } = require("./model-routing-guards.exempt.js");
 const { createLogger } = require("./model-routing-guards.log.js");
 const { loadLocalPolicy, foldModelTierToken } = require("./lib/local-policy.js");
 const ledger = require("./agent-tier-ledger.js");
+const decisions = require("./model-routing-guards.decisions.js");
 
 const appendDebug = createLogger("agent-model-routing-guard");
 
 // Bumped whenever this file's own enforcement logic changes in a way that
 // should invalidate an old ledger record's rules_version comparison later.
 const GUARD_VERSION = "1";
+
+// docs/specs/routing-scorecard.md §2.5 — this guard applies its rules "to
+// every caller, orchestrator and subagent alike" and never branches on
+// agent_id for gating; this classification exists ONLY for the decision
+// ledger's `caller` field. Duplicated (not imported) from
+// orchestrator-tool-guard.js's identical one-line-body function per §2.5's
+// own hedge: importing would create a cross-guard runtime dependency that
+// does not exist today, which the spec prefers to avoid given the
+// function's triviality.
+function classifyCaller(agentIdRaw) {
+  if (typeof agentIdRaw !== "string") return "orchestrator"; // absent or non-string
+  if (isBlankAfterStrip(agentIdRaw)) return "orchestrator"; // empty/whitespace/invisible
+  return "subagent";
+}
+
+function decisionRecord(fields) {
+  return Object.assign({ guard: "agent-model-routing-guard", guard_version: GUARD_VERSION }, fields);
+}
+
+// docs/specs/routing-scorecard.md §2.1 R1 — raw stdin captured into
+// module-level (outer-scope) scope BEFORE main() runs, so the top-level
+// catch (previously blind to the raw request) can recover session_id.
+// Changes only WHEN the read happens, not what is read or how any
+// block/allow/fail_open outcome is decided.
+let rawStdinBuffer;
+let stdinReadFailed = false;
+
+function captureStdin() {
+  try {
+    rawStdinBuffer = fs.readFileSync(0, "utf8");
+  } catch (_) {
+    stdinReadFailed = true;
+  }
+}
 
 const OVERSIZED_THRESHOLD = 100000;
 
@@ -193,6 +228,12 @@ function resolveTierForModel(rawModel, modelTiers) {
 
 function failOpen(reason, extra) {
   appendDebug(Object.assign({ ts: new Date().toISOString(), event: "fail_open", reason }, extra || {}));
+  // §2.5: caller is "unknown" at every fail_open triggered before agent_id
+  // has been parsed at all — true for all three fail_open reasons this
+  // guard can produce.
+  decisions.appendDecision(
+    decisionRecord({ event: "fail_open", session_id: null, agent_id: null, caller: "unknown", tool_name: null, reason })
+  );
   process.exit(0);
 }
 
@@ -205,19 +246,19 @@ function buildBlockMessage(findings, toolName) {
   return msg;
 }
 
-function block(findings, toolName, extra) {
-  appendDebug(
-    Object.assign(
-      { ts: new Date().toISOString(), event: "block", tool_name: toolName, finding_ids: findings.map((f) => f.id) },
-      extra || {}
-    )
+function block(findings, toolName, extra, ctx) {
+  const findingIds = findings.map((f) => f.id);
+  appendDebug(Object.assign({ ts: new Date().toISOString(), event: "block", tool_name: toolName, finding_ids: findingIds }, extra || {}));
+  decisions.appendDecision(
+    decisionRecord(Object.assign({ event: "block", tool_name: toolName, finding_ids: findingIds }, ctx || {}))
   );
   process.stderr.write(buildBlockMessage(findings, toolName));
   process.exit(2);
 }
 
-function allow(toolName, extra) {
+function allow(toolName, extra, ctx) {
   appendDebug(Object.assign({ ts: new Date().toISOString(), event: "allow", tool_name: toolName }, extra || {}));
+  decisions.appendDecision(decisionRecord(Object.assign({ event: "allow", tool_name: toolName }, ctx || {})));
   process.exit(0);
 }
 
@@ -463,13 +504,11 @@ function handleSubagentStart(parsed) {
 // ─── PreToolUse main() ────────────────────────────────────────────────────
 
 function main() {
-  let raw;
-  try {
-    raw = fs.readFileSync(0, "utf8");
-  } catch (_) {
+  if (stdinReadFailed) {
     failOpen("stdin_read_error");
     return;
   }
+  const raw = rawStdinBuffer;
 
   let parsed;
   try {
@@ -487,6 +526,9 @@ function main() {
   const hookEventName = typeof parsed.hook_event_name === "string" ? parsed.hook_event_name : "PreToolUse";
 
   if (hookEventName === "SubagentStart") {
+    // docs/specs/routing-scorecard.md §3.2 carve-out — a metadata-capture
+    // path for the per-agent tier ledger, never a routing decision; no
+    // appendDecision call here, by design.
     handleSubagentStart(parsed);
     return;
   }
@@ -494,10 +536,24 @@ function main() {
   const toolName = typeof parsed.tool_name === "string" ? parsed.tool_name : "";
   const toolInput = parsed.tool_input && typeof parsed.tool_input === "object" ? parsed.tool_input : {};
   const localPolicy = loadLocalPolicy();
+  const sessionIdForDecision = typeof parsed.session_id === "string" ? parsed.session_id : null;
+  const agentIdForDecision = typeof parsed.agent_id === "string" ? parsed.agent_id : null;
+  const toolUseIdForDecision = typeof parsed.tool_use_id === "string" && parsed.tool_use_id !== "" ? parsed.tool_use_id : null;
+  const caller = classifyCaller(parsed.agent_id);
 
   try {
     if (toolName === "Agent") {
       const result = evaluateAgent(toolInput, localPolicy.model_tiers);
+      const ctx = {
+        session_id: sessionIdForDecision,
+        agent_id: agentIdForDecision,
+        caller,
+        tool_use_id: toolUseIdForDecision,
+        subagent_type: result.subagentType,
+        model: result.model,
+        tier: result.tier,
+        target_hash: decisions.hashTarget(typeof result.subagentType === "string" ? result.subagentType : null),
+      };
       if (result.ok) {
         try {
           const toolUseId = typeof parsed.tool_use_id === "string" && parsed.tool_use_id !== "" ? parsed.tool_use_id : null;
@@ -516,19 +572,25 @@ function main() {
         } catch (_) {
           // Ledger capture failure must never block an otherwise-allowed dispatch.
         }
-        allow(toolName, { subagent_type: result.subagentType, model: result.model, tier: result.tier });
+        allow(toolName, { subagent_type: result.subagentType, model: result.model, tier: result.tier }, ctx);
       } else {
-        block(result.findings, toolName, { subagent_type: result.subagentType, model: result.model });
+        block(result.findings, toolName, { subagent_type: result.subagentType, model: result.model }, ctx);
       }
       return;
     }
 
     if (toolName === "SendMessage") {
       const result = evaluateSendMessage(toolInput);
+      const ctx = {
+        session_id: sessionIdForDecision,
+        agent_id: agentIdForDecision,
+        caller,
+        tool_use_id: toolUseIdForDecision,
+      };
       if (result.ok) {
-        allow(toolName, {});
+        allow(toolName, {}, ctx);
       } else {
-        block(result.findings, toolName, {});
+        block(result.findings, toolName, {}, ctx);
       }
       return;
     }
@@ -537,7 +599,9 @@ function main() {
     // after a successful parse) hits this block, NOT fail-open.
     block(
       [{ id: "unexpected_tool_name", detail: `unexpected tool_name "${toolName}" reached this hook (matcher should be Agent|SendMessage only).` }],
-      toolName || "(missing)"
+      toolName || "(missing)",
+      {},
+      { session_id: sessionIdForDecision, agent_id: agentIdForDecision, caller, tool_use_id: toolUseIdForDecision }
     );
   } catch (internalErr) {
     appendDebug({
@@ -547,12 +611,24 @@ function main() {
       finding_ids: ["internal_exception"],
       message: String((internalErr && internalErr.message) || internalErr),
     });
+    decisions.appendDecision(
+      decisionRecord({
+        event: "block",
+        tool_name: toolName,
+        finding_ids: ["internal_exception"],
+        session_id: sessionIdForDecision,
+        agent_id: agentIdForDecision,
+        caller,
+        tool_use_id: toolUseIdForDecision,
+      })
+    );
     process.stderr.write("agent-model-routing-guard: BLOCKED — internal error during classification — treat as block.\n");
     process.exit(2);
   }
 }
 
 if (require.main === module) {
+  captureStdin();
   try {
     main();
   } catch (topErr) {
@@ -565,6 +641,9 @@ if (require.main === module) {
       });
       process.stderr.write("agent-model-routing-guard: BLOCKED — internal error during classification — treat as block.\n");
     } catch (_) {}
+    // §2.1 R1 — best-effort session recovery from the raw stdin captured
+    // before main() ran.
+    decisions.appendCrashRecord(rawStdinBuffer, "agent-model-routing-guard", GUARD_VERSION);
     process.exit(2);
   }
 }

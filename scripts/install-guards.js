@@ -148,6 +148,7 @@ const SUPPORT_FILES = [
   'model-routing-guards.exempt.js',
   'model-routing-guards.rules.js',
   'model-routing-guards.paths.js',
+  'model-routing-guards.decisions.js',
   'agent-tier-ledger.js',
 ];
 const SUPPORT_DIRS = ['lib'];
