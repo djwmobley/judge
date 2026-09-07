@@ -8,8 +8,9 @@ this guard's stdin-parse / stdout-decision shape (its 3-strike loop pattern
 is explicitly NOT followed here — see §4).
 
 *Revised after adversary round 1 (`.git/tmp/pr3-adversary-r1.md`, 17
-findings — see §10) and adversary round 2 (`.git/tmp/pr3-adversary-r2.md`,
-12 findings — see §11).*
+findings — see §10), adversary round 2 (`.git/tmp/pr3-adversary-r2.md`,
+12 findings — see §11), and adversary round 3 on §13's remote-tracking
+classification (`.tmp-adv-findings-r3.md`, 7 findings — see §14).*
 
 ## 1. Purpose
 
@@ -91,7 +92,12 @@ target — but only if that target ref actually exists locally; if it doesn't
 (dangling symref), fall through instead of failing — then local `main`,
 then local `master`. If no remote is configured at all, skip straight to
 local `main`/`master`. None resolve → UNKNOWN (§2.4), `reason` names the fix
-(`git remote set-head origin -a`, or create a local `main`).
+(`git remote set-head origin -a`, or create a local `main`). This
+resolution also determines, for §13, which single remote-tracking ref (if
+any) is excluded as "the ref the base branch tracks": the literal
+`refs/remotes/origin/HEAD` target when that path resolved base, or the
+local base branch's own configured `%(upstream)` ref when base instead
+resolved to local `main`/`master`.
 
 **Deadline:** an internal wall-clock budget of **20 seconds** measured from
 hook start (comfortably inside the 30-second explicit registered timeout —
@@ -113,6 +119,14 @@ hook start (comfortably inside the 30-second explicit registered timeout —
 This is never a silent allow — both paths are §2.4 UNKNOWN outcomes,
 produced by the hook's own code before any OS-level kill could occur.
 
+Remote-tracking refs (§13) are subject to this identical deadline
+mechanism, on equal footing with worktrees and local branches — classified
+in the same loop, against the same shared budget, never a separate
+allotment. A deadline-expiry `reason` enumerates remote-tracking refs
+exactly as it does branches (classified-so-far with class, not-yet-reached
+by name), and its timeout text states the remote-ref count explicitly
+(e.g., "23 of 51 remote-tracking refs classified before the deadline").
+
 **Batching.** To keep the common case well under budget as branch count
 grows, git calls are batched rather than issued once per branch: one
 `git for-each-ref refs/heads` call retrieves all branch metadata in one
@@ -123,6 +137,14 @@ per-branch subprocess calls remaining are `merge-base --is-ancestor`
 (cheap, one rev-walk) and, only for branches rows 2–3 didn't already
 resolve, `git cherry <base> <branch>` (the most expensive detector, tried
 last and only when needed).
+
+The same batching principle extends to §13: one additional `git
+for-each-ref refs/remotes` call retrieves every remote-tracking ref's
+metadata in one shot (mirroring the `refs/heads` call above); `base.treeSet`
+(from the single `rev-list`/`log` call already made for local branches) is
+reused as-is, never recomputed per remote or per ref. Only `merge-base
+--is-ancestor` and, when needed, `git cherry` remain per-ref, exactly as
+for local branches.
 
 ### Worktrees (`git worktree list --porcelain`)
 
@@ -200,6 +222,98 @@ If the **checked-out** branch classifies stale (rows 2–6 — row 7
 leads with `git checkout <base>`, then that row's fix (both lines, for
 row 6).
 
+### Remote-tracking branches (`git for-each-ref refs/remotes`)
+
+One batched `git for-each-ref --format=<name>|<objectname>|<tree>
+refs/remotes` call (§3 Batching) enumerates every ref under
+`refs/remotes/<remote>/*` across every configured remote in a single shot —
+total classification, no allow-list: every such ref maps to exactly one row
+below, in order, first match wins. All matching in this section — the
+`/HEAD` exclusion, the base's-own-ref exclusion, and grouping by tracking
+relationship (§13) — operates on **whole ref-path strings** (exact
+`refname` equality, or a suffix match on the literal string `/HEAD`);
+never by decomposing a ref into a remote-name segment and a branch-name
+segment, which would break for a remote name containing `/` (e.g. `git
+remote add team/fork <url>`) or non-ASCII characters (e.g. `réseau`) —
+both real, achievable git states (round-3 finding R3-07).
+
+**The base's own remote** (used by exclusion item 2 below and by the
+stale-remote / stale-remote-foreign split): the remote-name segment of
+`refs/remotes/<remote>/HEAD`'s target when that path resolved base (Base
+branch, above), or the remote-name segment of the local base branch's own
+configured `%(upstream)` ref when base instead resolved to local
+`main`/`master` with an upstream configured. **If the local base branch
+has no configured upstream at all, there is no base remote** — every
+remote-tracking ref in the repo, on every remote, then classifies at best
+`stale-remote-foreign` (informational only, never blocking); this is
+intentional, not a degraded mode — the "operator has no standing to
+delete it" rationale behind `stale-remote-foreign` (below) applies equally
+to every remote when none is distinguished as canonical.
+
+**Exclusions (structural, never by name pattern):**
+
+1. Any ref whose `refname` ends in the literal string `/HEAD`, for every
+   remote — a **name-suffix match**, checked regardless of whether that
+   ref is currently a symbolic ref or a detached (`git update-ref
+   --no-deref`) ordinary ref pointing directly at a commit (round-3 finding
+   R3-01). `git symbolic-ref`-based detection is deliberately not used
+   here: a detached `refs/remotes/origin/HEAD` is a real, reachable state
+   (verified empirically in R3-01) that would otherwise fall through to
+   full classification and, after a stale/divergent commit, could emit a
+   nonsensical `git push origin --delete HEAD` fix line for a branch that
+   doesn't exist.
+2. The ref that IS the base's own remote's `HEAD`-target or configured
+   upstream (defined above). No ref is excluded by this item if there is
+   no base remote — item 3 below still protects that case.
+3. **Mandatory tip-equality guard, additional to item 2, never a substitute
+   for it:** any candidate ref whose tip equals `base.tip` is excluded
+   outright, before any content detector runs, regardless of whether item 2
+   already named it by ref path. This closes, for remote refs, the exact
+   bug recorded in §12 — `merge-base --is-ancestor X X` and the
+   tree/cherry detectors all trivially succeed against a ref that IS the
+   base's own tip, and name-based exclusion alone is one misconfigured or
+   fork-shaped remote away from missing that case. The check is one string
+   comparison against an already-resolved value, not an extra git call.
+
+**Enumeration failure fallback (round-3 finding R3-02).** The batched
+`for-each-ref refs/remotes` call above requires an object lookup per ref
+(to resolve `%(tree)`) and fails **atomically** — zero rows for the entire
+namespace, not per-ref — when any one ref in `refs/remotes/*` points at a
+missing or unreadable object (verified empirically: a single
+`refs/remotes/origin/ghost` written directly at a nonexistent sha blacks
+out classification of every other, healthy remote ref alongside it). When
+this batched call fails, fall back to: (a) `git show-ref` to enumerate
+every `refs/remotes/*` ref by name and stored SHA without dereferencing
+any object (this call cannot fail on a missing object, since it never
+reads one); then (b) for each enumerated ref, `git rev-parse --verify -q
+<ref>^{commit}` to confirm the object resolves, followed by `git log -1
+--format=%H|%T <ref>` (reusing the existing per-ref tip/tree lookup already
+used elsewhere in this file) to get its tip and tree. A ref that fails (a)
+or (b) classifies **unknown → block** individually, per row 4 below;
+every sibling ref that passes classifies normally — restoring row 4's
+per-ref isolation promise even though the fast batched path can't itself
+deliver it. This fallback is deliberately scoped to `refs/remotes` only;
+`refs/heads` (local branches) has the identical atomic-failure exposure
+and is not given the same fallback in this revision — see §8.
+
+| Order | Class | Evidence | Result |
+|---|---|---|---|
+| — | (excluded) | ref name ends in `/HEAD` (any remote, symref or detached), the base's own tracked/upstream ref, or tip == `base.tip` | not classified, not listed |
+| 1 | stale-remote | ref is on the base's own remote AND its tip is an ancestor of `base.tip` (`merge-base --is-ancestor`), tip != `base.tip` | fix sequence, §13; **blocks** |
+| 2 | stale-remote | ref is on the base's own remote AND its tip's tree ∈ `base.treeSet` (reused from the Branches table above, not recomputed) | fix sequence, §13; **blocks** |
+| 3 | stale-remote | ref is on the base's own remote AND `git cherry <base.tip> <ref-tip>` reports every commit already applied, ≥1 commit | fix sequence, §13; **blocks** |
+| 4 | stale-remote-foreign | ref is on any remote OTHER than the base's own remote (or there is no base remote) AND satisfies rows 1–3's detector logic against `base.tip`/`base.treeSet` | **allows**, `systemMessage` names it (§13) — no fix offered: the operator has no standing to delete a branch on a remote that isn't the base's own (round-3 finding R3-03) |
+| 5 | unknown → block | any git call for this ref fails or times out, including a ref whose object is missing (including via the fallback path above) | none offered — inspect manually |
+| 6 | active-remote → ok | none of the above | — (someone else's unmerged work is never flagged) |
+
+Same three detectors, same order, as this section's Branches rows 3–5 —
+deliberately reused rather than reinvented (both for the base-remote and
+foreign-remote branches of row 1–4), so a reviewer who already understands
+that table reads this one for free. Grouping with a tracking local branch,
+the exact fix-command sequence, the `stale-remote-foreign` reporting
+mechanics, the no-network consequence, and three-way grouping with a
+linked worktree are specified in full in §13.
+
 ## 4. Bypass and loop behavior
 
 No state file, no strike counter, no session-keyed ledger, no finding-set
@@ -267,6 +381,19 @@ trailing count of any remainder (e.g. "...and 12 more"). Allow → no output,
 or (bypass or in-progress-operation only) `{"systemMessage":"<text>"}` with
 no `decision` field. **Exit code is always `0`.**
 
+Remote-tracking-ref findings (§13) share this exact list, cap, and format —
+a `stale-remote` item grouped with a tracking local branch (§13) counts as
+one item toward the 40-item cap, not two (and a three-way worktree grouping,
+§13 round-3 revision, counts as one item as well), matching what the agent
+actually needs to act on. `stale-remote-foreign` items (§13, round-3
+revision) never appear in a block `reason` at all — they carry no fix, so
+they are reported only via the allow-side `systemMessage` channel below,
+and only when the overall result is otherwise a clean allow (§13). §13
+introduces no new stdin fields and no new output shape beyond folding
+`stale-remote-foreign` lines into the existing `systemMessage` channel; it
+is scoped, invoked, and reported through the identical `-C <targetDir>` /
+batched-call / `reason`-string machinery already specified above.
+
 For the record (not used by this guard, to stay consistent with
 `no-punt-guard.js`): per Claude Code's documented hook contract, exit
 code `2` also forces a block regardless of stdout JSON, with the reason
@@ -305,6 +432,14 @@ this guard's implementation).
   a logic change. A version constant may still be added purely for log/
   diagnostic labeling if the implementer finds it useful, but nothing in
   this guard's behavior depends on it.
+- **Primary prevention vs. backstop:** this repo has GitHub's
+  `delete_branch_on_merge` repository setting enabled, which auto-deletes a
+  PR's remote branch on merge in the overwhelming common case. §13's
+  remote-tracking-ref classification is the backstop for what that setting
+  doesn't catch — an unmerged/abandoned branch pushed but never PR'd, a
+  merge performed outside GitHub's UI, or a repo/org where the setting is
+  later turned off — not the primary mechanism, and this guard never
+  assumes the setting is on.
 
 ## 7. Test matrix
 
@@ -349,6 +484,23 @@ following `no-punt-guard.test.js`'s subprocess pattern.
 | `uncommitted_changes_do_not_change_class` | dirty stale worktree | still stale; inspect-first text |
 | `deadline_exceeded_blocks_with_partial_classification` | classification forced past 20s (e.g. injected delay) | block, timeout-named reason, lists classified vs. not-yet-classified |
 | `batched_git_calls_used_not_per_branch` | repo with several branches | exactly one `for-each-ref` and one `rev-list` invocation observed, not one per branch |
+| `remote_stale_no_local_branch_blocks` | remote-tracking ref on the base's own remote, merged into base, no local branch tracks it | block, fix sequence verbatim (`fetch --prune`, verify, `push --delete`), no `-dr`/local-delete lines needed unless push is refused |
+| `remote_stale_with_tracking_local_branch_grouped` | remote-tracking ref on the base's own remote is stale AND a local branch tracks it (also stale) | single grouped `reason` item, full fix sequence, local delete included |
+| `remote_stale_tracking_local_branch_active_note_only` | base-remote stale-remote ref tracked by a local branch that is itself `active` | single grouped item, remote-side fix sequence only, note that the local branch is active/untouched, no local-delete line |
+| `remote_active_unmerged_allows` | remote-tracking ref with unmerged, non-stale content | active-remote, allow |
+| `remote_head_symref_excluded_by_name` | `origin/HEAD` present as a normal symref among remote refs | never classified or listed as its own item |
+| `remote_head_detached_excluded_by_name` | `git update-ref --no-deref refs/remotes/origin/HEAD <divergent-sha>` — a detached, non-symbolic `origin/HEAD` whose tip would otherwise match a stale signature | still excluded by the `/HEAD` name-suffix match (round-3 R3-01); never listed, no `push --delete HEAD` fix line emitted |
+| `remote_base_own_tracked_ref_ignored` | the ref base resolved via (e.g. `origin/main`) | excluded by name, never listed |
+| `remote_no_base_remote_all_foreign_allows` | base resolves to local `main` with no configured upstream; a remote ref elsewhere is merged into base | no base remote determinable; that ref classifies `stale-remote-foreign`, not `stale-remote` — allow with `systemMessage`, never block |
+| `remote_foreign_remote_merged_ref_allows_with_message` | second remote (`upstream`), not the base's own remote, has a ref merged into base | classified `stale-remote-foreign`; overall result allows, `systemMessage` names the ref and remote, no fix text offered |
+| `remote_foreign_message_suppressed_when_blocking_findings_exist` | a foreign-remote merged ref coexists with an unrelated blocking finding (e.g. a stale local branch) | block `reason` lists only the blocking item(s); the foreign-remote note is omitted from this invocation's output entirely |
+| `remote_base_remote_push_delete_refused_falls_back_to_branch_dr` | base-remote `stale-remote` finding, `push --delete` step simulated as refused | fix sequence's step 4 offers `git branch -dr <remote>/<branch>` with the recurrence-after-next-fetch note |
+| `remote_fix_sequence_reverify_step_present` | base-remote `stale-remote` finding | fix sequence includes the `rev-parse --verify` re-check line between `fetch --prune` and `push --delete` |
+| `remote_ref_missing_object_unknown_blocks` | a single remote-tracking ref's object corrupted/missing | unknown, block |
+| `remote_forremote_atomic_failure_falls_back_to_show_ref` | `refs/remotes/origin/ghost` points at a nonexistent object alongside otherwise-healthy sibling remote refs, forcing the batched `for-each-ref refs/remotes` call to fail atomically | `show-ref` + per-ref `rev-parse --verify` fallback invoked; `ghost` classifies unknown individually; every healthy sibling ref classifies normally, not blacked out |
+| `remote_tip_equals_base_not_flagged` | a remote ref (any remote) whose tip equals `base.tip`, not excluded by name (e.g. base resolved to local `main`, ref has no configured upstream link to it) | tip-equality guard fires; not classified stale-remote |
+| `remote_refs_counted_in_deadline_reason` | deadline forced to expire mid remote-ref classification | reason lists remote-ref count reached/not-reached, same shape as branches |
+| `remote_worktree_branch_remote_three_way_grouped` | linked worktree checked out on a branch that is stale AND tracks a base-remote `stale-remote` ref | single combined worktree `reason` item carrying worktree-remove, branch-delete, and the remote fix sequence; no standalone branch or branch+remote item emitted for the same branch |
 | `bypass_env_var_allows` | `JUDGE_STOP_GUARD=off`, stale present | allow, `systemMessage` notes bypass |
 | `reason_caps_at_40_items` | 45 stale items | first 40 listed, "and 5 more" |
 
@@ -368,7 +520,11 @@ following `no-punt-guard.test.js`'s subprocess pattern.
   deliberately constructing inputs to evade staleness detection. Closing
   this would require content-similarity heuristics (e.g. a diff-size
   threshold) that risk new false positives for a threat this guard isn't
-  trying to defeat.
+  trying to defeat. §13 reuses these identical three detectors against
+  remote-tracking-ref tips (round-3 finding R3-06), so this exact gap
+  applies equally to `stale-remote`/`stale-remote-foreign` detection: one
+  trivial commit added on top of already-merged content after a branch was
+  pushed reads that remote ref as `active-remote`, not stale.
 - **`rev-list --max-count=500` cost/coverage tradeoff.** Reduced to one
   call per invocation (§3 Batching) rather than one per branch, but the
   window size itself is still a bounded-read tradeoff, not validated
@@ -401,7 +557,11 @@ following `no-punt-guard.test.js`'s subprocess pattern.
 - **Work only on a remote, never fetched.** Classification is entirely
   local-ref-based (including the upstream-tip check in §3 row 6, which
   reads the locally cached tracking ref, not a live fetch); this guard
-  never runs `git fetch`.
+  never runs `git fetch`. §13's `stale-remote` classification inherits this
+  identically — a branch already deleted on the server but not yet locally
+  pruned still shows `stale-remote` until someone runs `git fetch --prune
+  <remote>` (the fix sequence's own first step, §13), and there is no
+  guarantee any given Stop invocation happens after a recent fetch.
 - **TOCTOU.** Each invocation is an independent, fresh, point-in-time
   snapshot (no cached state carries forward), which narrows — but does not
   eliminate — the window: another process can still mutate a worktree or
@@ -427,7 +587,55 @@ following `no-punt-guard.test.js`'s subprocess pattern.
   so even a correctly-set `origin/HEAD` points at the wrong project's
   default branch. §3's base-branch waterfall has no way to verify the
   chosen ref is actually the team's live integration target. Accepted,
-  not closed.
+  not closed. §13 inherits this identically, in a round-3-revised shape:
+  the same misidentified-base risk now determines the `stale-remote` /
+  `stale-remote-foreign` split — a genuinely-foreign branch on a
+  misidentified "base remote" could be confidently offered a delete-and-
+  push fix, while the team's real integration remote's own stale branches
+  are demoted to informational-only `stale-remote-foreign` notes. Still no
+  git-native way to verify the choice; still accepted, not closed.
+- **Grouped stale-remote/local-branch item when the local branch is
+  `active`, not `stale`.** §13's grouping is written to always append the
+  local branch's own delete command when one applies; when the tracking
+  local branch classifies `active` there is no such command to append, and
+  the exact wording for that case is not yet operator-confirmed — see §9
+  open question 2.
+- **Atomic-failure fallback is asymmetric (round-3 finding R3-02).** Only
+  `refs/remotes` got a `show-ref`-plus-per-ref-verify fallback for the
+  "one bad object blacks out the whole batched call" failure mode; `git
+  for-each-ref refs/heads` (local branches) has the identical exposure —
+  one corrupted local branch ref can still collapse ALL local-branch
+  classification into a single generic `branch-list-failed` block with no
+  per-item detail — and was not given the same fallback in this revision.
+  Accepted, not closed; scoped this way per the round-3 orchestrator
+  decision, which addressed remotes only.
+- **Show-ref fallback has no cross-invocation cache.** If
+  `for-each-ref refs/remotes` keeps failing on every Stop call (e.g. a
+  permanently corrupted ref nobody has cleaned up), every invocation pays
+  the full per-ref `show-ref` + `rev-parse --verify` + `log` cost instead
+  of the one batched call — the same architectural tension as R2-B4
+  (§4's no-persisted-state design has no way to remember "the fast path
+  is broken, skip straight to the fallback"). Accepted, not closed.
+- **`git branch -dr` is a local-only workaround, not a real fix (round-3
+  finding R3-03).** The fix sequence's step 4 fallback clears this
+  checkout's own blocking finding by deleting the local cached
+  remote-tracking ref, but does nothing server-side. If the operator never
+  gains push rights on that remote, the identical finding reappears every
+  time this checkout later fetches from it and the tracking ref is
+  re-created — an operator without push rights can silence the guard
+  locally forever, on a loop, without the actual remote branch ever being
+  deleted. This is the accepted trade-off for closing R3-03's "permanent
+  block with zero escape" failure mode; the server-side staleness itself
+  remains a real, un-remediated gap outside this guard's reach.
+- **Detached-HEAD worktree at a remote-tracking ref's commit.** A linked
+  worktree checked out in detached mode directly at a commit that also
+  happens to be a `stale-remote` ref's tip is not cross-referenced against
+  §13's classification — it is evaluated purely by this section's
+  Worktrees detached-HEAD row (`unknown → block`, no fix offered), and the
+  remote ref is separately reported as `stale-remote` with no link drawn
+  between the two, unlike the local-branch grouping case. Accepted, not
+  closed — the same class of gap as the existing 'concurrently-open
+  worktree' and 'in-progress-operation is primary-only' entries above.
 - **Concurrently-open worktree with no git-visible "in use" signal.** A
   linked worktree that classifies `stale` per §3 but is at this moment open
   in another session purely for read-only inspection is still reported
@@ -458,9 +666,27 @@ following `no-punt-guard.test.js`'s subprocess pattern.
    cherry, upstream-tip-merged) leads with `-D` plus an inline comment
    explaining why `-d` would fail. No remaining open fork here.
 
-*(No unresolved forks remain after round 2; all round-1 and round-2
-findings were dispositioned as fixed or accepted blind spots — see §10,
-§11.)*
+*(No unresolved forks remained after round 2 for the original scope; §13
+below introduces one new, genuinely unresolved fork — item 2.)*
+
+2. **Grouping when the tracking local branch is not itself stale.** §13's
+   grouping rule (a `stale-remote` ref is listed even when a local branch
+   tracks it, but grouped under one item) is written for the common case
+   where the local branch is also stale. It's genuinely unresolved whether
+   grouping should still apply, unchanged, when the local branch classifies
+   `active` (e.g. it has unpushed commits ahead, but its own upstream ref's
+   cached tip independently satisfies a stale-remote detector) — there is
+   no local-branch delete step to append in that case. **Recommended
+   lean:** group unconditionally by tracking relationship (the tracking
+   relationship, not co-staleness, is what makes two items "the same fix
+   target" for the agent reading `reason`), but only emit the local
+   branch's own delete command as an appended fix line when the local
+   branch's own class is `stale`; when it's `active`, the grouped item
+   shows only the remote-side fix sequence plus a short note that the
+   local branch itself is still active and untouched. §3 and §13 are
+   written to this lean already; flagged here as pending operator
+   confirmation rather than treated as fully closed, since — unlike item
+   1's `-d`/`-D` fork — it has not been through an adversary round.
 
 ## 10. Adversary round 1 change log
 
@@ -532,3 +758,162 @@ flagging the guard's own in-progress feature branch as stale via
 This finding and fix predate the PR's initial submission; this section
 exists so the spec's own record matches what the shipped code does,
 rather than describing only the pre-fix row 6 behavior.
+
+## 13. Remote-tracking branch classification
+
+**Operator directive driving this section:** no stale branches are to be
+left anywhere in the repo, remote included — closing the gap in §1–§12
+where only local branches and worktrees were evaluated and a merged or
+rebase-merged feature branch could be deleted locally while its remote
+copy (kept alive by a reviewer's fork, a slow CI mirror, or simply
+`delete_branch_on_merge` not having run yet — see §6) sat unflagged
+forever.
+
+**Scope.** Every ref under `refs/remotes/<remote>/*`, across every
+configured remote, is now a first-class classification target alongside
+worktrees and local branches (§3). The mechanics — eligible refs, the two
+structural exclusions, the mandatory tip-equality guard, the three-detector
+table, and the resulting `stale-remote` / `unknown` / `active-remote`
+classes — are specified in §3's "Remote-tracking branches" subsection;
+this section covers everything that subsection defers: grouping, fix text,
+the consequence of never fetching, and the multi-remote caveat.
+
+**Grouping with a tracking local branch.** A `stale-remote` ref (base
+remote only — `stale-remote-foreign` is never grouped, since it never has
+a fix to group toward) is listed even when a local branch tracks it —
+deleting only the local branch leaves the remote copy behind — but the two
+are grouped under one `reason` item, identified by the tracking
+relationship (`%(upstream)` on the local branch matching the remote ref,
+from the already-batched `refs/heads` call), so the agent reads one fix
+sequence instead of two unrelated-looking findings for what is really one
+piece of stale work. Grouping is keyed on the tracking relationship
+itself, not on the local branch also being stale — per §9 open question
+2's recommended lean, a grouped item whose tracking local branch classifies
+`active` (not `stale`) shows only the remote-side fix sequence below plus
+a short note that the local branch itself is active and untouched; the
+local branch's own delete command is appended only when that branch's own
+class is `stale`. This lean is applied throughout this section but is not
+yet operator-confirmed (§9).
+
+**Three-way grouping — linked worktree + its checked-out branch + that
+branch's stale-remote tracking ref (round-3 finding R3-05).** §3
+Worktrees' `coveredBranches` mechanism already absorbs a linked worktree's
+stale checked-out branch into the worktree's own single combined `reason`
+item (suppressing that branch's standalone entry). This absorption now
+extends one level further: when the absorbed branch is ALSO the tracking
+local branch of a `stale-remote` (base-remote) finding, that remote's fix
+sequence is appended as the combined worktree item's final leg (after the
+worktree-remove and branch-delete lines), and the standalone
+branch+remote grouped item (above) is suppressed entirely for that branch
+— never emitted a second time. This avoids the exact duplicate-delete-
+command outcome R3-05 flagged: one worktree, one `reason` item, one
+ordered fix sequence, regardless of how many of the three layers (worktree,
+branch, remote) are stale simultaneously.
+
+**Fix sequence, verbatim, in this order, in the (possibly grouped) item's
+`reason` text — base remote only:**
+
+1. `git fetch --prune <remote>` — the ref may already be gone on the
+   server; classification is cache-only (below), so this is always listed
+   first, regardless of local-branch presence or class.
+2. **Re-verify before proceeding (round-3 finding R3-04):** `git
+   rev-parse --verify -q refs/remotes/<remote>/<branch>` — if step 1's
+   fetch already pruned the ref locally (someone deleted it server-side
+   first), this no longer resolves and the finding is already gone; skip
+   step 3 entirely rather than running it against a target step 1 just
+   proved absent. Only proceed to step 3 if this still resolves.
+3. `git push <remote> --delete <branch>` — labeled in `reason` as
+   **"externally visible: deletes the branch on the remote"**.
+4. **Fallback when step 3 is refused (round-3 finding R3-03):** `git
+   branch -dr <remote>/<branch>` — deletes only the LOCAL cached copy of
+   the remote-tracking ref, always executable by the agent regardless of
+   push rights on `<remote>`. Labeled in `reason` with an explicit
+   recurrence note: this does not delete the server-side branch, so the
+   exact same finding reappears the next time this checkout fetches from
+   `<remote>` and re-populates the tracking ref — it is a workaround for
+   "permanently blocked, no push rights" (R3-03's original failure mode),
+   not a substitute for the actual remote delete.
+5. The tracking local branch's own delete command (its own
+   evidence-appropriate `-d`/`-D`, per §3 Branches' row selection) —
+   appended only when a local branch tracks this ref AND that branch's own
+   class is `stale` (§9 open question 2's lean); omitted entirely for a
+   `stale-remote` ref with no tracking local branch, and also omitted
+   (replaced by the active-branch note above) when the tracking local
+   branch is itself `active`.
+
+The guard never runs any of these lines — §1's "never executes a
+git-mutating command" applies identically here; `git fetch --prune` and
+step 2's `rev-parse --verify` are read-only/read-remote in spirit but are
+still never invoked by the guard itself, only ever printed as fix text, to
+keep exactly one rule ("this hook's own process runs zero git-mutating or
+git-network calls") rather than a carved-out exception for any one
+command.
+
+**Foreign-remote findings: allow with `systemMessage`, never block (round-3
+finding R3-03).** A `stale-remote-foreign` item never contributes to a
+block — the operator has no standing to delete a branch on a remote that
+isn't the base's own, so there is no fix to offer and no reason to hold
+the session open over it. Every `stale-remote-foreign` item found in a
+given invocation is instead collected into the same informational
+`systemMessage` channel already used for the primary worktree's
+in-progress-operation note (§3 Worktrees), one line per foreign finding
+naming the ref, its remote, and the evidence. This `systemMessage` is only
+emitted when the OVERALL result for that invocation is otherwise a clean
+allow (no blocking worktree, branch, or base-remote `stale-remote` item
+exists) — if any blocking item coexists, the foreign-remote note is
+silently omitted from that invocation's output (a block `reason` never
+carries an item with no actionable fix) and simply resurfaces on a later
+Stop invocation once every blocking item has been resolved and
+reclassification runs again (§4, no cached state carries forward).
+
+**No network — cache-only classification, and its consequence.**
+Classification never fetches; `refs/remotes/*` reflects whatever was last
+fetched into this checkout, by anyone, at any prior time. Consequence,
+stated explicitly rather than left implicit: a branch already deleted on
+the server but not yet locally pruned still shows `stale-remote` here.
+This is not a false positive to be suppressed — the fix sequence above
+handles it correctly either way, since step 1 (`fetch --prune`) is listed
+unconditionally and first; if the ref is already gone server-side, that
+one command clears it, step 2's re-verify confirms it, and the next Stop
+invocation (§4, no cached state across invocations) simply no longer
+lists it.
+
+**Base-remote determination and the fork-workflow caveat.** "The base's
+own remote" (§3, defined there) governs the entire stale-remote /
+stale-remote-foreign split; §8's existing fork-workflow entries (B3,
+R2-B3) already document that this guard has no git-native way to verify
+which remote is the team's real integration target when `origin` is a
+contributor's own fork. Round-3's `stale-remote-foreign` class changes
+this caveat's shape rather than removing it: a misidentified base remote
+now means a genuinely-foreign branch could be confidently offered a
+delete-and-push fix (treated as "base remote" when it shouldn't be), while
+the team's real integration remote's own stale branches are demoted to
+informational-only `stale-remote-foreign` notes. Still accepted, not
+closed — see §8.
+
+**Deadline and batching.** Both are shared, not additive — see §3
+Deadline's and Batching's updated text above. Remote-tracking refs add
+exactly one new batched git call (`for-each-ref refs/remotes`) to the fixed
+set already paid once per invocation, with the §3 show-ref fallback
+(round-3 finding R3-02) only incurred when that batched call itself fails;
+the only calls that still scale with remote-ref count are the same
+per-ref `merge-base --is-ancestor` / `git cherry` calls already priced in
+for local branches, now doubled in population by however many remote refs
+survive the exclusions in §3.
+
+**`GUARDS` array / install-guards.js:** no new entry — this extends the
+existing `stop-stale-worktrees-guard` hook's own classification pass
+in-place; §6 is otherwise unchanged, aside from its new
+`delete_branch_on_merge` note.
+
+## 14. Adversary round 3 change log
+
+| Finding | Resolution | Spec section | Rationale |
+|---|---|---|---|
+| R3-01 | fixed | §3 Remote-tracking branches | `/HEAD` exclusion is now a structural name-suffix match (`refname` ends in the literal string `/HEAD`), never symref detection — a detached (non-symbolic) `origin/HEAD` is excluded identically to a normal symref, closing the path to a nonsensical `git push origin --delete HEAD` fix line. |
+| R3-02 | fixed | §3 Remote-tracking branches, §8 | An atomically-failing `for-each-ref refs/remotes` now falls back to `show-ref` enumeration (no object dereference) plus per-ref `rev-parse --verify`, restoring row 5's per-ref isolation promise; the identical atomic-failure exposure for `refs/heads` (local branches) is left unfixed and newly documented in §8 as an accepted, scope-limited asymmetry. |
+| R3-03 | fixed | §3 Remote-tracking branches, §13, §8 | New `stale-remote-foreign` class: merged refs on any remote other than the base's own remote (or when no base remote is determinable) allow with an informational `systemMessage`, never block, since the operator has no standing to delete them. For the base's own remote, the fix sequence gains a `git branch -dr` local-tracking-ref-delete fallback for when `push --delete` is refused — removing the permanent-block failure mode R3-03 identified, at the documented cost (§8) of a local-only workaround that doesn't touch the server. |
+| R3-04 | fixed | §13 Fix sequence | A `git rev-parse --verify` re-check step is now specified between `fetch --prune` and `push --delete` — an agent that already pruned a gone ref via step 1 no longer blindly runs step 3 against a target its own re-check just proved absent. |
+| R3-05 | fixed | §13, §3 Worktrees | Three-way grouping (linked worktree + its stale checked-out branch + that branch's stale-remote tracking ref) now extends the existing `coveredBranches` absorption mechanism one level further: the remote's fix lines become the combined worktree item's final leg, and the standalone branch+remote grouped item is suppressed for that branch, eliminating the duplicated-delete-command outcome R3-05 flagged. |
+| R3-06 | fixed | §8 (rebase/squash-edge-case entry) | One sentence added stating the "one extra trivial commit defeats content-equivalence detectors" gap applies identically to `stale-remote`/`stale-remote-foreign` detection, since §13 reuses the exact same three detectors against remote-ref tips. |
+| R3-07 | fixed | §3 Remote-tracking branches | One sentence added stating all matching in this section operates on whole ref-path strings, never a remote-name/branch-name split — closing the documentation gap that could otherwise mislead an implementer into writing a slash-splitting parser that breaks on a multi-segment or non-ASCII remote name. |
