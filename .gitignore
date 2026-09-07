@@ -4,3 +4,4 @@ node_modules/
 local-policy.json
 *.spec.md
 *.adversary.md
+hooks/state/

@@ -412,7 +412,40 @@ removed rather than kept as an unexercised fallback:
   `.claude/settings.json` could add this to its `env` block itself,
   indistinguishable from a genuine operator-set variable once inherited;
   closing that needs a separate guard restricting writes to that file,
-  out of scope here.
+  out of scope here. Also skips the bounded-reblock layer below entirely
+  (no state read or written).
+- **Bounded re-block** (spec `docs/specs/stop-guard-bounded-reblock.md`,
+  reverses this guard's original "no state, no yield" design — see that
+  spec's §2 and `stop-stale-worktrees-guard.md` §4's reversal note): every
+  `block` outcome above is paired with a per-item breakdown (worktree path,
+  branch/ref name, or a fixed diagnostic label; every `deadline` block
+  collapses to one shared item regardless of which step timed out). Strikes
+  are counted per item, keyed by class + `normalizePathForCompare`-
+  normalized identity, in a per-`session_id` state file at
+  `hooks/state/stop-stale-worktrees-guard.<sanitized session_id>.json`
+  (atomic temp-file-then-rename writes; 7-day sweep on every run, reusing
+  `model-routing-guards.state.js`'s `cleanupOldStateFiles`). An item still
+  under 3 strikes keeps blocking normally; once every item present has
+  reached 3, the guard allows instead, with a `systemMessage` summary and
+  one durable JSON-line record per yielded item appended to
+  `hooks/state/stop-stale-worktrees-guard.yields.log` (the summary names
+  this path explicitly — `systemMessage` reaching the model is not assumed).
+  A fix line containing `git push <remote> --delete ...` is annotated
+  "(externally visible, run it or ask the operator)". Missing/malformed
+  `session_id` fails closed (blocks unconditionally, no state touched); a
+  state write failure also fails closed (blocks, naming the path and
+  error). Strikes never reset within a session and a yield never carries
+  into a different `session_id` — **accepted blind spot:** once an item
+  yields, it is silently omitted from every block reason for the rest of
+  that same session even if it recurs unchanged 50 more times; only a new
+  session resets it. **Accepted blind spot:** the state file is plain,
+  unsigned JSON — an agent with ordinary file access to the state
+  directory can forge a `strikes >= 3` record to force an immediate yield
+  (this guard's threat model is a forgetful agent, not an adversarial one,
+  consistent with its other accepted gaps below). `JUDGE_STOP_GUARD_STATE_DIR`
+  overrides where this layer's state and yields log live (used by this
+  file's own test suite for isolation; also usable to relocate state on a
+  real install).
 - **Other declared blind spots** (see the guard's own header and
   `docs/specs/stop-stale-worktrees-guard.md` §8 for the full list): a
   squash-merge whose matching base commit falls outside the 500-commit

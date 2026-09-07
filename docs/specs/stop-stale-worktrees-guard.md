@@ -360,8 +360,27 @@ linked worktree are specified in full in §13.
 
 ## 4. Bypass and loop behavior
 
+**Reversed by owner ruling, PR "stop guard bounded re-block."** Two live
+incidents (19 identical blocks in one session; 10 blocks across 3 clusters
+while genuine async remediation was in flight) showed that "no state, no
+yield" — the deliberate stance this section originally took after round-1
+findings A3-A5/C1-C3 below — has no way to distinguish a fast, no-op retry
+loop from a slow, legitimate fix in progress, and no way to ever stop
+repeating an already-delivered block reason. `docs/specs/
+stop-guard-bounded-reblock.md` adds a bounded-reblock layer on top of this
+guard's classification pass (unchanged by that spec): per-item strike
+counts, capped at 3 identical blocks per item before that item yields
+(allows, with a durable log line and a `systemMessage` summary), scoped
+per `session_id`, never crossing sessions. The text immediately below
+describes this guard's ORIGINAL, no-state design and the round-1 rationale
+for it; that rationale is superseded by the newer spec's owner ruling, not
+retracted as having been wrong on its own terms — see that spec's §2 for
+the full ruling and §9 for how each round-1/round-2 concern this section
+raised (A3-A5, C1-C3) was re-examined and closed under the new design.
+
 No state file, no strike counter, no session-keyed ledger, no finding-set
-hash. **Every Stop invocation independently re-runs full classification
+hash **(historical — see the reversal note above)**. **Every Stop
+invocation independently re-runs full classification
 (§2–§3) from scratch; if any stale or unknown item exists, the guard
 blocks — every time, regardless of `stop_hook_active` or how many times it
 has already blocked this session.** A human operator can always terminate
@@ -754,8 +773,8 @@ below introduces one new, genuinely unresolved fork — item 2.)*
 |---|---|---|---|
 | A1 | fixed | §3 Branches (row 4) | Tree-equality-against-last-500-base-commits check catches a squash-merge whose remote branch was kept, independent of upstream-track state. |
 | A2 | fixed | §3 Branches (row 7) | New `empty-local` class: tip==base + no upstream is `ok`, not `stale`, so a just-created branch is never targeted for deletion. |
-| A3 | fixed (by construction) | §4 | No state file exists to poison — the guard reclassifies from scratch every invocation. |
-| A4 | fixed (by construction) | §4 | No retry counter exists — passive no-op retries never earn an allow. |
+| A3 | fixed (by construction), **later reversed** | §4 | No state file exists to poison — the guard reclassifies from scratch every invocation. **Reversed by owner ruling in `docs/specs/stop-guard-bounded-reblock.md`** (§4's reversal note, above): that spec reintroduces per-item, session-keyed state, and re-examines A3's original poisoning concern under the new design (its own §2 item 3 and §9 BR-01 row) rather than leaving it silently unaddressed. |
+| A4 | fixed (by construction), **later reversed** | §4 | No retry counter exists — passive no-op retries never earn an allow. **Reversed by owner ruling in `docs/specs/stop-guard-bounded-reblock.md`** (§4's reversal note, above): that spec reintroduces a bounded per-item retry counter (cap 3), with A4's original "free passive retries" concern re-examined under the new design (its §3 decision procedure only counts strikes toward a yield, never grants an allow purely for retrying without any change). |
 | A5 | fixed (by construction) | §4 | No finding-set hash exists to be perturbed by unrelated repo churn. |
 | A6 | accepted blind spot | §4, §8 | Process-env bypass is still forgeable via a `.claude/settings.json` `env` edit; closing it needs a separate guard, out of scope here. |
 | A7 | fixed | §3 Deadline | Internal deadline makes the hook emit its own UNKNOWN block before an OS-level timeout kill could produce a silent allow; round 2 hardened this further with per-call timeouts (§11 R2-A4). |
