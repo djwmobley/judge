@@ -261,4 +261,16 @@ document self-certifies.
 
 ## 10. Change log
 
-- Revised after spec-adversary round 1 (G1-G10), 2026-09-11.
+- Revised after spec-adversary round 1 (G1-G10), 2026-09-11. Adversary
+  record kept untracked on disk per the repo's `*.adversary.md` ignore
+  rule; findings G1-G10 are summarized in this section.
+  - G1: trigger missed newly-registered models on non-empty registry — fixed by §2 per-model trigger.
+  - G2: model identity key undefined — fixed by §4 exact byte-for-byte key rule.
+  - G3: concurrent inits raced with no locking — fixed by §2 single-writer lock.
+  - G4: re-run could auto-apply suggestion for skipped field — fixed by §6 re-run invariant.
+  - G5: blank answer ambiguous between decline and invalid — fixed by §3 explicit tokens.
+  - G6: "non-negative number" admitted Infinity/locale garbage — fixed by §3 fixed grammar.
+  - G7: Q2 case/format equality unstated — fixed by §3 exact-case equality rule.
+  - G8: pseudo-TTY/piped stdin unclassified — fixed by §2 liveness-wait rule.
+  - G9: skip-flag vs per-field-flag precedence undefined — fixed by §2 mutual-exclusion rule.
+  - G10: `--force` naming risked a seeded default — fixed by §2 named non-`--force` flags.
