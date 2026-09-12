@@ -15,7 +15,7 @@ Per decision `routing-home-judge`: **judge owns all routing** —
 `route_resolve`, the review-never-equals-draft identity rule, and the
 init-time tier questionnaire this spec describes. Judge owns its own tables
 (same Postgres instance `claude-memory` uses, separate schema) and its own
-MCP tools and init flow, in `djwmobley/judge`. `claude-memory` stores
+MCP tools and init flow, in judge's own repo. `claude-memory` stores
 memory only and has no routing tables, tools, or init step after this
 ships. This supersedes `s17-1-2-init-qa-shape`: the Q&A's interactive
 *shape* — three questions, asked once per trigger, never silently seeded —
@@ -154,8 +154,8 @@ the read path.
 `route_resolve`/`routing_profile_set`/the Q&A perform against it, is the
 exact `model_id` string, trimmed of leading/trailing whitespace only,
 compared byte-for-byte, case-sensitive. No case-folding, no vendor-prefix
-stripping, no alias table: `claude-sonnet-5`, `Claude-Sonnet-5`, and
-`anthropic/claude-sonnet-5` are three distinct keys. A registration naming
+stripping, no alias table: `example-model-a`, `Example-Model-A`, and
+`vendor/example-model-a` are three distinct keys. A registration naming
 an existing key **updates that row**, never inserts a second; a key
 differing by even one byte or case is, by design, a different model with
 its own `never-asked` Q2/Q3 until its own trigger fires. Deliberate
