@@ -1,14 +1,12 @@
 # judge — init-time routing Q&A (V7/V8/V9)
 
 **Audience:** a fresh Claude Code session in this repo, authoring from this
-spec. Draft, not yet implemented or adversaried — a spec-adversary round runs
-against this document, especially its §3 classification, before any code is
-written (`docs/independence.md`'s "adversary before author" law). Companion
-to `docs/specs/routing-scorecard.md` (reports on guard decisions after
-routing is configured) and `docs/specs/pr2-agent-model-routing-guard.md`
-(the tier-routing guard itself); this spec covers only how the three
-onboarding answers routing depends on — role taxonomy, capability tier, cost
-figures — get into judge's own tables in the first place.
+spec. Revised after spec-adversary round 1 (G1-G10); implementation may
+proceed once this revision is read, per `docs/independence.md`'s "adversary
+before author" law. Companion to `docs/specs/routing-scorecard.md` and
+`docs/specs/pr2-agent-model-routing-guard.md`; this spec covers only how
+the three onboarding answers routing depends on — role taxonomy,
+capability tier, cost figures — get into judge's own tables.
 
 ## 1. Purpose and ownership
 
@@ -16,163 +14,251 @@ Per decision `routing-home-judge`: **judge owns all routing** —
 `model_registry`, `routing_profiles`, `routing_session_overrides`,
 `route_resolve`, the review-never-equals-draft identity rule, and the
 init-time tier questionnaire this spec describes. Judge owns its own tables
-(same Postgres instance `claude-memory` uses, but a separate schema/table
-set) and its own MCP tools and init flow, in `djwmobley/judge`.
-`claude-memory` stores memory only — entities, assertions, edges, handoff
-state — and has no routing tables, tools, or init step after this ships.
-This supersedes decision `s17-1-2-init-qa-shape`, itself marked SUPERSEDED:
-"init-time tier Q&A moves to judge's own init (interactive shape retained);
-not in handoff init. PR #249 closed." The interactive *shape* of the Q&A —
-three questions, asked once, at init, never silently seeded — carries
-forward unchanged from the original owner directive; only the *host*
-changes, from `claude-memory`'s `handoff_init` to judge's own init.
+(same Postgres instance `claude-memory` uses, separate schema) and its own
+MCP tools and init flow, in `djwmobley/judge`. `claude-memory` stores
+memory only and has no routing tables, tools, or init step after this
+ships. This supersedes `s17-1-2-init-qa-shape`: the Q&A's interactive
+*shape* — three questions, asked once per trigger, never silently seeded —
+carries forward unchanged; only the *host* changes, from `handoff_init` to
+judge's own init.
 
 ## 2. Trigger and re-entry
 
-Per the 2026-07-20 owner directive (claude-memory runbook §17.1.2): "V7/V8/V9
-are collected via an INTERACTIVE Q&A at init/registration time, never
-silently seeded. Trigger: handoff_init, or the first route_resolve/
-routing_profile_set touch against an empty model_registry — whichever comes
-first. Skipping the Q&A is a legitimate owner choice, not an error; routing
-just stays inert until answered." Restated for judge's init:
+Per the 2026-07-20 owner directive (runbook §17.1.2): Q&A is interactive,
+never silently seeded; skipping is legitimate, not an error — routing stays
+inert until answered. Two independent trigger channels apply, no longer
+collapsed into one "empty registry" test:
 
-- **First-run trigger:** judge's own init command, or the first
-  `route_resolve` / `routing_profile_set` MCP call against an empty
-  `model_registry` — whichever comes first.
-- **Empty-registry re-entry:** any later touch against a still-empty
-  registry re-triggers the same Q&A; there is no one-shot flag that
-  permanently suppresses it once skipped.
-- **Re-run on demand:** an explicit `judge init --routing` (or equivalent)
-  re-runs the Q&A even against a populated registry, to add or correct a
-  model's answers. Re-run is idempotent per model (§6).
-- **Non-interactive/CI behavior:** mirrors `scripts/install-guards.js`'s own
-  precedent (README.md) — if stdin is not a TTY, the Q&A never prompts. An
-  explicit flag (`--yes` / `--skip-routing-qa`, exact name TBD) lets a
-  non-interactive run proceed with the registry left unanswered; omitting
-  the flag with no TTY refuses immediately rather than hanging. A skip,
-  flagged or silent-non-TTY, leaves the registry exactly as unconfigured as
-  it was — routing stays inert (§5), never guessed.
+- **Global trigger (Q1 only).** Init, or the first `route_resolve`/
+  `routing_profile_set` call against an empty `model_registry` — whichever
+  first — asks Q1 once for the registry as a whole. Q1 fires only on an
+  empty registry or an explicit re-run (`judge init --routing`); never per
+  model.
+- **Per-model trigger (Q2/Q3).** Any call that creates a model's row — init's
+  registration step, or an MCP call touching a `model_id` with no existing
+  row — fires Q2/Q3 for *that model* the moment its row is created,
+  regardless of whether the registry was already non-empty. "Registry
+  non-empty" is never a reason to skip a new model's own pass; this closes
+  the gap where a later-registered model got a silent NULL row with no Q&A
+  at all.
+- **Empty-registry re-entry / re-run on demand.** Any touch against a
+  still-empty registry re-triggers Q1; there is no permanent one-shot
+  suppression. `judge init --routing` re-runs the Q&A against a populated
+  registry to add or correct answers; idempotent per model (§6).
+- **Concurrency.** Two sessions can race the same trigger. judge holds a
+  single-writer advisory lock per pass: keyed on the model's identity (§4)
+  for a per-model pass, or registry-level for the Q1 pass. A second caller
+  hitting a held lock never waits, retries, or overwrites silently — it
+  gets `init in progress for <key>` and must retry after the first pass
+  completes.
+- **Non-interactive/CI.** Prompting requires stdin **and** stdout both
+  TTYs; either non-TTY means no prompt. Two flags govern non-interactive
+  runs — named explicitly, not reusing `install-guards.js`'s `--force`
+  (reserved there for a future "overwrite despite a safety check," not
+  seeding): `--skip-routing-qa` declines the Q&A, writing every touched
+  field **skipped**; `--answers-file <path>` supplies answers from a file,
+  each validated exactly as an interactive answer (§3) — a malformed file
+  value is **invalid**, never coerced. Mutually exclusive: both present is
+  a hard error at flag-parse time, naming both. No flag, present or
+  future, ever seeds a default into role-set, `capability_tier`, or either
+  cost column — only *skip* or *supply-from-file*, never *guess*. Piped
+  stdin with data, no flag given, is **not** an answer channel — treated
+  as no-TTY-no-flag; `--answers-file` is the only non-interactive answer
+  path. No flag and no TTY refuses immediately, naming both flags. A
+  reported TTY that never answers (a CI pseudo-TTY) gets a bounded
+  liveness wait (illustrative 30s) after the question is posed; on
+  timeout, treated as no-TTY-no-flag. No input state is left
+  unclassified.
 
 ## 3. The three questions
 
-Each question is asked once per model being registered, in this order,
-during a single Q&A pass.
+Each question, once triggered (§2), resolves to exactly one branch below;
+there is no fifth answer-time state. This is distinct from the row-level
+lifecycle state (§4), which separately makes "was this ever triggered"
+total.
 
-**Q1 — role set.** A 7-role table (orchestrate, spec, draft/write, read,
-index, bookkeep, review/verify) is presented as a **pre-filled suggestion**,
-not a default: the owner confirms it as-is, edits any row, or replaces the
-set entirely with free text. The suggested set never applies on its own —
-there is no "press enter to accept" path that writes roles without an
-explicit confirming keystroke. Roles are stored as free-text data, not a
-schema-level enum, so an owner-edited set is not a validation failure.
+**Explicit tokens.** Two literal, case-sensitive tokens govern every
+question; neither is satisfied by a bare Enter/blank line. **Skip token**
+— typing `skip` (trimmed, exact) declines a question; blank/Enter alone is
+never a decline, it is invalid. **Confirm token** — accepting a pre-filled
+re-run suggestion (§6) requires typing `confirm` or making an explicit
+edit; blank/Enter alone never confirms, first run or re-run.
 
-**Q2 — capability tier.** Asked once per *registered model*: high / mid /
-low. Never inferred from the model's name or vendor string — a name
-containing "haiku," "mini," or "large" carries no weight. Any other input is
-invalid, not a fourth tier.
+**Q1 — role set.** Asked once per global trigger (§2), never per model. A
+7-role table (orchestrate, spec, draft/write, read, index, bookkeep,
+review/verify) is a pre-filled suggestion, not a default: `confirm` accepts
+it verbatim; an explicit edit replaces it. Free-text storage, not a
+schema-level enum. Blank/Enter with neither token is **invalid**; `skip`
+yields **skipped** (NULL, `qa_state` `asked-and-skipped`, §4).
 
-**Q3 — cost figures.** `cost_in_per_mtok` and `cost_out_per_mtok`, once per
-registered model, owner-supplied numeric values. Never defaulted from a
-price list or vendor page bundled with judge.
+**Q2 — capability tier.** Asked once per newly-registered model, at that
+model's per-model trigger: high / mid / low. Never inferred from name or
+vendor string. Equality rule: trim whitespace only, no case-folding, then
+must equal exactly one of `high`, `mid`, `low`, byte-for-byte. `High`,
+`MID`, or any other casing/spacing is **invalid**, not a fourth tier.
+`skip` is the only decline path; blank/Enter with no token is **invalid**.
 
-**Total classification of every answer state** (no allow-list — every input
-maps to exactly one of these four branches, unknown/malformed included):
+**Q3 — cost figures.** `cost_in_per_mtok`/`cost_out_per_mtok`, once per
+newly-registered model, same per-model pass as Q2, owner-supplied — never
+defaulted from bundled price data. Parsing rule: trimmed answer must match
+a fixed grammar — digits, an optional single `.` decimal separator,
+digits, nothing else: no thousands separators, no locale `,` decimals, no
+exponential notation. Value must be finite and non-negative; `-0` is
+**invalid**, not zero — a literal "≥ 0" check alone would pass `Infinity`,
+`NaN`, exponential input, locale input, and `-0` too, so each is named
+**invalid** explicitly. Stored as `NUMERIC`, never a float that can
+reintroduce `Infinity` on read. `skip` is the only decline path;
+blank/Enter alone is invalid.
+
+**Total classification of every answer to an already-triggered question**
+(no allow-list — every input maps to exactly one branch):
 
 | Input state | Branch | Effect |
 |---|---|---|
-| Valid answer given (matches the field's own validation: Q1 non-empty string, Q2 ∈ {high, mid, low}, Q3 non-negative number) | **answered** | Written to the model's row (§4); used by `route_resolve` from that point on. |
-| Q&A explicitly skipped for this model (flagged non-interactive run, or owner interactively declines this question) | **skipped** | Field(s) left NULL; model registered but that field is unconfigured — not an error (§5). |
-| Input given but fails that field's own validation (non-numeric cost, tier string not in {high, mid, low}, empty required role edit) | **invalid** | Re-prompt in an interactive session; in a non-interactive run, fail the init step loudly — never silently coerced or truncated into a nearest-valid value. |
-| No input reaches the question at all (non-TTY, no skip flag given) | **invalid** (refuse-to-hang branch, §2) | Init refuses immediately, naming the skip flag. |
+| Valid answer matching the field's grammar (Q1: confirmed/edited non-empty text; Q2: exactly `high`\|`mid`\|`low`, case-sensitive; Q3: finite, non-negative, `.`-separated decimal, not `-0`) | **answered** | Written to the row (§4); `qa_state` → `asked-and-answered`; used by `route_resolve` thereafter. |
+| The literal `skip` token (trimmed, exact) | **skipped** | Field left NULL; `qa_state` → `asked-and-skipped`; not an error (§5). |
+| Input given but fails that field's grammar (wrong-case/format tier, non-decimal/locale/exponential/`-0`/`Infinity` cost, blank/Enter with no token, empty required Q1 edit) | **invalid** | Re-prompt interactively; via `--answers-file`, fail loudly naming the field and value — never coerced, truncated, or rounded to nearest-valid. |
+| No input reaches the question (no TTY, no flag, or no response inside the liveness window, §2) | **invalid** (refuse-to-hang) | Init refuses immediately, naming `--skip-routing-qa` and `--answers-file`. |
 
-Every branch is reachable and terminates in a defined state; no fifth,
-unenumerated input falls through un-routed.
+Every branch is reachable and terminates; nothing unenumerated falls
+through un-routed. §4 makes "was this ever triggered" total separately, so
+a NULL value is never the only signal a reader has.
 
 ## 4. Storage
 
 Judge-owned tables, same Postgres instance as `claude-memory`, separate
-schema. `model_registry` (one row per model) gains (exact column names are
-implementation-level, named descriptively here): a role-set column (free
-text from Q1, NULL until answered or explicitly edited — never
-auto-populated with the suggested 7-role table), `capability_tier`
-(checked-text high/mid/low, NULL until Q2 answered), `cost_in_per_mtok` and
-`cost_out_per_mtok` (numeric, NULL until Q3 answered). NULL in any of these
-columns means exactly one thing: unconfigured. Never zero-cost, never
-"assume low tier," never coerced to a default anywhere in the read path.
+schema. `model_registry` (one row per model, keyed by §4's identity rule)
+gains a role-set column (free text, NULL until answered/edited),
+`capability_tier` (checked-text high/mid/low, NULL until answered),
+`cost_in_per_mtok`/`cost_out_per_mtok` (NUMERIC, NULL until answered) —
+plus, per field, a `qa_state` value and an `asked_at` timestamp. `qa_state`
+is total over that field's lifecycle:
+
+| `qa_state` | Meaning |
+|---|---|
+| `never-asked` | Question not yet presented for this row. `asked_at` NULL. |
+| `asked-and-answered` | Presented and answered validly (§3); value non-NULL, `asked_at` set. |
+| `asked-and-skipped` | Presented and `skip`ped (interactively or via flag); value NULL, `asked_at` set. |
+
+A NULL value alone is ambiguous between `never-asked` and
+`asked-and-skipped` — no code path, `route_resolve` (§5) included, may
+treat "value is NULL" as sufficient evidence of which; `qa_state` (or
+`asked_at`) must be consulted. §2's per-model trigger means `never-asked`
+should not occur for Q2/Q3 on any row created after this ships; it stays
+named so a row landing there anyway (a bug, a bulk import, an
+unanticipated registrar path) is diagnosable, not misread as a deliberate
+skip. Never zero-cost, never "assume low tier," never coerced anywhere in
+the read path.
+
+**Model identity key.** The key for `model_registry`, and for every lookup
+`route_resolve`/`routing_profile_set`/the Q&A perform against it, is the
+exact `model_id` string, trimmed of leading/trailing whitespace only,
+compared byte-for-byte, case-sensitive. No case-folding, no vendor-prefix
+stripping, no alias table: `claude-sonnet-5`, `Claude-Sonnet-5`, and
+`anthropic/claude-sonnet-5` are three distinct keys. A registration naming
+an existing key **updates that row**, never inserts a second; a key
+differing by even one byte or case is, by design, a different model with
+its own `never-asked` Q2/Q3 until its own trigger fires. Deliberate
+simplicity, not an oversight — alias resolution is a separate,
+separately-adversaried future feature (§8). Same explicit rule for every
+other key: **role-set** is free text, never a lookup key, so only re-run's
+"no change" check (§6) applies — byte-for-byte after trimming surrounding
+whitespace, no reordering/case/synonym-insensitivity. **`capability_tier`**
+is compared byte-for-byte against the three lowercase literals, same
+function at write and every read, `route_resolve` included.
 
 ## 5. `route_resolve` behavior on unconfigured state
 
-"Unanswered means unconfigured, not guessed: `route_resolve` against
-missing Q1–Q3 data returns an explicit 'unconfigured — run routing init Q&A'
-error, never a guess or a silent fallback." Concretely: a `route_resolve`
-call touching a model whose `capability_tier` is NULL hard-errors with that
-message ("unanswered = `capability_tier` NULL and `route_resolve`
-hard-errors"); a model missing cost figures is excluded from least-cost
-ranking rather than ranked at an assumed cost ("unanswered = least-cost
-ranking inert for that model"), not a hard error, since a tier-only routing
-decision can still resolve without cost data.
+Unanswered means unconfigured, never guessed. `route_resolve` reads
+`qa_state`, not just the value column, so its error names which history
+applies: `asked-and-skipped` hard-errors `"capability_tier skipped for
+<model_id> — run routing init Q&A"`; `never-asked` hard-errors
+`"capability_tier never asked for <model_id> — run routing init Q&A"`.
+Both are hard errors — neither guessed nor defaulted — but the message
+names which, so an owner knows whether they declined or the trigger never
+reached that model (itself worth investigating per §2). A model missing
+cost figures, either `qa_state`, is excluded from least-cost ranking
+rather than ranked at an assumed cost — not a hard error, since a
+tier-only decision can still resolve — and the exclusion output names the
+model and its `qa_state`.
 
 ## 6. Invariants
 
-- Never infer `capability_tier` from a model's name, vendor, or other
-  registered metadata — Q2 has no allow-list of "known" models to
-  pattern-match against.
-- Never seed `cost_in_per_mtok` / `cost_out_per_mtok` from a bundled price
-  list, cached quote, or any source but a direct owner answer.
-- The Q1 suggested role set never auto-applies; every registration writes
-  an explicit confirmation or an explicit edit.
-- Re-running the Q&A against an already-answered model is idempotent: the
-  same confirmed answer re-entered produces no change, and existing answers
-  are the pre-filled starting point for a re-run, not cleared first.
-- Answers survive re-init: running judge's init flow again never clears or
-  resets a previously-answered model's Q1–Q3 columns.
+- Never infer `capability_tier` from name, vendor, or other metadata — no
+  allow-list of "known" models to pattern-match.
+- Never seed cost figures from a bundled price list, cached quote, or
+  anything but a direct owner answer; no flag is ever wired to seeding.
+- The Q1 suggestion never auto-applies; every registration writes an
+  explicit `confirm` or an explicit edit (§3).
+- **Re-run pre-fill never presents a placeholder as a prior answer.** For
+  `asked-and-answered` fields, re-run shows the existing value pre-filled
+  and `confirm` accepts it unchanged. For `asked-and-skipped` or
+  `never-asked` fields, re-run has no prior answer and must say so
+  visibly ("never answered" / "previously skipped") instead of silently
+  rendering the Q1 suggestion, or any placeholder, where a real answer
+  would sit — the same explicit confirm-or-edit keystroke §3 requires on a
+  first run is required here too.
+- Re-run against an already-answered model is idempotent: the same
+  confirmed answer re-entered (§4's equality rules) produces no change and
+  does not update `asked_at`; existing answers are always the re-run
+  starting point, never cleared first.
+- Answers survive re-init: re-running init never clears a previously
+  answered model's Q1–Q3 columns.
+- Concurrent passes never race to silent last-write-wins; the §2 lock and
+  error apply to every write path, including re-run.
 
 ## 7. Open owner-review points (V7–V9)
 
 - **V7 — role taxonomy.** The 7-role starting set is a suggestion to
-  confirm, not a fixed schema. Recommended lean: keep the column free-text
-  so an owner can add or rename roles without a migration; revisit only if
-  role values start being matched against in guard logic.
-- **V8 — capability-tier mapping.** Zero defaults for any named model; each
-  registration is a per-model owner call. Recommended lean: keep it that
-  way as the registry grows — a vendor-name heuristic is exactly the
-  allow-list failure mode `judge`'s own design law rejects.
+  confirm, not a fixed schema. Recommended lean: keep the column
+  free-text so an owner can add or rename roles without a migration;
+  revisit only if role values start being matched in guard logic.
+- **V8 — capability-tier mapping.** Zero defaults for any named model;
+  each registration is a per-model owner call. Recommended lean: keep it
+  as the registry grows — a vendor-name heuristic is exactly the
+  allow-list failure mode judge's design law rejects.
 - **V9 — cost figures.** Owner-supplied, never hardcoded; a stale figure
-  corrupts both least-cost ranking and `cost_delta_usd` telemetry.
-  Recommended lean: no automatic refresh from any external price source in
-  this spec's scope; a staleness/re-confirm nudge is a distinct,
-  separately-adversaried future feature, not part of this Q&A.
+  corrupts least-cost ranking and `cost_delta_usd` telemetry alike.
+  Recommended lean: no automatic refresh from any external price source
+  in scope; a staleness/re-confirm nudge is a distinct, separately
+  adversaried future feature.
 
 ## 8. Out of scope
 
-- The `route_resolve` ranking algorithm, the review-never-equals-draft
-  identity rule's enforcement, and `routing-scorecard.md`'s decision
-  ledger — all covered by their own specs.
-- Migrating any `claude-memory`-side routing code or data into judge; this
-  spec covers only the Q&A that populates judge's own tables going forward.
+- The `route_resolve` ranking algorithm, review-never-equals-draft rule
+  enforcement, and `routing-scorecard.md`'s ledger — own specs.
+- Migrating `claude-memory`-side routing code/data into judge — this spec
+  covers only the Q&A populating judge's own tables.
 - A staleness/re-confirmation nudge for cost figures (V9 lean above).
-- The exact non-interactive flag name and init command's full CLI surface —
-  named illustratively in §2, finalized at implementation time.
+- Model-alias resolution (§4) — a distinct future spec if ever pursued.
+- The concurrency primitive's exact implementation, the liveness timeout's
+  default/configurability, and the final CLI wiring of
+  `--skip-routing-qa`/`--answers-file` — §2/§6 name requirements
+  illustratively; implementation finalizes the code.
 
 ## 9. Blind spots of this spec
 
-This spec was authored by reading `docs/specs/session-end-worktree-guard.md`
-(heading style only), `docs/specs/routing-scorecard.md` (§1-2), and
-`README.md`, plus a grep of this worktree for `model_registry` /
-`route_resolve` / `routing_profile` / `capability_tier` /
-`cost_in_per_mtok`, which returned exactly one hit:
-`docs/specs/pr2-agent-model-routing-guard.md`, whose own text states that
-`route_resolve`, `routing_profile_*`, and `usage_*` are "a different
-subsystem living in `claude-memory`'s `scripts/lib/route-resolve.js` and
-friends" as of that spec's writing — i.e. that spec predates, and has not
-been updated for, the `routing-home-judge` decision this spec is built on.
-This means: (a) this author could not verify that judge's repo currently has
-any `model_registry` table, MCP tool, or init command at all — §4-5 describe
-a target shape, not a confirmed existing schema to extend; (b) whether
-`claude-memory`'s existing `route-resolve.js` needs to be ported, rewritten,
-or retired was not investigated here and is not decided by this spec; (c)
-the exact non-interactive flag name and error-message string in §2/§5 are
-illustrative, not read from an existing judge source file, since none was
-found; (d) this spec's own §3 classification table has not yet been through
-the required spec-adversary round — that round is the next step, not
-something this document can self-certify.
+Authored by reading `docs/specs/session-end-worktree-guard.md` (heading
+style), `docs/specs/routing-scorecard.md` (§1-2), and `README.md`, plus a
+grep for `model_registry`/`route_resolve`/`routing_profile`/
+`capability_tier`/`cost_in_per_mtok`, one hit:
+`docs/specs/pr2-agent-model-routing-guard.md`, which says
+`route_resolve`/`routing_profile_*`/`usage_*` live in `claude-memory`'s
+`scripts/lib/route-resolve.js` — predating and not updated for
+`routing-home-judge`. This revision resolves spec-adversary round 1
+(G1-G10, `docs/specs/init-routing-qa.adversary.md`) at the text level;
+remaining blind spots: (a) no confirmation judge's repo has any
+`model_registry` table, MCP tool, or init command yet — §4-5, including
+the new `qa_state`/`asked_at` columns and lock primitive, describe a
+target shape, not a confirmed schema; (b) whether `route-resolve.js` needs
+porting, rewriting, or retiring is undecided; (c) flag names, error
+strings, and the 30s liveness timeout are illustrative, read from no
+existing judge source; (d) §2/§6 state the lock requirement but don't
+choose advisory-lock-vs-version-column, nor analyze whether the global Q1
+lock and a per-model Q2/Q3 lock can deadlock; (e) this revision hasn't
+itself had a round-2 adversary pass — the next step, not something this
+document self-certifies.
+
+## 10. Change log
+
+- Revised after spec-adversary round 1 (G1-G10), 2026-09-11.
