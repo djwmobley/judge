@@ -55,6 +55,7 @@ const {
   normalizeRawCommandForStateDirCheck,
   // backlog #30 — PS assignment total classification
   classifyPsClauses,
+  findPsBracedClose,
   findPsAssignmentSplit,
   splitTopLevelCommas,
   looksLikePsBracedPath,
@@ -1556,13 +1557,12 @@ t("PSASSIGN-R3-03: $using:out = 1 -> BLOCK (unbraced using, unchanged from v1)",
   assert.equal(r.reason, "assignment-lhs-provider");
 });
 
-t("PSASSIGN-R3-04: ${.\\out.ps1} = 'x' -> BLOCK (branch 3, braced relative provider path)", () => {
+t("PSASSIGN-R3-04: ${.\\out.ps1} = 'x' -> ALLOW (SUPERSEDED by R3a-1 — colon-less braced content is plain-variable semantics, not a path)", () => {
   const r = ps("${.\\out.ps1} = 'x'");
-  assert.equal(r.allow, false, JSON.stringify(r));
-  assert.equal(r.branch, 3);
+  assert.equal(r.allow, true, JSON.stringify(r));
 });
 
-t("PSASSIGN-R3-05: looksLikePsBracedPath unit coverage", () => {
+t("PSASSIGN-R3-05: looksLikePsBracedPath unit coverage (still called for colon-bearing content, R3a-2 unchanged)", () => {
   assert.equal(looksLikePsBracedPath("C:\\out.ps1"), true);
   assert.equal(looksLikePsBracedPath("C:/out.ps1"), true);
   assert.equal(looksLikePsBracedPath("\\\\host\\share\\out.ps1"), true);
@@ -1570,6 +1570,98 @@ t("PSASSIGN-R3-05: looksLikePsBracedPath unit coverage", () => {
   assert.equal(looksLikePsBracedPath("env:X"), false);
   assert.equal(looksLikePsBracedPath("foo:bar"), false);
   assert.equal(looksLikePsBracedPath("using:out"), false);
+});
+
+// -- R3a: braced LHS colon-gated classification + shared backtick-aware -----
+// -- brace scan (spec-adversary pass, adversary-r3a-judge-2026-09-24.md) ----
+
+t("PSASSIGN-R3A-01: ${name} = 1 -> ALLOW (colon-less braced LHS, plain variable, R3a-1)", () => {
+  const r = ps("${name} = 1");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PSASSIGN-R3A-02: ${my var} = 1 -> ALLOW (colon-less braced LHS with a space, still plain variable, R3a-1)", () => {
+  const r = ps("${my var} = 1");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PSASSIGN-R3A-03: ${.\\out.ps1} = 5 -> ALLOW (colon-less leading-dot content, R3a-1 — old path carve-out removed, F1 fix)", () => {
+  const r = ps("${.\\out.ps1} = 5");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PSASSIGN-R3A-04: ${PSDefaultParameterValues} = @{} -> BLOCK (colon-less reserved base name, R3a-1 + R1, assignment-lhs-reserved)", () => {
+  const r = ps("${PSDefaultParameterValues} = @{}");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-reserved");
+});
+
+t("PSASSIGN-R3A-05: ${null} = 1 -> BLOCK (colon-less reserved base name, R3a-1 + R1, assignment-lhs-reserved)", () => {
+  const r = ps("${null} = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-reserved");
+});
+
+t("PSASSIGN-R3A-06: ${a`}b} = 1 -> BLOCK (backtick anywhere in braced content, R3a-3, assignment-lhs-escape)", () => {
+  const r = ps("${a`}b} = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-escape");
+});
+
+t("PSASSIGN-R3A-07: ${C:\\folder`}name\\out.ps1} = 1 -> BLOCK (shared backtick-aware scan finds the TRUE close, R3a-3 + R3a-4, assignment-lhs-escape)", () => {
+  const r = ps("${C:\\folder`}name\\out.ps1} = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-escape");
+});
+
+t("PSASSIGN-R3A-08: unterminated ${ in LHS position -> BLOCK (branch 4, assignment-lhs-malformed, via shared findPsBracedClose)", () => {
+  const r = ps("${unterminated = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("PSASSIGN-R3A-09: findPsBracedClose unit coverage — backtick-aware true-close scan", () => {
+  assert.equal(findPsBracedClose("ab}c", 0), 2);
+  assert.equal(findPsBracedClose("a`}b}c", 0), 4);
+  assert.equal(findPsBracedClose("a`}b", 0), -1);
+  assert.equal(findPsBracedClose("a`", 0), -1);
+  assert.equal(findPsBracedClose("", 0), -1);
+});
+
+t("PSASSIGN-R3A-10: ${a}, $b = 1,2 -> ALLOW (colon-less braced element in a comma list, R3a-1 + R4)", () => {
+  const r = ps("${a}, $b = 1,2");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PSASSIGN-R3A-11: ${a}, ${C:\\x.ps1} = 1,2 -> BLOCK (colon-bearing element resolves and blocks; R3a-2/R3 + R4 worst-wins)", () => {
+  const r = ps("${a}, ${C:\\x.ps1} = 1,2");
+  assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+t("PSASSIGN-R3A-12: ${a\uFF1Ab} = 1 -> ALLOW (Unicode lookalike colon U+FF1A is not ASCII ':' — plain variable per R3a-1, F3 confirmed no-op)", () => {
+  const r = ps("${a\uFF1Ab} = 1");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t('PSASSIGN-R3A-13: regression — $env:PROJECT_ROOT = "C:\\x"; node scripts/handoff.js status still allowed (unaffected by R3a, unbraced env: scope)', () => {
+  const r = ps('$env:PROJECT_ROOT = "C:\\x"; node scripts/handoff.js status');
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PSASSIGN-R3A-14: must-still-block #21 cases unaffected — ${C:\\t\\out.ps1} = 'x' still blocks (branch 3, colon-bearing, R3a-2 unchanged)", () => {
+  const r = ps("${C:\\t\\out.ps1} = 'x'");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 3);
+});
+
+t("PSASSIGN-R3A-15: must-still-block #21 cases unaffected — $a[(Set-Content x.ps1)] = 1 still blocks (branch 4, assignment-lhs-index-paren)", () => {
+  const r = ps("$a[(Set-Content x.ps1)] = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-index-paren");
 });
 
 // -- R4/O2: comma-list LHS nesting-aware split -------------------------------
