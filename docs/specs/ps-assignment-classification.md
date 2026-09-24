@@ -1,6 +1,6 @@
 # Spec v2 — PowerShell assignment total classification (judge shell-write-guard, backlog #30)
 
-Source: Opus plan v1, 2026-09-24, amended with owner-orchestrator rulings R1-R5
+Source: planning-tier plan v1, 2026-09-24, amended with owner-orchestrator rulings R1-R5
 on the spec-adversary's findings (`adversary-ps-assign-judge-2026-09-24.md`,
 harness `adversary-ps-harness-judge-2026-09-24.js`, same directory). v2
 changes are called out inline as **R1**-**R5**; everything else is v1,
