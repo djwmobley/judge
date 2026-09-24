@@ -53,6 +53,19 @@ const {
   loadConfig,
   DEFAULT_GATED_EXTENSIONS,
   normalizeRawCommandForStateDirCheck,
+  // backlog #30 — PS assignment total classification
+  classifyPsClauses,
+  findPsAssignmentSplit,
+  splitTopLevelCommas,
+  looksLikePsBracedPath,
+  applySuffixChain,
+  classifyPsBracedLhs,
+  parsePsAssignmentLhsSingle,
+  parsePsAssignmentLhs,
+  psRhsHasQuotedSubexpression,
+  isPsRhsPureExpression,
+  classifyPsAssignmentRhs,
+  isReservedLhsVarName,
 } = require(HOOK_PATH);
 
 const GATED = DEFAULT_GATED_EXTENSIONS.slice(); // [".ps1", ".psm1", ".psd1"]
@@ -1279,6 +1292,371 @@ t("PSD1-15: FileStream with explicit read access -> allow (StreamReader-style fi
 t("PSD1-16: assignment RHS write cmdlet is classified — $x = Set-Content -Path out.ps1 -Value y -> BLOCK", () => {
   const r = ps("$x = Set-Content -Path out.ps1 -Value y");
   assert.equal(r.allow, false, JSON.stringify(r));
+});
+
+// ---------------------------------------------------------------------------
+// backlog #30 — PowerShell assignment total classification
+// docs/specs/ps-assignment-classification.md — spec v2 test matrix (R1-R5)
+// ---------------------------------------------------------------------------
+
+t("PSASSIGN-00: baseline — node scripts/handoff.js status alone -> allow", () => {
+  assert.equal(ps("node scripts/handoff.js status").allow, true);
+});
+
+t('PSASSIGN-01: original backlog #30 bug fixed — $env:PROJECT_ROOT = "C:\\x"; node scripts/handoff.js status -> allow', () => {
+  const r = ps('$env:PROJECT_ROOT = "C:\\x"; node scripts/handoff.js status');
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+// -- Now allowed (spec v1 test list) -----------------------------------------
+
+t("PSASSIGN-02: $x = $y -> allow", () => {
+  assert.equal(ps("$x = $y").allow, true);
+});
+
+t("PSASSIGN-03: $x += 1 -> allow", () => {
+  assert.equal(ps("$x += 1").allow, true);
+});
+
+t("PSASSIGN-04: $x ??= Get-Date -> allow", () => {
+  assert.equal(ps("$x ??= Get-Date").allow, true);
+});
+
+t("PSASSIGN-05: [string]$s = 'a' -> allow", () => {
+  assert.equal(ps("[string]$s = 'a'").allow, true);
+});
+
+t("PSASSIGN-06: $a[0] = 1 -> allow", () => {
+  assert.equal(ps("$a[0] = 1").allow, true);
+});
+
+t("PSASSIGN-07: $a.b = $c -> allow", () => {
+  assert.equal(ps("$a.b = $c").allow, true);
+});
+
+t("PSASSIGN-08: $a,$b = 1,2 -> allow", () => {
+  assert.equal(ps("$a,$b = 1,2").allow, true);
+});
+
+t("PSASSIGN-09: ${env:X} = 1 -> allow (braced env scope, R3)", () => {
+  assert.equal(ps("${env:X} = 1").allow, true);
+});
+
+t("PSASSIGN-10: $x = $(Get-Date) -> allow (bare $ remnant exemption)", () => {
+  assert.equal(ps("$x = $(Get-Date)").allow, true);
+});
+
+t("PSASSIGN-11: $h = @{a=1} -> allow (bare @ remnant exemption, inner clauses still classified)", () => {
+  assert.equal(ps("$h = @{a=1}").allow, true);
+});
+
+t("PSASSIGN-12: $r = @(1,2) -> allow", () => {
+  assert.equal(ps("$r = @(1,2)").allow, true);
+});
+
+t('PSASSIGN-13: $x = "out.ps1" -> allow (policy delta: literal RHS naming a gated file)', () => {
+  assert.equal(ps('$x = "out.ps1"').allow, true);
+});
+
+t('PSASSIGN-14: $x = @"\\nout.ps1\\n"@ -> allow (A3: literal-only double-quoted here-string is pure)', () => {
+  const r = ps('$x = @"\nout.ps1\n"@');
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+// -- Unchanged (no top-level depth-0 `=`; findPsAssignmentSplit never fires) -
+
+t('PSASSIGN-15: Write-Host "a=b" -> allow (unchanged, = is inside a quoted string)', () => {
+  assert.equal(ps('Write-Host "a=b"').allow, true);
+});
+
+t("PSASSIGN-16: git log --format=%H -> allow (unchanged; LHS candidate 'git log --format' doesn't start with $, R2)", () => {
+  assert.equal(ps("git log --format=%H").allow, true);
+});
+
+t("PSASSIGN-17: cmd /c set X=1 -> unchanged (R2 explicit example; LHS candidate doesn't start with $)", () => {
+  const before = ps("cmd /c set X=1");
+  assert.equal(before.allow, true, JSON.stringify(before));
+});
+
+t("PSASSIGN-18: node a --x=$y -> unchanged (R2 explicit example; not treated as an assignment — 'node a --x' isn't $-shaped — and still blocks branch 4 for the SAME pre-existing reason as today, the ambiguous $y in --x=$y, not via assignment classification)", () => {
+  const r = ps("node a --x=$y");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "argument-ambiguous");
+});
+
+t("PSASSIGN-19: Write-Output $x=1 -> not an assignment (R2 explicit example; LHS candidate doesn't start with $)", () => {
+  // 'Write-Output $x' does not itself parse as an LHS, so this falls
+  // through unchanged to the pre-existing split/dispatch — not asserting
+  // a specific allow/block outcome here (unaffected either way), only that
+  // it does not throw and is not routed through assignment classification.
+  const r = ps("Write-Output $x=1");
+  assert.equal(typeof r.allow, "boolean");
+});
+
+// -- Must still block (spec v1 test list, amended per R1) -------------------
+
+t("PSASSIGN-20: $x = Set-Content -Path out.ps1 -Value y -> BLOCK (RHS existing dispatch)", () => {
+  assert.equal(ps("$x = Set-Content -Path out.ps1 -Value y").allow, false);
+});
+
+t("PSASSIGN-21: $null = New-Item out.ps1 -> BLOCK (branch 4, assignment-lhs-reserved — R1 disclosed consequence)", () => {
+  const r = ps("$null = New-Item out.ps1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-reserved");
+});
+
+t("PSASSIGN-22: $x = [IO.File]::WriteAllText('out.ps1','x') -> BLOCK (RHS existing dispatch, dotnet)", () => {
+  assert.equal(ps("$x = [IO.File]::WriteAllText('out.ps1','x')").allow, false);
+});
+
+t("PSASSIGN-23: $x = & $cmd a.ps1 -> BLOCK (RHS existing dispatch, call operator)", () => {
+  const r = ps("$x = & $cmd a.ps1");
+  assert.equal(r.allow, false, JSON.stringify(r)); assert.equal(r.branch, 4);
+});
+
+t("PSASSIGN-24: $x = $w.Write('out.ps1') -> BLOCK (RHS existing dispatch, unrecognized clause)", () => {
+  const r = ps("$x = $w.Write('out.ps1')");
+  assert.equal(r.allow, false, JSON.stringify(r)); assert.equal(r.branch, 4);
+});
+
+t('PSASSIGN-25: $x = "$(Set-Content out.ps1)" -> BLOCK (branch 4, rhs-subexpression)', () => {
+  const r = ps('$x = "$(Set-Content out.ps1)"');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "rhs-subexpression");
+});
+
+t('PSASSIGN-26: $x = @"\\n$(Set-Content out.ps1)\\n"@ -> BLOCK (rhs-subexpression, here-string form)', () => {
+  const r = ps('$x = @"\n$(Set-Content out.ps1)\n"@');
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "rhs-subexpression");
+});
+
+t("PSASSIGN-27: $x = Get-Content a > out.ps1 -> BLOCK (branch 3, whole-statement redirect scan, untouched)", () => {
+  const r = ps("$x = Get-Content a > out.ps1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 3);
+  assert.equal(r.detector, "PowerShell redirect");
+});
+
+t("PSASSIGN-28: ${C:\\t\\out.ps1} = 'x' -> BLOCK (branch 3, LHS provider-path resolution)", () => {
+  const r = ps("${C:\\t\\out.ps1} = 'x'");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 3);
+});
+
+t("PSASSIGN-29: $c:foo = 1 -> BLOCK (branch 4, assignment-lhs-provider)", () => {
+  const r = ps("$c:foo = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-provider");
+});
+
+t("PSASSIGN-30: $a[(Set-Content x.ps1)] = 1 -> BLOCK (branch 4, assignment-lhs-index-paren — A1 fix)", () => {
+  const r = ps("$a[(Set-Content x.ps1)] = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-index-paren");
+});
+
+t("PSASSIGN-31: $sb = { Set-Content out.ps1 } -> BLOCK (branch 3, RHS existing dispatch, scriptblock)", () => {
+  const r = ps("$sb = { Set-Content out.ps1 }");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 3);
+});
+
+t("PSASSIGN-32: SPLAT-01 unaffected — $p=@{Path='out.ps1'}; Set-Content @p -> BLOCK (branch 4)", () => {
+  const r = ps("$p=@{Path='out.ps1'}; Set-Content @p");
+  assert.equal(r.allow, false, JSON.stringify(r)); assert.equal(r.branch, 4);
+});
+
+// -- R1: reserved automatic/preference variables (escape E1) ----------------
+
+t("PSASSIGN-R1-01: $PSDefaultParameterValues['Out-File:FilePath'] = 'out.ps1' -> BLOCK (E1 fix, assignment-lhs-reserved)", () => {
+  const r = ps("$PSDefaultParameterValues['Out-File:FilePath'] = 'out.ps1'");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-reserved");
+});
+
+t("PSASSIGN-R1-02: $WhatIfPreference = $false -> BLOCK (ends with Preference)", () => {
+  const r = ps("$WhatIfPreference = $false");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "assignment-lhs-reserved");
+});
+
+t("PSASSIGN-R1-03: $ErrorActionPreference = 'Stop' -> BLOCK (ends with Preference, accepted friction)", () => {
+  const r = ps("$ErrorActionPreference = 'Stop'");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "assignment-lhs-reserved");
+});
+
+t("PSASSIGN-R1-04: $PSBoundParameters['x'] = 1 -> BLOCK (starts with PS)", () => {
+  const r = ps("$PSBoundParameters['x'] = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "assignment-lhs-reserved");
+});
+
+t('PSASSIGN-R1-05: $env:PSModulePath = "C:\\mods" -> allow (env: scope exempt from R1, even though base name starts with PS)', () => {
+  const r = ps('$env:PSModulePath = "C:\\mods"');
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PSASSIGN-R1-06: isReservedLhsVarName unit coverage", () => {
+  assert.equal(isReservedLhsVarName("PSDefaultParameterValues"), true);
+  assert.equal(isReservedLhsVarName("psdefaultparametervalues"), true);
+  assert.equal(isReservedLhsVarName("WhatIfPreference"), true);
+  assert.equal(isReservedLhsVarName("null"), true);
+  assert.equal(isReservedLhsVarName("PWD"), true);
+  assert.equal(isReservedLhsVarName("myCustomVar"), false);
+  assert.equal(isReservedLhsVarName("x"), false);
+});
+
+// -- R2/A1: index containing "(" is reachable ---------------------------------
+
+t("PSASSIGN-R2-01: findPsAssignmentSplit locates = AFTER a nested [( )] index span, not before it", () => {
+  const scan = blankPsQuotesForScan("$a[(Set-Content x.ps1)] = 1");
+  const split = findPsAssignmentSplit(scan);
+  assert.notEqual(split, null);
+  assert.equal(scan.slice(split.opStart, split.opEnd), "=");
+});
+
+t("PSASSIGN-R2-02: = at paren depth > 0 is not a candidate (Test-Path -Path (Get-X -Y=1) style)", () => {
+  const scan = blankPsQuotesForScan("Get-Item (Get-Y -Z=1)");
+  const split = findPsAssignmentSplit(scan);
+  assert.equal(split, null);
+});
+
+t("PSASSIGN-R2-03: parsePsAssignmentLhsSingle rejects non-$-shaped candidates (returns null, not a finding)", () => {
+  assert.equal(parsePsAssignmentLhsSingle("Write-Output $x"), null);
+  assert.equal(parsePsAssignmentLhsSingle("git log --format"), null);
+  assert.equal(parsePsAssignmentLhsSingle("cmd /c set X"), null);
+  assert.equal(parsePsAssignmentLhsSingle("node a --x"), null);
+});
+
+// -- R3/O1: braced "other qualifier" LHS -------------------------------------
+
+t("PSASSIGN-R3-01: ${foo:bar} = 1 -> BLOCK (branch 4, assignment-lhs-provider — O1 fix)", () => {
+  const r = ps("${foo:bar} = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "assignment-lhs-provider");
+});
+
+t("PSASSIGN-R3-02: ${using:out} = 1 -> BLOCK (branch 4, assignment-lhs-provider — O1 fix, braced using)", () => {
+  const r = ps("${using:out} = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "assignment-lhs-provider");
+});
+
+t("PSASSIGN-R3-03: $using:out = 1 -> BLOCK (unbraced using, unchanged from v1)", () => {
+  const r = ps("$using:out = 1");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.reason, "assignment-lhs-provider");
+});
+
+t("PSASSIGN-R3-04: ${.\\out.ps1} = 'x' -> BLOCK (branch 3, braced relative provider path)", () => {
+  const r = ps("${.\\out.ps1} = 'x'");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 3);
+});
+
+t("PSASSIGN-R3-05: looksLikePsBracedPath unit coverage", () => {
+  assert.equal(looksLikePsBracedPath("C:\\out.ps1"), true);
+  assert.equal(looksLikePsBracedPath("C:/out.ps1"), true);
+  assert.equal(looksLikePsBracedPath("\\\\host\\share\\out.ps1"), true);
+  assert.equal(looksLikePsBracedPath(".\\out.ps1"), true);
+  assert.equal(looksLikePsBracedPath("env:X"), false);
+  assert.equal(looksLikePsBracedPath("foo:bar"), false);
+  assert.equal(looksLikePsBracedPath("using:out"), false);
+});
+
+// -- R4/O2: comma-list LHS nesting-aware split -------------------------------
+
+t("PSASSIGN-R4-01: splitTopLevelCommas is nesting-aware (comma inside [ ] is not a split point)", () => {
+  const raw = "$a[1,2], $b";
+  const scan = blankPsQuotesForScan(raw);
+  const segs = splitTopLevelCommas(raw, scan).map((s) => s.trim());
+  assert.deepEqual(segs, ["$a[1,2]", "$b"]);
+});
+
+t("PSASSIGN-R4-02: $a[1,2], $b = @(1,2), 3 -> nesting-aware split, no gated content -> allow", () => {
+  const r = ps("$a[1,2], $b = @(1,2), 3");
+  assert.equal(r.allow, true, JSON.stringify(r));
+});
+
+t("PSASSIGN-R4-03: $a, 1+1 = 2, 3 -> BLOCK (branch 4, assignment-lhs-unparseable-element — unparseable element is friction, not silently dropped)", () => {
+  const r = ps("$a, 1+1 = 2, 3");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-unparseable-element");
+});
+
+t("PSASSIGN-R4-04: parsePsAssignmentLhs comma-list worst-wins — one reserved element outweighs one plain element", () => {
+  const r = parsePsAssignmentLhs("$a, $PSDefaultParameterValues", "C:\\work", GATED);
+  assert.notEqual(r, null);
+  assert.equal(r.branch, 4);
+  assert.equal(r.reason, "assignment-lhs-reserved");
+});
+
+// -- R5/A2/A3: pure-expression RHS token grammar -----------------------------
+
+t("PSASSIGN-R5-01: isPsRhsPureExpression unit coverage — pure shapes", () => {
+  assert.equal(isPsRhsPureExpression("1"), true);
+  assert.equal(isPsRhsPureExpression("$true"), true);
+  assert.equal(isPsRhsPureExpression("$null"), true);
+  assert.equal(isPsRhsPureExpression("'a'"), true);
+  assert.equal(isPsRhsPureExpression('"out.ps1"'), true);
+  assert.equal(isPsRhsPureExpression("$y"), true);
+  assert.equal(isPsRhsPureExpression("$a.b.c"), true);
+  assert.equal(isPsRhsPureExpression("$a[0]"), true);
+  assert.equal(isPsRhsPureExpression("1,2"), true);
+  assert.equal(isPsRhsPureExpression("1 -eq 2"), true);
+  assert.equal(isPsRhsPureExpression("'a' -replace 'b','c'"), true);
+  assert.equal(isPsRhsPureExpression("1..5"), true);
+});
+
+t("PSASSIGN-R5-02: isPsRhsPureExpression unit coverage — impure shapes (A2 exploit path: -op then a bare `(`)", () => {
+  assert.equal(isPsRhsPureExpression("Get-Date"), false);
+  assert.equal(isPsRhsPureExpression("$w.Write('x')"), false);
+  assert.equal(isPsRhsPureExpression('"{0}" -f (Set-Content out.ps1 -Value \'y\')'), false);
+  assert.equal(isPsRhsPureExpression("(1)"), false);
+  assert.equal(isPsRhsPureExpression(""), false);
+});
+
+t("PSASSIGN-R5-03: $x = \"{0}\" -f (Set-Content out.ps1 -Value 'y') -> BLOCK (A2: -f operator alone doesn't waive the ( )", () => {
+  const r = ps("$x = \"{0}\" -f (Set-Content out.ps1 -Value 'y')");
+  assert.equal(r.allow, false, JSON.stringify(r));
+  assert.equal(r.branch, 3);
+  assert.equal(r.detector, "Set-Content");
+});
+
+t("PSASSIGN-R5-04: psRhsHasQuotedSubexpression unit coverage", () => {
+  assert.equal(psRhsHasQuotedSubexpression('"$(Set-Content out.ps1)"'), true);
+  assert.equal(psRhsHasQuotedSubexpression('@"\n$(Set-Content out.ps1)\n"@'), true);
+  assert.equal(psRhsHasQuotedSubexpression('"out.ps1"'), false);
+  assert.equal(psRhsHasQuotedSubexpression('@"\nout.ps1\n"@'), false);
+  assert.equal(psRhsHasQuotedSubexpression("'out.ps1'"), false); // single-quoted -- never interpolated, out of scope for this check
+  assert.equal(psRhsHasQuotedSubexpression("$x"), false);
+});
+
+// -- Unit: splitPsClauses `${...}` atomic-unit behavior ----------------------
+
+t("PSASSIGN-UNIT-01: splitPsClauses treats ${...} as one atomic clause span (no split at inner { or })", () => {
+  const scan = blankPsQuotesForScan("${env:X} = 1");
+  const clauses = splitPsClauses(scan);
+  // First clause must span the WHOLE "${env:X}" text, not fragment at the
+  // inner "{"/"}" -- this is what item 1a fixes generally (not just for
+  // assignment LHS text).
+  const first = scan.slice(clauses[0].start, clauses[0].end);
+  assert.ok(first.indexOf("${env:X}") !== -1, JSON.stringify({ first, clauses }));
+});
+
+t("PSASSIGN-UNIT-02: splitPsClauses still hard-splits @{...} (hashtable literal, unaffected)", () => {
+  const scan = blankPsQuotesForScan("@{Path='out.ps1'}");
+  const clauses = splitPsClauses(scan);
+  assert.ok(clauses.length > 1, JSON.stringify(clauses));
 });
 
 t("UNIT-19: splitPsClauses keeps a dotnet call's own parens together but splits a bare subexpression", () => {

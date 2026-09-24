@@ -2292,10 +2292,18 @@ function findPsVerbPositionMatch(text, re) {
 //         gated value -> branch 4 naming the cmdlet (friction default)
 //   (v)   otherwise -> branch 1
 // A "clause" is a maximal run of text between structural boundary
-// characters (; | & ( ) { } =) — finer-grained than statement-splitting
-// (which only handles top-level ;/|/&&/||), so a write cmdlet nested inside
-// a script block (`ForEach-Object { Set-Content ... }`) or after `=`
-// (`$x = Set-Content ...`) is still independently classified.
+// characters (; | & ( ) { } =, plus the `${...}` atomic exception in
+// splitPsClauses) — finer-grained than statement-splitting (which only
+// handles top-level ;/|/&&/||), so a write cmdlet nested inside a script
+// block (`ForEach-Object { Set-Content ... }`) is still independently
+// classified. Backlog #30 (docs/specs/ps-assignment-classification.md): a
+// statement recognized as a PowerShell ASSIGNMENT (`$x = Set-Content ...`,
+// `$env:PROJECT_ROOT = "..."`) is no longer run through this unconditional
+// `=`-is-a-boundary clause split at all — analyzePsStatement classifies its
+// LHS and RHS separately first (parsePsAssignmentLhs /
+// classifyPsAssignmentRhs), falling back to this SAME clause-splitting
+// logic (now factored out as classifyPsClauses) only for the RHS text, or
+// for the whole statement when it is not recognized as an assignment.
 
 const PS_KNOWN_READ_EXACT = new Set([
   "out-string", "out-host", "write-output", "write-host", "where-object",
@@ -2566,6 +2574,21 @@ function splitPsClauses(scanText) {
   let last = 0;
   for (let i = 0; i < scanText.length; i++) {
     const ch = scanText[i];
+    // R2/item-1a (backlog #30): `${...}` (braced variable/provider syntax:
+    // `${env:X}`, `${C:\out.ps1}`, `${using:x}`) is an ATOMIC unit — its own
+    // `{`/`}` must NOT be treated as clause boundaries, or `${env:X}`
+    // fragments into `$`, `env:X`, `` (three-plus clauses, each losing the
+    // context the others carry), which is exactly the reported escape/
+    // false-positive root cause. Only `$` immediately followed by `{`
+    // triggers this — `@{...}` (hashtable literal) is UNCHANGED (still hard-
+    // split), since that shape is handled by the existing-dispatch bare-`@`-
+    // remnant exemption in classifyPsClauses instead (see there).
+    if (ch === "$" && scanText[i + 1] === "{") {
+      let j = i + 2;
+      while (j < scanText.length && scanText[j] !== "}") j++;
+      i = j; // land on the matching "}" (or end of string if unterminated); loop's own i++ moves past it
+      continue;
+    }
     if (ch === ";" || ch === "|" || ch === "{" || ch === "}" || ch === "=") {
       clauses.push({ start: last, end: i });
       last = i + 1;
@@ -2619,6 +2642,434 @@ function splitPsClauses(scanText) {
   }
   clauses.push({ start: last, end: scanText.length });
   return clauses;
+}
+
+// ── PowerShell assignment total classification (backlog #30) ──────────────
+// Spec: docs/specs/ps-assignment-classification.md. Root cause: the OLD
+// unconditional `=`-is-a-hard-boundary rule in splitPsClauses (above,
+// unchanged for non-assignment text) turned `$env:PROJECT_ROOT = "..."`
+// into a verb-less "$env:PROJECT_ROOT" clause, independently flagged
+// ambiguous by isAmbiguousToken's `$` check — so ANY statement carrying a
+// PowerShell assignment before a legitimate, otherwise-allowed command
+// blocked the whole statement. Total classification per statement:
+//   (i)   find the first top-level (bracket/paren/brace-depth-0, `${...}`-
+//         atomic) assignment operator (`=`, `+=`, `-=`, `*=`, `/=`, `%=`,
+//         `??=`) — findPsAssignmentSplit.
+//   (ii)  the ENTIRE text from statement start to that operator must parse
+//         as a valid assignment LHS (parsePsAssignmentLhs) — anchored to
+//         the statement start, NOT to whatever clause boundary the old
+//         splitter happened to produce (owner ruling R2; this is what makes
+//         `$a[(Set-Content x.ps1)]`'s "index containing (" branch reachable
+//         at all — see parsePsAssignmentLhsSingle). If it does not parse as
+//         an LHS, the `=` was never an assignment operator in the first
+//         place (`Write-Output $x=1`, `node a --x=$y`, `cmd /c set X=1`) —
+//         the WHOLE statement falls through to the untouched, unconditional
+//         splitPsClauses/classifyPsClauses path below, unchanged from today.
+//   (iii) LHS classified by parsePsAssignmentLhs (branches: reserved/
+//         automatic-or-preference variable (R1), provider-qualifier
+//         (unbraced `$X:name` / braced `${X:name}` outside the allowed
+//         scope set, R3), index containing `(` (R2/A1), comma-list — every
+//         element must itself parse, worst wins, an unparseable element is
+//         friction (branch 4), never silently dropped (R4) — else plain
+//         in-memory assignment, no finding.
+//   (iv)  RHS classified by classifyPsAssignmentRhs: empty -> friction;
+//         quoted string/here-string containing an interpolated `$(...)` ->
+//         friction (rhs-subexpression); else a closed pure-expression token
+//         grammar (R5) -> no finding; else EXISTING dispatch (the
+//         unmodified splitPsClauses/classifyPsClauses machinery, run on
+//         just the RHS text) — with one narrow, additive exemption: a bare
+//         `$`/`@` remnant clause (the artifact of the OLD splitter breaking
+//         `$(`, `@(`, `@{` apart) as the FIRST clause is not itself flagged
+//         merely for being `$`/`@` — everything nested inside it still is.
+// The whole-statement redirect scan (bottom of analyzePsStatement) is
+// UNTOUCHED — it runs unconditionally on the full statement text regardless
+// of assignment status, exactly as before (spec item 5).
+
+// The 8 PowerShell variable scopes safe to write to in-memory (about_Scopes
+// + the `function:`/`alias:` drives) — anything else prefixing a `:` is a
+// PROVIDER qualifier (branch 4), not a plain-variable scope.
+const PS_ALLOWED_LHS_SCOPES = new Set([
+  "global", "local", "script", "private", "variable", "env", "function", "alias",
+]);
+
+// R1: documented PowerShell automatic variables (about_Automatic_Variables)
+// and preference variables (about_Preference_Variables) whose NAME does not
+// already match the "starts with PS" / "ends with Preference" dynamic
+// rules below — enumerated explicitly per the owner ruling. Assigning to
+// ANY of these (unbraced or braced, any scope prefix) is friction (branch
+// 4, `assignment-lhs-reserved`) EXCEPT under the `env:` scope, which the
+// ruling exempts (`$env:PSModulePath = ...` stays a no-finding in-memory
+// assignment even though "PSModulePath" itself starts with "PS").
+const PS_RESERVED_LHS_VARS = new Set([
+  // Automatic variables not already covered by /^ps/i or /preference$/i.
+  "_", "args", "consolefilename", "error", "event", "eventargs",
+  "eventsubscriber", "executioncontext", "foreach", "home", "host", "input",
+  "lastexitcode", "matches", "myinvocation", "nestedpromptlevel", "pid",
+  "profile", "pwd", "sender", "shellid", "stacktrace", "switch", "this",
+  "true", "false", "null",
+  // Preference variables not already covered by /^ps/i or /preference$/i.
+  "errorview", "formatenumerationlimit", "logcommandhealthevent",
+  "logcommandlifecycleevent", "logenginehealthevent",
+  "logenginelifecycleevent", "logproviderlifecycleevent",
+  "logproviderhealthevent", "maximumaliascount", "maximumdrivecount",
+  "maximumerrorcount", "maximumfunctioncount", "maximumhistorycount",
+  "maximumvariablecount", "ofs", "outputencoding", "transcript",
+]);
+
+function isReservedLhsVarName(name) {
+  const lower = String(name).toLowerCase();
+  if (/^ps/.test(lower)) return true;
+  if (/preference$/.test(lower)) return true;
+  return PS_RESERVED_LHS_VARS.has(lower);
+}
+
+/**
+ * findPsAssignmentSplit(scanText) -> {opStart, opEnd} | null
+ * Depth-aware (over `(`, `[`, `{`, with `${...}` treated as one atomic
+ * unit, same as splitPsClauses) forward scan from position 0 (the
+ * STATEMENT's own start — analyzePsStatement always calls this on a single
+ * already-isolated statement) for the FIRST `=` at depth 0. `==`/`<=`/`>=`/
+ * `!=` are not PowerShell assignment/operator shapes at all here (PS uses
+ * `-eq`/`-le`/`-ge`/`-ne`) and are excluded so a stray one in unusual text
+ * is never mistaken for an assignment marker. A compound-assignment prefix
+ * (`+`, `-`, `*`, `/`, `%`, or `??`) immediately before the `=` moves
+ * `opStart` back to the start of that prefix, so the LHS candidate text
+ * excludes it. Only the FIRST depth-0 `=` is ever considered — per owner
+ * ruling R2, if the text before it fails to parse as an LHS, the WHOLE
+ * statement is conclusively "not an assignment" (no fallback scan for a
+ * LATER `=`).
+ */
+function findPsAssignmentSplit(scanText) {
+  let depth = 0;
+  for (let i = 0; i < scanText.length; i++) {
+    const ch = scanText[i];
+    if (ch === "$" && scanText[i + 1] === "{") {
+      let j = i + 2;
+      while (j < scanText.length && scanText[j] !== "}") j++;
+      i = j;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") { depth++; continue; }
+    if (ch === ")" || ch === "]" || ch === "}") { if (depth > 0) depth--; continue; }
+    if (depth !== 0) continue;
+    if (ch !== "=") continue;
+    if (scanText[i + 1] === "=") { i++; continue; } // "==" — not a PS operator shape, skip both chars
+    const prev = i > 0 ? scanText[i - 1] : "";
+    if (prev === "<" || prev === ">" || prev === "!") continue; // comparison-like, not assignment
+    let opStart = i;
+    if (prev === "?" && i > 1 && scanText[i - 2] === "?") {
+      opStart = i - 2; // "??="
+    } else if (prev === "+" || prev === "-" || prev === "*" || prev === "/" || prev === "%") {
+      opStart = i - 1; // "+=" / "-=" / "*=" / "/=" / "%="
+    }
+    return { opStart, opEnd: i + 1 };
+  }
+  return null;
+}
+
+/**
+ * splitTopLevelCommas(raw, scan) -> string[]
+ * R4: nesting-aware split on depth-0 commas ONLY (respecting `(`/`[`/`{`
+ * depth and `${...}` atomicity, mirroring findPsAssignmentSplit) — so
+ * `$a[1,2], $b` splits into `$a[1,2]` and `$b`, never at the comma nested
+ * inside the index. `raw` and `scan` (its quote-blanked twin) must be the
+ * same length; segments are sliced from `raw` so quoted content inside an
+ * element (e.g. an index string literal) survives intact.
+ */
+function splitTopLevelCommas(raw, scan) {
+  const segments = [];
+  let depth = 0, last = 0;
+  for (let i = 0; i < scan.length; i++) {
+    const ch = scan[i];
+    if (ch === "$" && scan[i + 1] === "{") {
+      let j = i + 2;
+      while (j < scan.length && scan[j] !== "}") j++;
+      i = j;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") { depth++; continue; }
+    if (ch === ")" || ch === "]" || ch === "}") { if (depth > 0) depth--; continue; }
+    if (ch === "," && depth === 0) {
+      segments.push(raw.slice(last, i));
+      last = i + 1;
+    }
+  }
+  segments.push(raw.slice(last));
+  return segments;
+}
+
+/**
+ * looksLikePsBracedPath(inner) -> boolean
+ * R3(b): the content of a `${...}` LHS looks like a provider PATH (writes
+ * the file) rather than a scope:name variable reference — a drive letter
+ * (`X:\`/`X:/`), a UNC prefix, any path separator, or a leading `.`
+ * (relative-path shorthand, `${.\out.ps1}`).
+ */
+function looksLikePsBracedPath(inner) {
+  if (/^[A-Za-z]:[\\/]/.test(inner)) return true;
+  if (/^\\\\/.test(inner)) return true;
+  if (inner.indexOf("\\") !== -1 || inner.indexOf("/") !== -1) return true;
+  if (inner.charAt(0) === ".") return true;
+  return false;
+}
+
+/**
+ * applySuffixChain(suffixRaw, wholeRaw) -> {branch, reason, target}
+ * Parses a chain of member (`.ident`) and index (`[...]`) accessors
+ * trailing a `$var` or `${scope:name}` LHS core (e.g. `.b.c`, `[0][1]`,
+ * `['Out-File:FilePath']`). Quote-blanks `suffixRaw` first so a literal `(`
+ * INSIDE a quoted index key (`$a['(']`) cannot be mistaken for R2's "index
+ * containing `(`" shape. Any index span whose (blanked) content contains a
+ * `(` -> branch 4 `assignment-lhs-index-paren` (this is what makes that
+ * spec-table row reachable at all post owner-ruling R2 — see A1). Any
+ * leftover text that is neither `.ident` nor a balanced `[...]` -> branch 4
+ * `assignment-lhs-malformed-suffix` (total classification default: unknown
+ * -> friction, never silently allowed).
+ */
+function applySuffixChain(suffixRaw, wholeRaw) {
+  if (suffixRaw === "") return { branch: 1, reason: null, target: wholeRaw };
+  const suffixScan = blankPsQuotesForScan(suffixRaw);
+  let i = 0;
+  let sawIndexParen = false;
+  while (i < suffixScan.length) {
+    const ch = suffixScan[i];
+    if (ch === ".") {
+      const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(suffixScan.slice(i + 1));
+      if (!m) return { branch: 4, reason: "assignment-lhs-malformed-suffix", target: wholeRaw };
+      i += 1 + m[0].length;
+      continue;
+    }
+    if (ch === "[") {
+      let depth = 1, j = i + 1;
+      while (j < suffixScan.length && depth > 0) {
+        if (suffixScan[j] === "[") depth++;
+        else if (suffixScan[j] === "]") depth--;
+        j++;
+      }
+      if (depth !== 0) return { branch: 4, reason: "assignment-lhs-malformed-suffix", target: wholeRaw };
+      const indexContent = suffixScan.slice(i + 1, j - 1);
+      if (indexContent.indexOf("(") !== -1) sawIndexParen = true;
+      i = j;
+      continue;
+    }
+    return { branch: 4, reason: "assignment-lhs-malformed-suffix", target: wholeRaw };
+  }
+  if (sawIndexParen) return { branch: 4, reason: "assignment-lhs-index-paren", target: wholeRaw };
+  return { branch: 1, reason: null, target: wholeRaw };
+}
+
+/**
+ * classifyPsBracedLhs — R3: the content of a `${...}` LHS.
+ *   (a) `scope:name` with `scope` in PS_ALLOWED_LHS_SCOPES -> treat exactly
+ *       like the unbraced scoped-variable case (R1 reserved-check on
+ *       `name`, `env` exempt), then apply any trailing member/index chain.
+ *   (b) else, path-like (looksLikePsBracedPath) -> resolveTarget(inner) —
+ *       this LHS shape WRITES that file.
+ *   (c) else (e.g. `${using:x}`, `${foo:bar}`) -> branch 4
+ *       `assignment-lhs-provider` (O1 — symmetric with the unbraced rule;
+ *       a loose regex here would silently readmit exactly the escape O1
+ *       found, so scope membership is checked by exact Set membership).
+ */
+function classifyPsBracedLhs(inner, afterBrace, initialCwd, gatedExts, wholeRaw) {
+  const scopeMatch = inner.match(/^([A-Za-z_][A-Za-z0-9_]*):([\s\S]*)$/);
+  if (scopeMatch && PS_ALLOWED_LHS_SCOPES.has(scopeMatch[1].toLowerCase())) {
+    const scope = scopeMatch[1].toLowerCase();
+    const baseName = scopeMatch[2];
+    if (scope !== "env" && isReservedLhsVarName(baseName)) {
+      return { branch: 4, reason: "assignment-lhs-reserved", target: wholeRaw };
+    }
+    return applySuffixChain(afterBrace, wholeRaw);
+  }
+  if (looksLikePsBracedPath(inner)) {
+    const resolved = resolveTarget(inner, initialCwd, gatedExts);
+    return { branch: resolved.branch, reason: resolved.reason, target: resolved.target, ext: resolved.ext };
+  }
+  return { branch: 4, reason: "assignment-lhs-provider", target: wholeRaw };
+}
+
+/**
+ * parsePsAssignmentLhsSingle(rawIn, initialCwd, gatedExts) -> result | null
+ * ONE (non-comma-list) LHS candidate. Returns null ONLY when the text does
+ * not even look variable-shaped at all (doesn't start with `$`, after
+ * stripping any `[Type]`/`[Type[]]` cast prefix) — this is the signal that
+ * propagates up to "not an assignment; existing split" for the WHOLE
+ * statement (owner ruling R2). Once the text is confirmed `$`-shaped, every
+ * other failure to fully parse is friction (branch 4), never null — a
+ * partially-recognized `$...` shape falling back to "not an assignment"
+ * would silently readmit it through the OLD unconditional `=`-split
+ * instead of blocking it, which is the wrong direction for a friction
+ * default.
+ */
+function parsePsAssignmentLhsSingle(rawIn, initialCwd, gatedExts) {
+  let raw = String(rawIn).trim();
+  if (raw === "") return null;
+  const castRe = /^\[[A-Za-z_][A-Za-z0-9_.]*(\[\])?\]\s*/;
+  let m;
+  while ((m = castRe.exec(raw)) !== null) raw = raw.slice(m[0].length);
+  if (raw === "" || raw.charAt(0) !== "$") return null;
+
+  const rest = raw.slice(1);
+  if (rest.charAt(0) === "{") {
+    const closeIdx = rest.indexOf("}");
+    if (closeIdx === -1) return { branch: 4, reason: "assignment-lhs-malformed", target: raw };
+    const inner = rest.slice(1, closeIdx);
+    const afterBrace = rest.slice(closeIdx + 1);
+    return classifyPsBracedLhs(inner, afterBrace, initialCwd, gatedExts, raw);
+  }
+
+  const identRe = /^([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*))?/;
+  const im = identRe.exec(rest);
+  if (!im) return { branch: 4, reason: "assignment-lhs-malformed", target: raw };
+  const first = im[1];
+  const second = im[2];
+  let scope = null, baseName;
+  if (second !== undefined) {
+    if (!PS_ALLOWED_LHS_SCOPES.has(first.toLowerCase())) {
+      return { branch: 4, reason: "assignment-lhs-provider", target: raw };
+    }
+    scope = first.toLowerCase();
+    baseName = second;
+  } else {
+    baseName = first;
+  }
+  if (scope !== "env" && isReservedLhsVarName(baseName)) {
+    return { branch: 4, reason: "assignment-lhs-reserved", target: raw };
+  }
+  const afterVar = rest.slice(im[0].length);
+  return applySuffixChain(afterVar, raw);
+}
+
+/**
+ * parsePsAssignmentLhs(rawTextIn, initialCwd, gatedExts) -> result | null
+ * Entry point: R4 comma-list handling wraps parsePsAssignmentLhsSingle.
+ * `,` split is depth-aware (splitTopLevelCommas) so `$a[1,2], $b` splits
+ * correctly. Once 2+ top-level segments exist, this text IS treated as an
+ * assignment (never returns null from here on) — an element that fails to
+ * parse is friction (branch 4 `assignment-lhs-unparseable-element`), worst
+ * element wins, per owner ruling R4 (an unparseable element must not be
+ * silently dropped from the list).
+ */
+function parsePsAssignmentLhs(rawTextIn, initialCwd, gatedExts) {
+  const raw = String(rawTextIn).trim();
+  if (raw === "") return null;
+  const scan = blankPsQuotesForScan(raw);
+  const segments = splitTopLevelCommas(raw, scan);
+  if (segments.length > 1) {
+    let worst = null;
+    for (const seg of segments) {
+      const trimmedSeg = seg.trim();
+      let r = parsePsAssignmentLhsSingle(trimmedSeg, initialCwd, gatedExts);
+      if (r === null) {
+        r = { branch: 4, reason: "assignment-lhs-unparseable-element", target: trimmedSeg || null };
+      }
+      if (!worst || r.branch > worst.branch) worst = r;
+    }
+    return worst;
+  }
+  return parsePsAssignmentLhsSingle(raw, initialCwd, gatedExts);
+}
+
+/**
+ * psRhsHasQuotedSubexpression(trimmedRaw) -> boolean
+ * The RHS spec-table row `"…$(…)…"` / `@"…$(…)…"@` -> branch 4
+ * `rhs-subexpression`: a double-quoted string or double-quoted here-string
+ * whose (raw, unblanked) content contains a literal `$(` — this must be
+ * checked on RAW text (blankPsQuotesForScan would blank the very content
+ * being tested) and BEFORE the pure-expression check, so an interpolated
+ * write hiding inside a quoted RHS is never waved through as "just a
+ * literal string". Respects backtick-escapes inside a plain `"..."` the
+ * same way blankPsQuotesForScan does. A single-quoted here-string
+ * (`@'...'@`) is never interpolated in real PowerShell and is out of scope
+ * here (handled as unconditionally pure by the token grammar instead).
+ */
+function psRhsHasQuotedSubexpression(trimmedRaw) {
+  let body;
+  if (trimmedRaw.slice(0, 2) === '@"') {
+    const closeIdx = trimmedRaw.indexOf('"@', 2);
+    body = closeIdx === -1 ? trimmedRaw.slice(2) : trimmedRaw.slice(2, closeIdx);
+  } else if (trimmedRaw.charAt(0) === '"') {
+    let i = 1, closeIdx = -1;
+    while (i < trimmedRaw.length) {
+      const ch = trimmedRaw[i];
+      if (ch === "`" && i + 1 < trimmedRaw.length) { i += 2; continue; }
+      if (ch === '"') { closeIdx = i; break; }
+      i++;
+    }
+    body = closeIdx === -1 ? trimmedRaw.slice(1) : trimmedRaw.slice(1, closeIdx);
+  } else {
+    return false;
+  }
+  return body.indexOf("$(") !== -1;
+}
+
+// R5: the "pure expression" RHS token grammar — a CLOSED set (no operator
+// allow-list, per the owner ruling: "any `-word` operator" is unconditionally
+// in-grammar, so `-f`/`-replace`/`-join`/`-split`/`-as`/`-is`/... all count
+// without enumeration, resolving adversary finding A2). A bare `(` is not a
+// token type at all here, so ANY use of `(` — a cmdlet call, a subexpression,
+// a method call — disqualifies "pure" outright and the RHS falls through to
+// existing dispatch instead (this is also what makes A2's own worked example,
+// `"{0}" -f (Set-Content out.ps1 -Value 'y')`, fall through and still block:
+// the operator itself is fine, the `(` right after it is not). Bare `.` is
+// deliberately NOT a standalone punctuation token (only `..`, the range
+// operator) — member access is already covered by the variable/accessor
+// token type.
+const PS_RHS_PURE_TOKEN_RE = new RegExp(
+  "^(?:" + [
+    "\\$true", "\\$false", "\\$null",
+    "\\d+(?:\\.\\d+)?",
+    "'(?:[^']|'')*'",
+    "@\"[\\s\\S]*?\"@",
+    "@'[\\s\\S]*?'@",
+    "\"(?:[^\"`]|`.)*\"",
+    "\\$[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?(?:\\.[A-Za-z_][A-Za-z0-9_]*|\\[[^\\[\\]()]*\\])*",
+    "-[A-Za-z]+",
+    "\\.\\.",
+    "[+*/%,![\\]-]",
+  ].join("|") + ")",
+  "i"
+);
+
+/**
+ * isPsRhsPureExpression(trimmedRhs) -> boolean
+ * R5: the ENTIRE trimmed RHS text must tokenize exhaustively (whitespace-
+ * separated) into PS_RHS_PURE_TOKEN_RE tokens with nothing left over. Also
+ * defends (redundantly with psRhsHasQuotedSubexpression, which already runs
+ * first) against any matched token literally containing `$(`.
+ */
+function isPsRhsPureExpression(trimmedRhs) {
+  if (trimmedRhs === "") return false;
+  let pos = 0;
+  const text = trimmedRhs;
+  while (pos < text.length) {
+    while (pos < text.length && /\s/.test(text[pos])) pos++;
+    if (pos >= text.length) break;
+    const m = PS_RHS_PURE_TOKEN_RE.exec(text.slice(pos));
+    if (!m || m.index !== 0) return false;
+    if (m[0].indexOf("$(") !== -1) return false;
+    pos += m[0].length;
+  }
+  return true;
+}
+
+/**
+ * classifyPsAssignmentRhs(rawRhsText, initialCwd, gatedExts) -> finding | null
+ * Priority order per spec RHS table: empty -> friction; quoted
+ * subexpression -> friction; pure expression -> no finding (null); else
+ * EXISTING dispatch (classifyPsClauses, unmodified clause logic, run on
+ * just the RHS text) with the narrow bare-`$`/`@`-remnant exemption on the
+ * FIRST clause only (the v1 policy delta: `$h = @{a=1}`, `$r = @(1,2)` are
+ * now allowed — the remnant itself carries no gated text, but anything
+ * NESTED inside it is still independently classified as today).
+ */
+function classifyPsAssignmentRhs(rawRhsText, initialCwd, gatedExts) {
+  const trimmed = rawRhsText.trim();
+  if (trimmed === "") return { branch: 4, reason: "assignment-rhs-empty", target: null };
+  if (psRhsHasQuotedSubexpression(trimmed)) {
+    return { branch: 4, reason: "rhs-subexpression", target: null };
+  }
+  if (isPsRhsPureExpression(trimmed)) return null;
+  return classifyPsClauses(rawRhsText, initialCwd, gatedExts, { exemptFirstBareRemnant: true });
 }
 
 /**
@@ -2681,15 +3132,35 @@ function psWhatIfSuppresses(scanText) {
   return false;
 }
 
-function analyzePsStatement(stmt, initialCwd, gatedExts) {
-  const scanText = blankPsQuotesForScan(stmt);
-
+/**
+ * classifyPsClauses(rawText, initialCwd, gatedExts, opts) -> finding | null
+ * The EXISTING (unmodified) per-clause dispatch loop — extracted verbatim
+ * from analyzePsStatement so it can be reused, unchanged, in TWO places:
+ * (1) the whole statement, when no assignment was detected (100% behavior-
+ * preserving — this is the exact same code that used to run inline here);
+ * (2) just the RHS substring of a detected assignment (classifyPsAssignmentRhs's
+ * "existing dispatch" per spec item 3). `opts.exemptFirstBareRemnant`
+ * (case 2 only) is the ONE additive behavior: a bare `$`/`@` FIRST clause
+ * (the leftover artifact of splitPsClauses's unconditional split on `$(`/
+ * `@(`/`@{`) is not itself flagged merely for being `$`/`@` — every clause
+ * nested inside it is still independently classified exactly as today.
+ */
+function classifyPsClauses(rawText, initialCwd, gatedExts, opts) {
+  opts = opts || {};
+  const scanText = blankPsQuotesForScan(rawText);
   let worst = null;
   function consider(f) { if (f && (!worst || f.branch > worst.branch)) worst = f; }
 
-  for (const clause of splitPsClauses(scanText)) {
+  const clauses = splitPsClauses(scanText);
+  for (let ci = 0; ci < clauses.length; ci++) {
+    const clause = clauses[ci];
     const clauseScanText = scanText.slice(clause.start, clause.end);
-    const clauseRawText = stmt.slice(clause.start, clause.end);
+    const clauseRawText = rawText.slice(clause.start, clause.end);
+
+    if (opts.exemptFirstBareRemnant && ci === 0 &&
+        (clauseRawText.trim() === "$" || clauseRawText.trim() === "@")) {
+      continue;
+    }
 
     // D5/E2 (fixed — per-clause, not whole-statement): -WhatIf suppresses
     // only the clause that carries its OWN bare -WhatIf/-WhatIf:$true — a
@@ -2720,7 +3191,7 @@ function analyzePsStatement(stmt, initialCwd, gatedExts) {
     const dm = detectDotNetIoMutation(clauseScanText);
     if (dm) {
       if (dm.style === "dotnet-read") continue; // recognized (StreamReader / read-access FileStream) but not a mutation
-      const rawFromDm = stmt.slice(clause.start + dm.idx, clause.end);
+      const rawFromDm = rawText.slice(clause.start + dm.idx, clause.end);
       const target = extractNthStringLiteral(rawFromDm, dm.argIndex || 0);
       if (!target) {
         consider({ branch: 4, detector: dm.verb, reason: "unresolvable-target", target: null });
@@ -2760,7 +3231,7 @@ function analyzePsStatement(stmt, initialCwd, gatedExts) {
     // consumer (known-write target extraction, web-request -OutFile,
     // catch-all) sees the same shape it already handles. Self-found escape,
     // fixed here rather than duplicated in three regexes.
-    const rawFromVerb = normalizePsColonParams(stmt.slice(absVerbStart, clause.end));
+    const rawFromVerb = normalizePsColonParams(rawText.slice(absVerbStart, clause.end));
 
     // Sole `gh` exception (see comment above KNOWN_READ_VERBS in the Bash
     // section): `gh api <endpoint>` is read here too — same predicate,
@@ -2804,7 +3275,53 @@ function analyzePsStatement(stmt, initialCwd, gatedExts) {
     consider(classifyPsClauseArguments(verbName, rawFromVerb, gatedExts));
   }
 
-  // Plain redirect (>,>>), whole-statement scope — not tied to a specific clause.
+  return worst;
+}
+
+/**
+ * analyzePsStatement(stmt, initialCwd, gatedExts) -> finding | null
+ * ONE statement (already isolated by splitPsStatements at `;`/`|`/`&&`/
+ * `||`/newline). Owner ruling R2: assignment detection is anchored to the
+ * statement's OWN start and is bracket/paren-depth aware (findPsAssignmentSplit),
+ * NOT embedded in splitPsClauses's single left-to-right clause scan — the
+ * latter approach (spec v1) could never actually reach the LHS table's
+ * "index containing `(`" branch, because splitPsClauses's own `(` handling
+ * had already fragmented the clause before the `=` was ever reached (see
+ * adversary finding A1). If the text before the first depth-0 `=` does not
+ * parse as a full LHS, this is conclusively NOT an assignment and the
+ * statement falls through to the untouched classifyPsClauses path — 100%
+ * unchanged from today for every non-assignment statement.
+ */
+function analyzePsStatement(stmt, initialCwd, gatedExts) {
+  const scanText = blankPsQuotesForScan(stmt);
+
+  let worst = null;
+  function consider(f) { if (f && (!worst || f.branch > worst.branch)) worst = f; }
+
+  let handledAsAssignment = false;
+  const asg = findPsAssignmentSplit(scanText);
+  if (asg) {
+    const lhsCandidateRaw = stmt.slice(0, asg.opStart).trim();
+    const lhsResult = parsePsAssignmentLhs(lhsCandidateRaw, initialCwd, gatedExts);
+    if (lhsResult !== null) {
+      handledAsAssignment = true;
+      consider(lhsResult);
+      const rhsRawText = stmt.slice(asg.opEnd);
+      consider(classifyPsAssignmentRhs(rhsRawText, initialCwd, gatedExts));
+    }
+  }
+
+  if (!handledAsAssignment) {
+    consider(classifyPsClauses(stmt, initialCwd, gatedExts, {}));
+  }
+
+  // Plain redirect (>,>>), whole-statement scope — not tied to a specific
+  // clause, and UNTOUCHED by the assignment split above (spec item 5): runs
+  // unconditionally on the full statement text regardless of assignment
+  // status, exactly as before — this is what still catches
+  // `$x = Get-Content a > out.ps1` (the redirect lives after the RHS
+  // command, outside anything the RHS's own "pure"/dispatch classification
+  // would see, since neither of those re-scans for shell-style redirects).
   const redirRe = /(?<![2&])(1?>>?)\s*([^\s|;&<>]*)/g;
   let rm;
   while ((rm = redirRe.exec(scanText)) !== null) {
@@ -2996,6 +3513,21 @@ module.exports = {
   analyzePsStatement,
   loadConfig,
   DEFAULT_GATED_EXTENSIONS,
+  // backlog #30 — PS assignment total classification
+  classifyPsClauses,
+  findPsAssignmentSplit,
+  splitTopLevelCommas,
+  looksLikePsBracedPath,
+  applySuffixChain,
+  classifyPsBracedLhs,
+  parsePsAssignmentLhsSingle,
+  parsePsAssignmentLhs,
+  psRhsHasQuotedSubexpression,
+  isPsRhsPureExpression,
+  classifyPsAssignmentRhs,
+  isReservedLhsVarName,
+  PS_ALLOWED_LHS_SCOPES,
+  PS_RESERVED_LHS_VARS,
 };
 
 // ── Standalone hook mode ────────────────────────────────────────────────────
