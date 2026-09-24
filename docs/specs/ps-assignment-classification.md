@@ -4,7 +4,11 @@ Source: planning-tier plan v1, 2026-09-24, amended with owner-orchestrator rulin
 on the spec-adversary's findings (`adversary-ps-assign-judge-2026-09-24.md`,
 harness `adversary-ps-harness-judge-2026-09-24.js`, same directory). v2
 changes are called out inline as **R1**-**R5**; everything else is v1,
-unchanged.
+unchanged. **R3a** (this revision, same day) further amends R3's braced-LHS
+`${...}` classification per a second spec-adversary pass
+(`adversary-r3a-judge-2026-09-24.md`, harnesses `r3a-probe-judge-2026-09-24.ps1`
+/ `r3a-tokenize-judge-2026-09-24.ps1` / `r3a-tokenize2-judge-2026-09-24.ps1`,
+same directory) — see the R3a section below.
 
 **Root cause:** `splitPsClauses` (`hooks/shell-write-guard.js`) split on
 every bare `=`, so `$env:PROJECT_ROOT = "..."` became a verb-less clause ->
@@ -98,8 +102,10 @@ bracket/paren-depth-aware forward scan (`findPsAssignmentSplit`), run before
 | index containing `(` (bracket/paren-depth aware — see R2) | branch 4 `assignment-lhs-index-paren` |
 | `[T]`/`[T[]]` prefixes, then valid form | no finding |
 | `$a, $b` list | **R4**: each element classified independently, worst wins |
-| `${X:\path}` (provider path; writes the file) | `resolveTarget(path)` |
-| `${...}` braced, any other unrecognized qualifier | **R3**: branch 4 `assignment-lhs-provider` |
+| `${...}` braced, content has NO ASCII `:` | **R3a-1**: plain-`$name` semantics (R1 reserved-check, then suffix chain) — no path carve-out |
+| `${X:\path}` (provider path, content HAS a colon; writes the file) | **R3a-2**/R3: `resolveTarget(path)` |
+| `${...}` braced, content HAS a colon, any other unrecognized qualifier | **R3a-2**/R3: branch 4 `assignment-lhs-provider` |
+| `${...}` braced, content contains a backtick (any position) | **R3a-3**: branch 4 `assignment-lhs-escape` |
 | `$X:name` (unbraced) with any other qualifier (incl. `using`) | branch 4 `assignment-lhs-provider` |
 | anything else (doesn't even start with `$`/`[`) | not an assignment; existing split |
 
@@ -190,9 +196,133 @@ unbraced case, by exact Set membership (never a loose prefix regex):
    `assignment-lhs-provider`.
 
 Tests: `${foo:bar} = 1` -> branch 4; `${using:out} = 1` -> branch 4;
-`${.\out.ps1} = 'x'` -> resolves and blocks (gated extension, branch 3);
+`${.\out.ps1} = 'x'` -> **SUPERSEDED by R3a below** (colon-less content is
+now unconditionally plain-variable semantics, not a path — see R3a-1);
 `${C:\t\out.ps1} = 'x'` -> resolves and blocks (branch 3, v1's own "must
-still block" case); `${env:X} = 1` -> no finding.
+still block" case, unaffected by R3a since it contains a colon);
+`${env:X} = 1` -> no finding.
+
+### R3a (owner ruling) — braced LHS colon-gated classification + shared
+### backtick-aware brace scan (spec-adversary pass, `adversary-r3a-judge-
+### 2026-09-24.md`, harnesses `r3a-probe-judge-2026-09-24.ps1` /
+### `r3a-tokenize-judge-2026-09-24.ps1` / `r3a-tokenize2-judge-2026-09-24.ps1`)
+
+**Finding F1 (adversary, MEDIUM, over-block/spec-correctness, not a
+bypass):** R3's `looksLikePsBracedPath` carve-out (`\`/`/`/leading-`.`/
+leading-`~`/UNC) tests a condition PowerShell's `${...}` grammar never
+satisfies without a colon-qualified drive — confirmed via AST
+(`VariablePath.IsDriveQualified` is unconditionally `false` for colon-less
+content across backslash, forward-slash, UNC, leading-`.`, and leading-`~`
+variants) and via live execution (`${\foo\bar.ps1} = 'x'` creates an
+in-memory variable literally named `\foo\bar.ps1`; zero files touched).
+Blocking is the safe direction, so this was not an escape, but it defeats
+R3's own stated purpose (backlog #30 exists to REMOVE false-positive
+over-blocking) and produces exactly that: `${.\out.ps1} = 5`, `${~} = 'x'`,
+and similar harmless colon-less assignments blocked for no real-world
+reason.
+
+**Finding F2 (adversary, investigated, NOT exploitable, hardened anyway):**
+a backtick-escaped `}` inside braced content (`` ${a`}b} ``, or inside a
+drive path `` ${C:\folder`}name\out.ps1} ``) made every braced-variable
+scan's naive `indexOf("}")` stop at the escaped `}`, truncating the content
+before PowerShell's real (unescaped) end — confirmed via AST that the real
+`UserPath` for the drive-path case is the full, gated
+`C:\folder}name\out.ps1`, which the old JS scan never saw. No live bypass
+was found: the truncated JS content always retains the literal,
+un-interpreted backtick, and `isAmbiguousToken`'s unconditional
+backtick-match rule caught every case anyway — but that protection was
+accidental (an unrelated ambiguity rule), not designed, and every reserved
+name in `PS_RESERVED_LHS_VARS` is `}`-free so none can ever need
+backtick-escaping in the first place (no reserved-name evasion path
+exists). Hardened per the ruling below rather than relying on the
+accident.
+
+**Findings F3/F4 (adversary, confirmed no-op, informational):** Unicode
+lookalikes for `:` (U+FF1A) and `/` (U+2215) are not special to PowerShell
+and are not normalized by the current ASCII-only character tests (no bug);
+a backtick before a real colon (`` ${a`:b} ``) does not suppress the colon
+as a scope separator in real PowerShell, and the existing raw-text ASCII
+colon scan already sees it and routes correctly (no bug) — both confirmed
+via AST/live execution, no change required for either.
+
+**Ruling:**
+
+- **R3a-1 (supersedes R3's colon-less path carve-out):** braced LHS
+  `${...}` content with **NO ASCII `:`** is unconditionally plain-`$name`
+  semantics — R1 reserved-name check on the whole content as the base name
+  (no scope prefix exists in this shape), then the existing member/index
+  suffix-chain rules (R2 index-`(` check still applies). The
+  `\`/`/`/leading-`.`/leading-`~`/UNC "path-like" carve-out is REMOVED
+  entirely for colon-less content — PowerShell only provider-qualifies
+  braced content with an ASCII colon (`VariablePath.IsDriveQualified`).
+  Examples: `${name} = 1`, `${my var} = 1`, `${.\out.ps1} = 5` -> no
+  finding; `${PSDefaultParameterValues} = @{}` / `${null} = 1` -> R1
+  branch 4 `assignment-lhs-reserved`.
+- **R3a-2 (unchanged):** braced content **WITH** an ASCII `:` keeps
+  existing R3 exactly as written above (scope-membership test, else
+  path-like resolution, else `assignment-lhs-provider`) — untouched by
+  this amendment.
+- **R3a-3 (new, explicit):** braced content containing a backtick
+  (anywhere, regardless of colon presence) -> branch 4
+  `assignment-lhs-escape` — explicit and unconditional, replacing today's
+  accidental `isAmbiguousToken`-backstop protection (F2) with a designed
+  one. Checked FIRST, before the colon-presence branch above.
+- **R3a-4 (new, shared helper):** every braced-variable scan site
+  (`parsePsAssignmentLhsSingle`'s LHS brace parse, `findPsAssignmentSplit`,
+  `splitTopLevelCommas`, and `splitPsClauses`'s `${...}` atomic-unit skip)
+  is rewritten to call ONE shared helper, `findPsBracedClose(text, start)`,
+  that scans forward from just after the opening `${` for the TRUE closing
+  `}`, treating a backtick as escaping the next character (so an escaped
+  `` `} `` is skipped as one unit, never mistaken for the real close). An
+  unterminated `${` (no unescaped `}` before the end of the text) ->
+  `findPsBracedClose` returns "not found", which the LHS parser
+  (`parsePsAssignmentLhsSingle`) turns into branch 4
+  `assignment-lhs-malformed` (unchanged from today's unterminated-brace
+  handling, now reached via the shared scan instead of an ad hoc one); the
+  non-LHS scan sites (statement/clause splitting, comma splitting) treat an
+  unterminated span as running to the end of the text, exactly as before —
+  they have no "branch" of their own to force, and the downstream LHS
+  parse (or `isAmbiguousToken`) is what applies friction if the resulting
+  text is actually part of an assignment.
+
+Tests: `${name} = 1`, `${my var} = 1`, `${.\out.ps1} = 5` -> no finding
+(R3a-1); `${PSDefaultParameterValues} = @{}`, `${null} = 1` -> branch 4
+`assignment-lhs-reserved` (R3a-1 + R1); `` ${a`}b} = 1 `` -> branch 4
+`assignment-lhs-escape` (R3a-3); `` ${C:\folder`}name\out.ps1} = 1 `` ->
+branch 4 `assignment-lhs-escape` (R3a-3 + R3a-4 — the shared scan finds the
+TRUE closing brace, so the LHS sees the full, backtick-bearing content
+rather than a truncated one); comma list with colon-less braced elements:
+`${a}, $b = 1,2` -> allowed (R3a-1 + R4), `${a}, ${C:\x.ps1} = 1,2` ->
+resolves and blocks via the second (colon-bearing) element (R3a-1 for the
+first element, R3a-2/R3 for the second, R4 worst-wins); Unicode lookalike
+colon `${a：b} = 1` (U+FF1A, not ASCII `:`) -> no finding, plain-variable
+semantics per R3a-1 (F3 confirms no normalization bug is needed); the R1
+regression `$env:PROJECT_ROOT = "C:\x"; node scripts/handoff.js status`
+remains allowed (unaffected — `env:` is an unbraced scope prefix, not
+routed through `classifyPsBracedLhs` at all).
+
+## Blind spots carried from the R3a adversary pass (not probed; see
+## `adversary-r3a-judge-2026-09-24.md` for the full list)
+- `-EncodedCommand`/base64-wrapped braced assignments, and braced LHS
+  reached via `pwsh -Command` inline-body recursion
+  (`handleInterpreterInline`) — only the native PowerShell-tool path was
+  exercised.
+- Unicode fuzzing beyond U+FF1A and U+2215 (e.g. U+2024 one-dot-leader as a
+  leading-dot lookalike, or RTL/bidi-control-character obfuscation) was not
+  attempted.
+- PowerShell Core vs Windows PowerShell 5.1 version skew was not tested for
+  any of F1-F4 (all live verification ran on one machine's installed
+  `pwsh` only).
+- No live end-to-end file-write trigger was attempted for the F2
+  drive-path case (deliberately, per floor constraints) — F2's conclusion
+  rests on AST inspection, not a live write-then-check.
+- `findPsAssignmentSplit`'s and `splitTopLevelCommas`'s own independent
+  copies of the shared brace scan were re-derived from the same
+  `findPsBracedClose` helper as the LHS-parsing copy, but the adversary
+  pass itself only traced the LHS-parsing copy (`parsePsAssignmentLhsSingle`)
+  against real PowerShell semantics in full; the other two call sites share
+  the same helper and reasoning by construction, not by independent
+  re-derivation against a live parser.
 
 ### R4 (owner ruling) — comma-list LHS split algorithm (O2, CONTIGUITY)
 
@@ -287,6 +417,10 @@ Now allowed:
   `$a.b = $c`, `$a,$b = 1,2`
 - `${env:X} = 1`, `$x = $(Get-Date)`, `$h = @{a=1}`, `$r = @(1,2)`,
   `$x = "out.ps1"`, `$x = @"\nout.ps1\n"@`
+- **R3a**: `${name} = 1`, `${my var} = 1`, `${.\out.ps1} = 5` (colon-less
+  braced LHS, R3a-1); `${a}, $b = 1,2` (colon-less braced element in a
+  comma list, R3a-1 + R4); `${a：b} = 1` (Unicode lookalike colon, F3,
+  still plain-variable per R3a-1)
 
 Unchanged: `Write-Host "a=b"`, `git log --format=%H`, `if ($a -eq 1) {}`;
 CALLOP-07/09; WHATIF-05..07 (none of these carry a top-level, depth-0 `=`,
@@ -307,11 +441,18 @@ Must still block:
 - `$a[(Set-Content x.ps1)] = 1` (LHS `assignment-lhs-index-paren`)
 - `$sb = { Set-Content out.ps1 }` (RHS existing dispatch)
 - SPLAT-01 (gated hashtable value; unaffected — verified no regression)
+- **R3a**: `${PSDefaultParameterValues} = @{}`, `${null} = 1` (colon-less
+  reserved name, `assignment-lhs-reserved`, R3a-1 + R1); `` ${C:\folder`}name\out.ps1} = 1 ``
+  (backtick in braced content, `assignment-lhs-escape`, R3a-3 + R3a-4 —
+  shared scan finds the TRUE closing brace so the escape is actually seen);
+  `${a}, ${C:\x.ps1} = 1,2` (colon-bearing element in a comma list still
+  resolves and blocks, R3a-2 + R4)
 
 Unit: `splitPsClauses` `${...}` atomic-unit behavior; `findPsAssignmentSplit`
 depth/compound-op detection; `parsePsAssignmentLhs`/`parsePsAssignmentLhsSingle`
 branch coverage; `classifyPsAssignmentRhs`/`isPsRhsPureExpression` token
-grammar coverage; `splitTopLevelCommas` nesting.
+grammar coverage; `splitTopLevelCommas` nesting; `findPsBracedClose`
+backtick-aware close-scan coverage (R3a-4).
 
 Policy delta: literal RHS naming a gated file (`$x = "out.ps1"`,
 `$x = @"...out.ps1..."@`) now allowed — later `$x` use as a target is

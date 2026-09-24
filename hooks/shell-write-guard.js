@@ -2558,6 +2558,34 @@ function classifyPsClauseArguments(verbName, rawFromVerb, gatedExts) {
 }
 
 /**
+ * findPsBracedClose(text, start) -> number
+ * R3a-4: the ONE shared, backtick-aware scan for the TRUE closing "}" of a
+ * "${...}" span, used by every braced-variable scan site (splitPsClauses,
+ * findPsAssignmentSplit, splitTopLevelCommas, parsePsAssignmentLhsSingle) so
+ * none of them can independently drift from PowerShell's real escaping
+ * rule. `start` is the index of the first character of the braced content
+ * (immediately after the opening "${"). PowerShell backtick-escapes the
+ * NEXT character, including a literal "}" — `` ${a`}b} `` names a variable
+ * literally "a}b" — so a naive `indexOf("}")` scan stops at the escaped "}"
+ * and truncates the content before the true end, which can hide a
+ * provider-qualified path or a reserved-variable name a real write/escape
+ * check needs to see (adversary finding F2). A backtick as the LAST
+ * character of `text` (nothing left to escape) is treated as an ordinary
+ * character rather than an escape prefix, so the scan can never walk past
+ * the end of the string. Returns the index of the true closing "}", or -1
+ * if the span is unterminated (no unescaped "}" before the end of `text`).
+ */
+function findPsBracedClose(text, start) {
+  let j = start;
+  while (j < text.length) {
+    if (text[j] === "`" && j + 1 < text.length) { j += 2; continue; }
+    if (text[j] === "}") return j;
+    j++;
+  }
+  return -1;
+}
+
+/**
  * Split (quote-blanked) text into clause {start,end} offsets on structural
  * boundaries. NOTE: bare "&" is deliberately NOT a hard boundary here (it
  * was originally one, but that fragmented the call operator `& (...)` /
@@ -2584,9 +2612,9 @@ function splitPsClauses(scanText) {
     // split), since that shape is handled by the existing-dispatch bare-`@`-
     // remnant exemption in classifyPsClauses instead (see there).
     if (ch === "$" && scanText[i + 1] === "{") {
-      let j = i + 2;
-      while (j < scanText.length && scanText[j] !== "}") j++;
-      i = j; // land on the matching "}" (or end of string if unterminated); loop's own i++ moves past it
+      // R3a-4: shared backtick-aware close scan (findPsBracedClose).
+      const close = findPsBracedClose(scanText, i + 2);
+      i = close === -1 ? scanText.length : close; // land on the matching "}" (or end of string if unterminated); loop's own i++ moves past it
       continue;
     }
     if (ch === ";" || ch === "|" || ch === "{" || ch === "}" || ch === "=") {
@@ -2744,9 +2772,9 @@ function findPsAssignmentSplit(scanText) {
   for (let i = 0; i < scanText.length; i++) {
     const ch = scanText[i];
     if (ch === "$" && scanText[i + 1] === "{") {
-      let j = i + 2;
-      while (j < scanText.length && scanText[j] !== "}") j++;
-      i = j;
+      // R3a-4: shared backtick-aware close scan (findPsBracedClose).
+      const close = findPsBracedClose(scanText, i + 2);
+      i = close === -1 ? scanText.length : close;
       continue;
     }
     if (ch === "(" || ch === "[" || ch === "{") { depth++; continue; }
@@ -2782,9 +2810,9 @@ function splitTopLevelCommas(raw, scan) {
   for (let i = 0; i < scan.length; i++) {
     const ch = scan[i];
     if (ch === "$" && scan[i + 1] === "{") {
-      let j = i + 2;
-      while (j < scan.length && scan[j] !== "}") j++;
-      i = j;
+      // R3a-4: shared backtick-aware close scan (findPsBracedClose).
+      const close = findPsBracedClose(scan, i + 2);
+      i = close === -1 ? scan.length : close;
       continue;
     }
     if (ch === "(" || ch === "[" || ch === "{") { depth++; continue; }
@@ -2859,18 +2887,55 @@ function applySuffixChain(suffixRaw, wholeRaw) {
 }
 
 /**
- * classifyPsBracedLhs — R3: the content of a `${...}` LHS.
- *   (a) `scope:name` with `scope` in PS_ALLOWED_LHS_SCOPES -> treat exactly
- *       like the unbraced scoped-variable case (R1 reserved-check on
- *       `name`, `env` exempt), then apply any trailing member/index chain.
- *   (b) else, path-like (looksLikePsBracedPath) -> resolveTarget(inner) —
- *       this LHS shape WRITES that file.
- *   (c) else (e.g. `${using:x}`, `${foo:bar}`) -> branch 4
- *       `assignment-lhs-provider` (O1 — symmetric with the unbraced rule;
- *       a loose regex here would silently readmit exactly the escape O1
- *       found, so scope membership is checked by exact Set membership).
+ * classifyPsBracedLhs — R3/R3a: the content of a `${...}` LHS. `inner` is
+ * the TRUE braced content (already resolved via the shared backtick-aware
+ * findPsBracedClose scan, R3a-4 — never a naively-truncated substring).
+ *
+ *   (0) R3a-3: `inner` contains a backtick anywhere -> branch 4
+ *       `assignment-lhs-escape`, unconditionally, before any other check.
+ *       PowerShell backtick-escapes the following character; an escaped
+ *       ":" could hide a provider qualifier from the check below, and an
+ *       escaped path character could hide the real target from a human
+ *       reading the raw statement text. This is explicit and total, not an
+ *       accidental side effect of `isAmbiguousToken`'s unrelated backtick
+ *       rule (adversary F2 — the old truncating scan happened to still get
+ *       caught by that rule, but only by accident).
+ *   (1) R3a-1: `inner` has NO ASCII ":" -> unconditionally plain-`$name`
+ *       semantics: R1 reserved-name check on the whole of `inner` as the
+ *       base name (no scope prefix exists in this shape), then the same
+ *       member/index suffix-chain rules as the unbraced case (R2 index-`(`
+ *       check still applies via applySuffixChain). There is no separate
+ *       "path-like" test here — PowerShell's `${...}` grammar cannot
+ *       provider-qualify content without a colon-qualified drive/scope
+ *       (`VariablePath.IsDriveQualified` is unconditionally `false` for
+ *       colon-less content — verified live, adversary finding F1). The old
+ *       `\`/`/`/leading-`.`/leading-`~`/UNC "path-like" carve-out for
+ *       colon-less content is REMOVED: it tested a condition PowerShell
+ *       never satisfies without a colon, and only produced false-positive
+ *       BLOCKs on harmless assignments like `${.\out.ps1} = 5`.
+ *   (2) R3a-2: `inner` DOES contain an ASCII ":" -> existing R3, unchanged:
+ *       (a) `scope:name` with `scope` in PS_ALLOWED_LHS_SCOPES -> treat
+ *           exactly like the unbraced scoped-variable case (R1
+ *           reserved-check on `name`, `env` exempt), then apply any
+ *           trailing member/index chain.
+ *       (b) else, path-like (looksLikePsBracedPath) -> resolveTarget(inner)
+ *           — this LHS shape WRITES that file.
+ *       (c) else (e.g. `${using:x}`, `${foo:bar}`) -> branch 4
+ *           `assignment-lhs-provider` (O1 — symmetric with the unbraced
+ *           rule; a loose regex here would silently readmit exactly the
+ *           escape O1 found, so scope membership is checked by exact Set
+ *           membership).
  */
 function classifyPsBracedLhs(inner, afterBrace, initialCwd, gatedExts, wholeRaw) {
+  if (inner.indexOf("`") !== -1) {
+    return { branch: 4, reason: "assignment-lhs-escape", target: wholeRaw };
+  }
+  if (inner.indexOf(":") === -1) {
+    if (isReservedLhsVarName(inner)) {
+      return { branch: 4, reason: "assignment-lhs-reserved", target: wholeRaw };
+    }
+    return applySuffixChain(afterBrace, wholeRaw);
+  }
   const scopeMatch = inner.match(/^([A-Za-z_][A-Za-z0-9_]*):([\s\S]*)$/);
   if (scopeMatch && PS_ALLOWED_LHS_SCOPES.has(scopeMatch[1].toLowerCase())) {
     const scope = scopeMatch[1].toLowerCase();
@@ -2910,7 +2975,9 @@ function parsePsAssignmentLhsSingle(rawIn, initialCwd, gatedExts) {
 
   const rest = raw.slice(1);
   if (rest.charAt(0) === "{") {
-    const closeIdx = rest.indexOf("}");
+    // R3a-4: shared backtick-aware close scan (findPsBracedClose) — the
+    // true end of the braced span, not the first unescaped-blind "}".
+    const closeIdx = findPsBracedClose(rest, 1);
     if (closeIdx === -1) return { branch: 4, reason: "assignment-lhs-malformed", target: raw };
     const inner = rest.slice(1, closeIdx);
     const afterBrace = rest.slice(closeIdx + 1);
@@ -3515,6 +3582,7 @@ module.exports = {
   DEFAULT_GATED_EXTENSIONS,
   // backlog #30 — PS assignment total classification
   classifyPsClauses,
+  findPsBracedClose,
   findPsAssignmentSplit,
   splitTopLevelCommas,
   looksLikePsBracedPath,
